@@ -34,6 +34,14 @@ jobs:
           key: ${{ secrets.ECS_SSH_KEY }}
           script: |
             set -e
+            if ! swapon --show | grep -q '/swapfile'; then
+              if [ ! -f /swapfile ]; then
+                fallocate -l 2G /swapfile
+                chmod 600 /swapfile
+                mkswap /swapfile
+              fi
+              swapon /swapfile
+            fi
             if ! command -v docker >/dev/null 2>&1; then
               apt-get update
               apt-get install -y docker.io

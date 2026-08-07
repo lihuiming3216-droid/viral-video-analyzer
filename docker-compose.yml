@@ -1,5 +1,6 @@
 services:
   viral-analyzer:
+    image: viral-video-analyzer:latest
     build:
       context: .
     container_name: viral-video-analyzer

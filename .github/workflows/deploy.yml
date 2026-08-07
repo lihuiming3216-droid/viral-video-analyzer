@@ -16,13 +16,29 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Build Docker image on GitHub runner
+        run: docker build -t viral-video-analyzer:latest .
+
+      - name: Export Docker image
+        run: docker save viral-video-analyzer:latest | gzip > viral-video-analyzer.tar.gz
+
       - name: Copy project to Alibaba ECS
         uses: appleboy/scp-action@v1
         with:
           host: ${{ secrets.ECS_HOST }}
           username: ${{ secrets.ECS_USER }}
           key: ${{ secrets.ECS_SSH_KEY }}
-          source: "./*"
+          source: "docker-compose.yml"
+          target: "/opt/viral-video-analyzer"
+          overwrite: true
+
+      - name: Copy built Docker image to Alibaba ECS
+        uses: appleboy/scp-action@v1
+        with:
+          host: ${{ secrets.ECS_HOST }}
+          username: ${{ secrets.ECS_USER }}
+          key: ${{ secrets.ECS_SSH_KEY }}
+          source: "viral-video-analyzer.tar.gz"
           target: "/opt/viral-video-analyzer"
           overwrite: true
 
@@ -34,14 +50,6 @@ jobs:
           key: ${{ secrets.ECS_SSH_KEY }}
           script: |
             set -e
-            if ! swapon --show | grep -q '/swapfile'; then
-              if [ ! -f /swapfile ]; then
-                fallocate -l 2G /swapfile
-                chmod 600 /swapfile
-                mkswap /swapfile
-              fi
-              swapon /swapfile
-            fi
             if ! command -v docker >/dev/null 2>&1; then
               apt-get update
               apt-get install -y docker.io
@@ -52,11 +60,14 @@ jobs:
               apt-get install -y docker-compose
             fi
             cd /opt/viral-video-analyzer
+            docker load -i /opt/viral-video-analyzer/viral-video-analyzer.tar.gz
+            rm -f /opt/viral-video-analyzer/viral-video-analyzer.tar.gz
             if docker compose version >/dev/null 2>&1; then
-              docker compose up -d --build --remove-orphans
+              docker compose up -d --no-build --remove-orphans
               docker compose ps
+              test -n "$(docker compose ps -q viral-analyzer)"
             else
-              docker-compose up -d --build --remove-orphans
+              docker-compose up -d --no-build --remove-orphans
               docker-compose ps
               test -n "$(docker-compose ps -q viral-analyzer)"
             fi

@@ -2,11 +2,12 @@ FROM docker.m.daocloud.io/library/node:22-bookworm-slim AS build
 
 WORKDIR /app
 ENV NEXT_TELEMETRY_DISABLED=1
+ENV NODE_OPTIONS=--max-old-space-size=512
 
 RUN corepack enable
 RUN pnpm config set registry https://registry.npmmirror.com
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
-RUN pnpm install --frozen-lockfile
+RUN pnpm install --frozen-lockfile --network-concurrency=1 --child-concurrency=1
 
 COPY . .
 RUN pnpm run check && pnpm run build
@@ -16,6 +17,7 @@ FROM docker.m.daocloud.io/library/node:22-bookworm-slim AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
+ENV NODE_OPTIONS=--max-old-space-size=512
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ffmpeg ca-certificates \

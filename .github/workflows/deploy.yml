@@ -12,12 +12,32 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Copy project to Alibaba ECS
+        uses: appleboy/scp-action@v1
+        with:
+          host: ${{ secrets.ECS_HOST }}
+          username: ${{ secrets.ECS_USER }}
+          key: ${{ secrets.ECS_SSH_KEY }}
+          source: "./*"
+          target: "/opt/viral-video-analyzer"
+          overwrite: true
+
       - name: Deploy over SSH
-        uses: appleboy/ssh-action@v1.2.2
+        uses: appleboy/ssh-action@v1.2.5
         with:
           host: ${{ secrets.ECS_HOST }}
           username: ${{ secrets.ECS_USER }}
           key: ${{ secrets.ECS_SSH_KEY }}
           script: |
+            if ! command -v docker >/dev/null 2>&1; then
+              apt-get update
+              apt-get install -y docker.io docker-compose-plugin
+              systemctl enable --now docker
+            fi
             cd /opt/viral-video-analyzer
-            ./deploy/update-server.sh
+            docker compose up -d --build --remove-orphans
+            docker image prune -f
+            docker compose ps

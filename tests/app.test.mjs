@@ -1,0 +1,156 @@
+import assert from "node:assert/strict";
+import { readFile, stat } from "node:fs/promises";
+import test from "node:test";
+
+const root = new URL("../", import.meta.url);
+
+test("ships the finished product shell and branded preview", async () => {
+  const [page, layout, app, image] = await Promise.all([
+    readFile(new URL("app/page.tsx", root), "utf8"),
+    readFile(new URL("app/layout.tsx", root), "utf8"),
+    readFile(new URL("app/ViralAnalyzerApp.tsx", root), "utf8"),
+    stat(new URL("public/og.png", root)),
+  ]);
+  assert.match(page, /ViralAnalyzerApp/);
+  assert.match(layout, /爆片分析/);
+  assert.match(layout, /og\.png/);
+  assert.match(app, /产品爆片档案库/);
+  assert.match(app, /两条视频对比/);
+  assert.match(app, /逐镜头时间轴/);
+  assert.ok(image.size > 100_000);
+  assert.doesNotMatch(`${page}\n${layout}\n${app}`, /codex-preview|SkeletonPreview|Your site is taking shape/);
+});
+
+test("database schema covers archive, scenes, providers, learning, Feishu and search indexes", async () => {
+  const database = await readFile(new URL("lib/database.ts", root), "utf8");
+  for (const table of ["products", "videos", "scenes", "provider_settings", "learning_memories", "learning_profiles", "feishu_settings", "feishu_targets", "feishu_batches", "feishu_deliveries", "feishu_documents", "feishu_events"]) {
+    assert.match(database, new RegExp(`CREATE TABLE IF NOT EXISTS ${table}`));
+  }
+  for (const index of ["idx_videos_product_created", "idx_videos_account_created", "idx_videos_status", "idx_scenes_video_shot", "idx_learning_memories_product"]) {
+    assert.match(database, new RegExp(index));
+  }
+});
+
+test("Feishu bot receives links, returns scored reports, and excludes remake copy from documents", async () => {
+  const [runtime, handler, cards, document, app, packageJson] = await Promise.all([
+    readFile(new URL("lib/feishu/runtime.ts", root), "utf8"),
+    readFile(new URL("lib/feishu/handler.ts", root), "utf8"),
+    readFile(new URL("lib/feishu/cards.ts", root), "utf8"),
+    readFile(new URL("lib/feishu/document.ts", root), "utf8"),
+    readFile(new URL("app/ViralAnalyzerApp.tsx", root), "utf8"),
+    readFile(new URL("package.json", root), "utf8"),
+  ]);
+  assert.match(runtime, /createLarkChannel/);
+  assert.match(runtime, /requireMention: true/);
+  assert.match(handler, /parseFeishuSubmission/);
+  assert.match(handler, /createFeishuBatch/);
+  for (const score of ["流量潜力", "带货转化", "画面质量", "产品展示", "声音情绪", "节奏完播"]) {
+    assert.match(cards, new RegExp(score));
+    assert.match(document, new RegExp(score));
+  }
+  assert.doesNotMatch(document, /rewriteScript|可直接照着拍的新中文脚本/);
+  assert.match(app, /发送到飞书/);
+  assert.match(packageJson, /@larksuiteoapi\/node-sdk/);
+});
+
+test("source tree contains no pasted API keys", async () => {
+  const files = [
+    "app/ViralAnalyzerApp.tsx", "lib/provider-config.ts", "lib/providers/openai.ts",
+    "lib/providers/qwen.ts", "lib/providers/tokscript.ts", "README.md",
+  ];
+  const text = (await Promise.all(files.map((file) => readFile(new URL(file, root), "utf8")))).join("\n");
+  assert.doesNotMatch(text, /sk-proj-[A-Za-z0-9_-]{20,}/);
+  assert.doesNotMatch(text, /sk-ws-[A-Za-z0-9._-]{20,}/);
+  assert.doesNotMatch(text, /sk_[a-f0-9]{32,}/i);
+});
+
+test("local dashboard API exposes business data without leaking provider secrets", async () => {
+  const baseUrl = process.env.TEST_BASE_URL || "http://localhost:3000";
+  const response = await fetch(`${baseUrl}/api/dashboard`);
+  assert.equal(response.status, 200);
+  const payload = await response.json();
+  assert.ok(Array.isArray(payload.products));
+  assert.ok(Array.isArray(payload.videos));
+  assert.ok(Array.isArray(payload.providers));
+  assert.ok(payload.products.every((product) => typeof product.pid === "string"));
+  assert.ok(payload.providers.every((provider) => !("encryptedApiKey" in provider) && !("apiKey" in provider)));
+});
+
+test("OpenAI uses the macOS proxy and model calls cannot hang forever", async () => {
+  const [network, openai, qwen] = await Promise.all([
+    readFile(new URL("lib/network.ts", root), "utf8"),
+    readFile(new URL("lib/providers/openai.ts", root), "utf8"),
+    readFile(new URL("lib/providers/qwen.ts", root), "utf8"),
+  ]);
+  assert.match(network, /scutil/);
+  assert.match(network, /ProxyAgent/);
+  assert.match(openai, /fetchOpenAI/);
+  assert.match(openai, /AbortSignal\.timeout/);
+  assert.match(qwen, /AbortSignal\.timeout/);
+});
+
+test("queue polling cannot enqueue the currently active video twice", async () => {
+  const queue = await readFile(new URL("lib/queue.ts", root), "utf8");
+  assert.match(queue, /__viralQueueActiveId/);
+  assert.match(queue, /__viralQueueActiveId !== id/);
+  assert.match(queue, /AbortController/);
+  assert.match(queue, /controller\.abort/);
+});
+
+test("finished videos can be deleted with their archived media", async () => {
+  const [route, processing, app, types] = await Promise.all([
+    readFile(new URL("app/api/videos/[id]/route.ts", root), "utf8"),
+    readFile(new URL("lib/video-processing.ts", root), "utf8"),
+    readFile(new URL("app/ViralAnalyzerApp.tsx", root), "utf8"),
+    readFile(new URL("lib/types.ts", root), "utf8"),
+  ]);
+  assert.match(route, /export async function DELETE/);
+  assert.match(route, /"waiting", "completed", "failed", "stopped"/);
+  assert.match(route, /deleteVideoMedia/);
+  assert.match(processing, /rmSync\(target, \{ recursive: true, force: true \}\)/);
+  assert.match(app, /永久删除这条视频/);
+  assert.match(app, /className="queue-delete"/);
+  assert.match(app, /const queue = data\.videos/);
+  assert.match(app, /停止/);
+  assert.match(types, /"stopped"/);
+});
+
+test("analysis page can quickly create a product with an optional PID", async () => {
+  const [app, database, types] = await Promise.all([
+    readFile(new URL("app/ViralAnalyzerApp.tsx", root), "utf8"),
+    readFile(new URL("lib/database.ts", root), "utf8"),
+    readFile(new URL("lib/types.ts", root), "utf8"),
+  ]);
+  assert.match(app, /新增产品档案/);
+  assert.match(app, /PID（选填）/);
+  assert.match(app, /创建并选中/);
+  assert.match(database, /ALTER TABLE products ADD COLUMN pid/);
+  assert.match(database, /idx_products_pid/);
+  assert.match(types, /pid: string/);
+});
+
+test("long-term learning is visible and used by future analysis", async () => {
+  const [learning, analysis, app, feedbackRoute] = await Promise.all([
+    readFile(new URL("lib/learning.ts", root), "utf8"),
+    readFile(new URL("lib/analysis.ts", root), "utf8"),
+    readFile(new URL("app/ViralAnalyzerApp.tsx", root), "utf8"),
+    readFile(new URL("app/api/videos/[id]/route.ts", root), "utf8"),
+  ]);
+  assert.match(learning, /getLearningContext/);
+  assert.match(learning, /人工标签和备注是最高优先级证据/);
+  assert.match(analysis, /长期学习系统提供的产品\/品类\/团队历史经验/);
+  assert.match(analysis, /learnFromVideo/);
+  assert.match(feedbackRoute, /learnFromVideo/);
+  assert.match(app, /长期学习中心/);
+  assert.match(app, /学习中心/);
+});
+
+test("learning API backfills completed reports", async () => {
+  const baseUrl = process.env.TEST_BASE_URL || "http://localhost:3000";
+  const response = await fetch(`${baseUrl}/api/learning`);
+  assert.equal(response.status, 200);
+  const payload = await response.json();
+  assert.ok(Number.isInteger(payload.learnedVideos));
+  assert.ok(Array.isArray(payload.profiles));
+  assert.ok(Array.isArray(payload.recentMemories));
+});

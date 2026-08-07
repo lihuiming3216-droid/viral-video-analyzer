@@ -1,0 +1,25 @@
+services:
+  viral-analyzer:
+    build:
+      context: .
+    container_name: viral-video-analyzer
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - viral_data:/app/.data
+    environment:
+      NODE_ENV: production
+      NEXT_TELEMETRY_DISABLED: "1"
+      ENABLE_QWEN_FALLBACK: "true"
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      HTTP_PROXY: ${HTTP_PROXY:-}
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  viral_data:

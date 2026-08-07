@@ -1,0 +1,7 @@
+allowBuilds:
+  '@ffmpeg-installer/darwin-arm64': true
+  protobufjs: true
+onlyBuiltDependencies:
+  - '@ffmpeg-installer/darwin-arm64'
+  - protobufjs
+  - sharp

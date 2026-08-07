@@ -33,6 +33,7 @@ jobs:
           username: ${{ secrets.ECS_USER }}
           key: ${{ secrets.ECS_SSH_KEY }}
           script: |
+            set -e
             if ! command -v docker >/dev/null 2>&1; then
               apt-get update
               apt-get install -y docker.io
@@ -49,5 +50,6 @@ jobs:
             else
               docker-compose up -d --build --remove-orphans
               docker-compose ps
+              test -n "$(docker-compose ps -q viral-analyzer)"
             fi
             docker image prune -f

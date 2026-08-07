@@ -1,4 +1,4 @@
-FROM node:22-bookworm-slim AS build
+FROM docker.m.daocloud.io/library/node:22-bookworm-slim AS build
 
 WORKDIR /app
 ENV NEXT_TELEMETRY_DISABLED=1
@@ -10,7 +10,7 @@ RUN pnpm install --frozen-lockfile
 COPY . .
 RUN pnpm run check && pnpm run build
 
-FROM node:22-bookworm-slim AS runtime
+FROM docker.m.daocloud.io/library/node:22-bookworm-slim AS runtime
 
 WORKDIR /app
 ENV NODE_ENV=production

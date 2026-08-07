@@ -35,10 +35,19 @@ jobs:
           script: |
             if ! command -v docker >/dev/null 2>&1; then
               apt-get update
-              apt-get install -y docker.io docker-compose-plugin
+              apt-get install -y docker.io
               systemctl enable --now docker
             fi
+            if ! docker compose version >/dev/null 2>&1 && ! command -v docker-compose >/dev/null 2>&1; then
+              apt-get update
+              apt-get install -y docker-compose
+            fi
             cd /opt/viral-video-analyzer
-            docker compose up -d --build --remove-orphans
+            if docker compose version >/dev/null 2>&1; then
+              docker compose up -d --build --remove-orphans
+              docker compose ps
+            else
+              docker-compose up -d --build --remove-orphans
+              docker-compose ps
+            fi
             docker image prune -f
-            docker compose ps

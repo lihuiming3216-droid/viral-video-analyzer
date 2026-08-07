@@ -2,7 +2,6 @@ FROM docker.m.daocloud.io/library/node:22-bookworm-slim AS build
 
 WORKDIR /app
 ENV NEXT_TELEMETRY_DISABLED=1
-ENV NODE_OPTIONS=--max-old-space-size=512
 
 RUN corepack enable
 RUN pnpm config set registry https://registry.npmmirror.com

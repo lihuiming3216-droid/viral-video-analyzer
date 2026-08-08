@@ -138,6 +138,18 @@ test("analysis page can quickly create a product with an optional PID", async ()
   assert.match(types, /pid: string/);
 });
 
+test("Feishu automation can return fields without requiring Base write permission", async () => {
+  const [automation, route] = await Promise.all([
+    readFile(new URL("lib/feishu/automation.ts", root), "utf8"),
+    readFile(new URL("app/api/feishu/automation/route.ts", root), "utf8"),
+  ]);
+  assert.match(automation, /writeBack\s*=\s*input\.writeBack === true/);
+  assert.match(automation, /if \(writeBack && Object\.keys\(patch\)\.length\)/);
+  assert.match(route, /fields: result\.patch/);
+  assert.match(route, /productDocument/);
+  assert.match(route, /writeBackError/);
+});
+
 test("long-term learning is visible and used by future analysis", async () => {
   const [learning, analysis, app, feedbackRoute] = await Promise.all([
     readFile(new URL("lib/learning.ts", root), "utf8"),

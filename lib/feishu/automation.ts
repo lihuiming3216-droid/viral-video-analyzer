@@ -65,6 +65,11 @@ function apiError(response: { code?: number; msg?: string } | null | undefined, 
   if (response?.code && response.code !== 0) throw new Error(response.msg || fallback);
 }
 
+function isBaseRolePermissionError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error || "");
+  return /RolePermNotAllow|role has no permissions|1254302|没有权限|无权限/i.test(message);
+}
+
 export function resolveAutomationFields(
   fields: Record<string, unknown>,
   inputMap: Partial<FeishuAutomationFieldMap> = {},
@@ -140,7 +145,12 @@ export async function completeFeishuAutomation(videoId: string) {
   } else if (video.errorMessage) {
     fields[map.analysis] = `处理失败：${video.errorMessage}`;
   }
-  await patchBaseRecord(channel.rawClient, { ...job, fields });
+  try {
+    await patchBaseRecord(channel.rawClient, { ...job, fields });
+  } catch (error) {
+    if (!isBaseRolePermissionError(error)) throw error;
+    return false;
+  }
   deleteFeishuAutomationJob(videoId);
   return true;
 }
@@ -152,12 +162,16 @@ export async function handleFeishuAutomation(input: {
   recordId: string;
   fields: Record<string, unknown>;
   fieldMap?: Partial<FeishuAutomationFieldMap>;
+  writeBack?: boolean;
 }) {
   const resolved = resolveAutomationFields(input.fields, input.fieldMap);
   const patch: Record<string, unknown> = {};
+  const writeBack = input.writeBack === true;
+  let documentUrl = "";
+  let writeBackError = "";
   // PID and the team's Chinese product name are the only trigger fields.
   // The public product URL is always derived from PID.
-  if (!resolved.pid || !resolved.productName) return { ...resolved, patch };
+  if (!resolved.pid || !resolved.productName) return { ...resolved, patch, documentUrl, writeBackError };
   let parsed = null;
   const effectivePid = resolved.pid;
   const effectiveName = resolved.productName;
@@ -208,6 +222,7 @@ export async function handleFeishuAutomation(input: {
       sellingPoints: product.sellingPoints,
       propImages: product.propImages,
     });
+    documentUrl = result.documentUrl;
     // Keep the webhook idempotent. Feishu may fire an automation again after
     // our record update, so writing an unchanged document URL wastes requests
     // and can create a self-triggering loop in less restrictive workflows.
@@ -227,16 +242,18 @@ export async function handleFeishuAutomation(input: {
       title: effectiveName ? `${effectiveName}样片` : "飞书自动化样片",
       analysisMode: "product_doc",
     });
-    saveFeishuAutomationJob({
-      videoId: video.id,
-      appToken: input.appToken,
-      tableId: input.tableId,
-      recordId: input.recordId,
-      fieldMap: resolved.map,
-    });
+    if (writeBack) {
+      saveFeishuAutomationJob({
+        videoId: video.id,
+        appToken: input.appToken,
+        tableId: input.tableId,
+        recordId: input.recordId,
+        fieldMap: resolved.map,
+      });
+    }
     if (existing?.status === "completed") {
       // Reusing a finished URL must not spend API tokens a second time.
-      await completeFeishuAutomation(video.id);
+      if (writeBack) await completeFeishuAutomation(video.id);
       patch[resolved.map.status] = "已完成";
       patch[resolved.map.analysis] = conciseAnalysis(video);
       patch[resolved.map.translation] = video.transcriptZh || "暂无中文翻译";
@@ -247,11 +264,18 @@ export async function handleFeishuAutomation(input: {
     }
   }
 
-  if (Object.keys(patch).length) await patchBaseRecord(input.client, {
-    appToken: input.appToken,
-    tableId: input.tableId,
-    recordId: input.recordId,
-    fields: patch,
-  });
-  return { ...resolved, productName: effectiveName, pid: effectivePid, patch };
+  if (writeBack && Object.keys(patch).length) {
+    try {
+      await patchBaseRecord(input.client, {
+        appToken: input.appToken,
+        tableId: input.tableId,
+        recordId: input.recordId,
+        fields: patch,
+      });
+    } catch (error) {
+      if (!isBaseRolePermissionError(error)) throw error;
+      writeBackError = error instanceof Error ? error.message : "飞书应用没有 Base 记录写入权限";
+    }
+  }
+  return { ...resolved, productName: effectiveName, pid: effectivePid, patch, documentUrl, writeBackError };
 }

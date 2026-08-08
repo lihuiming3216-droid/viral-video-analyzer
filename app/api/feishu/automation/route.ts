@@ -33,6 +33,10 @@ function payloadFields(body: Record<string, unknown>) {
   return directFields;
 }
 
+function booleanInput(value: unknown) {
+  return value === true || value === "true" || value === "1" || value === 1;
+}
+
 export async function POST(request: NextRequest) {
   try {
     const contentType = request.headers.get("content-type") || "";
@@ -46,6 +50,7 @@ export async function POST(request: NextRequest) {
     const tableId = String(body.tableId || body.table_id || "").trim();
     const recordId = String(body.recordId || body.record_id || "").trim();
     const fields = payloadFields(body);
+    const writeBack = booleanInput(body.writeBack ?? body.write_back);
     if (!appToken || !tableId || !recordId) return NextResponse.json({ error: "缺少 appToken、tableId 或 recordId" }, { status: 400 });
     if (!Object.keys(fields).length) return NextResponse.json({ error: "没有收到多维表格字段" }, { status: 400 });
     const channel = getConnectedFeishuChannel() || await ensureFeishuConnection();
@@ -57,8 +62,25 @@ export async function POST(request: NextRequest) {
       recordId,
       fields,
       fieldMap: (body.fieldMap || body.field_map || {}) as Partial<FeishuAutomationFieldMap>,
+      writeBack,
     });
-    return NextResponse.json({ ok: true, status: result.patch[result.map.status] || "无任务", patch: result.patch });
+    const productDocument = result.patch[result.map.productDocument] || result.documentUrl || result.productDocument || "";
+    const status = result.patch[result.map.status]
+      || (productDocument ? "已生成产品手卡" : "无任务");
+    return NextResponse.json({
+      ok: true,
+      status,
+      fields: result.patch,
+      patch: result.patch,
+      productDocument,
+      productUrl: result.patch[result.map.productUrl] || result.productUrl,
+      pid: result.pid,
+      productName: result.productName,
+      analysis: result.patch[result.map.analysis] || "",
+      translation: result.patch[result.map.translation] || "",
+      writeBack,
+      writeBackError: result.writeBackError || "",
+    });
   } catch (error) {
     return NextResponse.json({ error: error instanceof Error ? error.message : "飞书自动化处理失败" }, { status: 500 });
   }

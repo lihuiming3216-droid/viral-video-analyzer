@@ -35,7 +35,10 @@ function payloadFields(body: Record<string, unknown>) {
 
 export async function POST(request: NextRequest) {
   try {
-    const body = await request.json() as Record<string, unknown>;
+    const contentType = request.headers.get("content-type") || "";
+    const body = contentType.includes("application/json")
+      ? await request.json() as Record<string, unknown>
+      : Object.fromEntries((await request.formData()).entries()) as Record<string, unknown>;
     const auth = automationAuth(request, body);
     if (auth === null) return NextResponse.json({ error: "云端尚未配置自动化接口密钥" }, { status: 503 });
     if (!auth) return NextResponse.json({ error: "自动化接口密钥不正确" }, { status: 401 });

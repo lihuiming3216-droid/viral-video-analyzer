@@ -62,15 +62,15 @@ jobs:
             cd /opt/viral-video-analyzer
             docker load -i /opt/viral-video-analyzer/viral-video-analyzer.tar.gz
             rm -f /opt/viral-video-analyzer/viral-video-analyzer.tar.gz
+            # The container may have been created manually during recovery,
+            # so remove it by its fixed name before Compose recreates it.
+            # The named viral_data volume is not removed.
+            docker rm -f viral-video-analyzer 2>/dev/null || true
             if docker compose version >/dev/null 2>&1; then
               docker compose up -d --no-build --remove-orphans
               docker compose ps
               test -n "$(docker compose ps -q viral-analyzer)"
             else
-              # ECS currently uses docker-compose v1.29.2. Remove only the
-              # replaceable container first to avoid its ContainerConfig bug;
-              # the named viral_data volume is intentionally preserved.
-              docker-compose rm -sf viral-analyzer || true
               docker-compose up -d --no-build --remove-orphans
               docker-compose ps
               test -n "$(docker-compose ps -q viral-analyzer)"

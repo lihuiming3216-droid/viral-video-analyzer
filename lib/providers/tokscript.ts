@@ -178,7 +178,11 @@ export async function testTokScriptConnection() {
   return { ok: true, message: `连接成功，可用工具 ${tools.length} 个` };
 }
 
-export async function fetchTikTok(url: string, signal?: AbortSignal): Promise<TokScriptResult> {
+export async function fetchTikTok(
+  url: string,
+  signal?: AbortSignal,
+  options: { includeCover?: boolean } = {},
+): Promise<TokScriptResult> {
   const config = requireProvider("tokscript");
   const client = new TokScriptClient(config.baseUrl, config.apiKey, signal);
   await client.connect();
@@ -192,7 +196,9 @@ export async function fetchTikTok(url: string, signal?: AbortSignal): Promise<To
   }
   const transcriptRaw = parseToolPayload(await client.callTool(transcriptTool, url));
   const downloadRaw = parseToolPayload(await client.callTool(downloadTool, url));
-  const coverRaw = coverTool ? parseToolPayload(await client.callTool(coverTool, url)) : null;
+  const coverRaw = options.includeCover !== false && coverTool
+    ? parseToolPayload(await client.callTool(coverTool, url))
+    : null;
   const transcript = textValue(transcriptRaw, ["transcript", "full_transcript", "fullTranscript", "text", "content"]);
   const segments = normalizeSegments(transcriptRaw);
   return {

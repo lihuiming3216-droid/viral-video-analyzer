@@ -40,6 +40,46 @@ test("new product insert keeps its columns and bound values aligned", async () =
   assert.equal(placeholders.length, columns.length);
 });
 
+test("new video insert keeps its columns and bound values aligned", async () => {
+  const database = await readFile(new URL("lib/database.ts", root), "utf8");
+  const statement = database.match(/INSERT INTO videos\(([\s\S]*?)\) VALUES \(([\s\S]*?)\)`/);
+  assert.ok(statement, "createVideo INSERT statement is present");
+  const columns = statement[1].split(",").map((item) => item.trim()).filter(Boolean);
+  const placeholders = statement[2].match(/\?/g) || [];
+  assert.equal(placeholders.length, columns.length - 2, "status and stage are SQL literals; every other video column needs a bound value");
+});
+
+test("product documents auto-sync in lightweight mode and keep the manual prop area", async () => {
+  const [instrumentation, sync, analysis, document, formatter, qwen, tokscript, processing] = await Promise.all([
+    readFile(new URL("instrumentation.ts", root), "utf8"),
+    readFile(new URL("lib/feishu/product-doc-sync.ts", root), "utf8"),
+    readFile(new URL("lib/analysis.ts", root), "utf8"),
+    readFile(new URL("lib/feishu/document.ts", root), "utf8"),
+    readFile(new URL("lib/product-doc-analysis.ts", root), "utf8"),
+    readFile(new URL("lib/providers/qwen.ts", root), "utf8"),
+    readFile(new URL("lib/providers/tokscript.ts", root), "utf8"),
+    readFile(new URL("lib/video-processing.ts", root), "utf8"),
+  ]);
+  assert.match(instrumentation, /startProductDocumentSyncWorker/);
+  assert.match(sync, /getVideoBySourceUrl/);
+  assert.match(sync, /中文翻译\|原口播文案/);
+  assert.match(sync, /setTimeout\(resolve, 380\)/);
+  assert.match(analysis, /analysisMode === "product_doc" \? 2_000 : 4_500/);
+  assert.match(analysis, /learningContext = analysisMode === "product_doc" \? null/);
+  assert.match(analysis, /includeCover: analysisMode !== "product_doc"/);
+  assert.match(analysis, /includeAudio: analysisMode !== "product_doc" && !transcript/);
+  assert.match(analysis, /translationZh 必须写“无口播”/);
+  assert.match(formatter, /分析爆点/);
+  assert.doesNotMatch(formatter, /原视频链接|复拍口播稿|分镜脚本/);
+  assert.match(qwen, /max_tokens: input\.maxTokens \|\| 4_500/);
+  assert.match(tokscript, /options\.includeCover !== false/);
+  assert.match(processing, /includeAudio\?: boolean/);
+  assert.match(document, /insertProductPropsSection/);
+  assert.match(document, /道具列表（员工手动录入）/);
+  assert.match(document, /column_size: 3/);
+  assert.match(document, /B3GNdl05HoEdjnx8WPrcwC5Hnlg/);
+});
+
 test("Feishu bot receives links, returns scored reports, and excludes remake copy from documents", async () => {
   const [runtime, handler, cards, document, app, packageJson] = await Promise.all([
     readFile(new URL("lib/feishu/runtime.ts", root), "utf8"),

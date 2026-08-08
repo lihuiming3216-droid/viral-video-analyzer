@@ -101,16 +101,25 @@ function buildPrompt(input: {
     timeRange: `${formatTime(scene.startSeconds)}–${formatTime(scene.endSeconds)}`,
   }));
   if (input.mode === "product_doc") {
+    const productContext = {
+      name: input.product.name,
+      pid: input.product.pid,
+      coreFunctions: input.product.coreFunctions.slice(0, 3),
+      usageMethod: input.product.usageMethod,
+      targetAudience: input.product.targetAudience,
+      usageScenes: input.product.usageScenes,
+    };
     return `你是 TikTok 带货短视频拆解专家。请用中文输出精炼的产品样片分析。
 
 只输出：核心判断、开头钩子、分析爆点、内容结构、产品呈现、用户痛点或情绪、转化方式、可借鉴点，以及完整的中文口播翻译。不要输出评分、原视频链接、复拍口播稿或分镜脚本。不要臆造页面或视频没有提供的信息。
 translationZh 必须是完整原口播的自然中文翻译，不要只翻译其中几句；听不清的部分标记为“[听不清]”。
+如果视频没有口播，translationZh 必须写“无口播”，仍需根据画面完成其余分析。
+严格使用以下 JSON 结构：{"summary":"","language":"","translationZh":"","hook":{"timeRange":"","type":"","description":"","whyItWorks":""},"viralPoints":[{"timeRange":"","description":"","reason":""}],"strengths":[""],"structureFormula":""}。
 
-产品：${JSON.stringify(input.product)}
+产品：${JSON.stringify(productContext)}
 镜头时间轴：${JSON.stringify(timeline)}
 带时间码原文：${JSON.stringify(input.transcriptSegments)}
-完整原文：${input.transcript}
-历史经验：${JSON.stringify(input.learningContext)}`;
+完整原文：${input.transcript}`;
   }
   return `你是 TikTok 带货短视频拆解专家。请用中文输出，原文案保留英语或西语，并逐段给出中文翻译。translationZh 字段必须给出完整口播的中文翻译。
 
@@ -180,6 +189,7 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal) {
   if (!initial) throw new Error("视频不存在");
   const product = getProduct(initial.productId);
   if (!product) throw new Error("产品档案不存在");
+  const analysisMode = initial.analysisMode;
   const trace: string[] = [];
   try {
     signal?.throwIfAborted();
@@ -190,7 +200,7 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal) {
 
     if (initial.sourceType === "tiktok" && !relativeVideoPath) {
       setStage(videoId, "downloading", "正在通过 TokScript 获取视频和公开数据", 12);
-      const tok = await fetchTikTok(initial.sourceUrl || "", signal);
+      const tok = await fetchTikTok(initial.sourceUrl || "", signal, { includeCover: analysisMode !== "product_doc" });
       if (!tok.downloadUrl) throw new Error("TokScript 没有返回可下载的视频地址");
       remoteVideoUrl = tok.downloadUrl;
       relativeVideoPath = await downloadMedia(videoId, tok.downloadUrl, "video", signal);
@@ -227,8 +237,10 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal) {
 
     if (!relativeVideoPath) throw new Error("没有可分析的视频文件");
     setStage(videoId, "extracting", "正在识别镜头并提取关键画面", 36);
-    const analysisMode = initial.analysisMode;
-    const assets = await extractVideoAssets(videoId, relativeVideoPath, signal, { light: analysisMode === "product_doc" });
+    const assets = await extractVideoAssets(videoId, relativeVideoPath, signal, {
+      light: analysisMode === "product_doc",
+      includeAudio: analysisMode !== "product_doc" && !transcript,
+    });
     updateVideo(videoId, {
       duration_seconds: assets.duration,
       cover_path: getVideo(videoId, false)?.coverPath || assets.scenes[0]?.screenshotPath || null,
@@ -241,8 +253,8 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal) {
       trace.push("OpenAI：本地上传视频语音识别");
     }
 
-    const learningContext = getLearningContext(product, videoId);
-    const learnedExamples = Array.isArray(learningContext.similarExamples) ? learningContext.similarExamples.length : 0;
+    const learningContext = analysisMode === "product_doc" ? null : getLearningContext(product, videoId);
+    const learnedExamples = Array.isArray(learningContext?.similarExamples) ? learningContext.similarExamples.length : 0;
     if (learnedExamples) trace.push(`长期学习：参考 ${learnedExamples} 条相似历史经验`);
     const prompt = buildPrompt({ product, scenes: assets.scenes, transcript, transcriptSegments, learningContext, mode: analysisMode });
     const framePaths = assets.scenes.map((scene) => resolveMediaPath(scene.screenshotPath));
@@ -251,7 +263,13 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal) {
     let qwenContext: Record<string, unknown> | undefined;
     if (qwenFallbackEnabled() && isConfigured("qwen")) {
       try {
-        qwenContext = await analyzeVideoWithQwen({ prompt, remoteVideoUrl, framePaths, signal });
+        qwenContext = await analyzeVideoWithQwen({
+          prompt,
+          remoteVideoUrl,
+          framePaths,
+          maxTokens: analysisMode === "product_doc" ? 2_000 : 4_500,
+          signal,
+        });
         trace.push("Qwen：关键帧、文案与镜头结构分析");
       } catch (error) {
         if (signal?.aborted) throw error;
@@ -264,6 +282,8 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal) {
     if (isUsableAnalysis(qwenContext, assets.scenes.length, analysisMode)) {
       rawAnalysis = qwenContext as Partial<AnalysisResult>;
       trace.push("自动路由：Qwen 结果完整，直接生成快速报告");
+    } else if (analysisMode === "product_doc") {
+      throw new Error("Qwen 未返回完整的视频分析和中文翻译，请重试该链接");
     } else if (isConfigured("openai")) {
       try {
         rawAnalysis = await analyzeFramesWithOpenAI({ prompt, framePaths, product, qwenContext, signal });

@@ -1,6 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getConnectedFeishuChannel, ensureFeishuConnection } from "@/lib/feishu/runtime";
-import { deleteFeishuChildRange, insertFeishuTableColumn, insertFeishuTextBlocks, updateFeishuTextBlock } from "@/lib/feishu/document";
+import {
+  deleteFeishuChildRange,
+  insertFeishuTableColumn,
+  insertFeishuTextBlocks,
+  insertProductPropsSection,
+  updateFeishuTextBlock,
+} from "@/lib/feishu/document";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -31,6 +37,16 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    let propsSection = null;
+    if (body.insertPropsSection?.parentBlockId) {
+      propsSection = await insertProductPropsSection(
+        channel.rawClient,
+        documentId,
+        String(body.insertPropsSection.parentBlockId),
+        Number(body.insertPropsSection.index || 0),
+      );
+    }
+
     for (const item of Array.isArray(body.updates) ? body.updates : []) {
       await updateFeishuTextBlock(
         channel.rawClient,
@@ -50,7 +66,7 @@ export async function POST(request: NextRequest) {
         body.insert.contents.map(String),
       );
     }
-    return NextResponse.json({ ok: true, inserted });
+    return NextResponse.json({ ok: true, inserted, propsSection });
   } catch (error) {
     return NextResponse.json({ error: error instanceof Error ? error.message : "准备模板失败" }, { status: 500 });
   }

@@ -3,14 +3,14 @@ import "server-only";
 import type { Client } from "@larksuiteoapi/node-sdk";
 import {
   createProduct, createVideo, deleteFeishuAutomationJob, getFeishuAutomationJob,
-  getProduct, getProductByPid, getVideo, listVideos, saveFeishuAutomationJob,
-  updateProduct,
+  getProduct, getProductByPid, getVideo, getVideoBySourceUrl, saveFeishuAutomationJob,
+  updateProduct, updateVideo,
 } from "@/lib/database";
 import { ensureFeishuConnection, getConnectedFeishuChannel } from "@/lib/feishu/runtime";
 import { ensureProductDocument } from "@/lib/feishu/document";
 import { enqueueVideos } from "@/lib/queue";
 import { hasUsableProductInfo, parsePublicProductPage } from "@/lib/product-parser";
-import type { AnalysisResult } from "@/lib/types";
+import { conciseProductDocAnalysis } from "@/lib/product-doc-analysis";
 
 export interface FeishuAutomationFieldMap {
   productUrl: string;
@@ -108,25 +108,6 @@ async function patchBaseRecord(
   apiError(response, "回写飞书多维表格失败");
 }
 
-function conciseAnalysis(video: NonNullable<ReturnType<typeof getVideo>>) {
-  const analysis = video.analysis as AnalysisResult | null;
-  const hook = analysis?.hook;
-  const points = Array.isArray(analysis?.viralPoints) ? analysis.viralPoints : [];
-  const strengths = Array.isArray(analysis?.strengths) ? analysis.strengths : [];
-  const summary = String(video.summary || "通过痛点切入、产品演示和场景证明推动转化。")
-    .split(/(?<=[。！？])/)
-    .filter((sentence) => !/(评分|分数|潜力\s*[高低]|\d+\s*分|转化率)/.test(sentence))
-    .join("")
-    .trim();
-  return [
-    `核心判断：${summary || "通过痛点切入、产品演示和场景证明推动转化。"}`,
-    hook?.description ? `开头钩子：${hook.description}` : "",
-    points.slice(0, 3).map((point) => `分析爆点：${point.description || point.reason || "突出产品价值并推动继续观看"}`).join("\n"),
-    strengths.length ? `可借鉴点：${strengths.slice(0, 2).join("；")}` : "",
-    analysis?.structureFormula ? `内容结构：${analysis.structureFormula}` : "",
-  ].filter(Boolean).join("\n").trim();
-}
-
 export async function completeFeishuAutomation(videoId: string) {
   const job = getFeishuAutomationJob(videoId);
   const video = getVideo(videoId);
@@ -139,7 +120,7 @@ export async function completeFeishuAutomation(videoId: string) {
     [map.status]: video.status === "completed" ? "已完成" : video.status === "failed" ? "失败" : "已停止",
   };
   if (video.status === "completed") {
-    fields[map.analysis] = conciseAnalysis(video);
+    fields[map.analysis] = conciseProductDocAnalysis(video);
     fields[map.translation] = video.transcriptZh || "暂无中文翻译";
     if (product?.documentUrl) fields[map.productDocument] = product.documentUrl;
   } else if (video.errorMessage) {
@@ -244,7 +225,10 @@ export async function handleFeishuAutomation(input: {
   if (resolved.videoUrl) {
     const targetProduct = product || getProductByPid(resolved.pid) || getProduct("system-unclassified");
     if (!targetProduct) throw new Error("无法找到可归档视频的产品档案");
-    const existing = listVideos({ productId: targetProduct.id }).find((video) => video.sourceUrl === resolved.videoUrl);
+    const matchedVideo = getVideoBySourceUrl(resolved.videoUrl);
+    const existing = matchedVideo && matchedVideo.productId !== targetProduct.id
+      ? updateVideo(matchedVideo.id, { product_id: targetProduct.id })
+      : matchedVideo;
     const video = existing || createVideo({
       productId: targetProduct.id,
       sourceType: "tiktok",
@@ -265,7 +249,7 @@ export async function handleFeishuAutomation(input: {
       // Reusing a finished URL must not spend API tokens a second time.
       if (writeBack) await completeFeishuAutomation(video.id);
       patch[resolved.map.status] = "已完成";
-      patch[resolved.map.analysis] = conciseAnalysis(video);
+      patch[resolved.map.analysis] = conciseProductDocAnalysis(video);
       patch[resolved.map.translation] = video.transcriptZh || "暂无中文翻译";
       if (targetProduct.documentUrl) patch[resolved.map.productDocument] = targetProduct.documentUrl;
     } else {

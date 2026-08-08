@@ -19,6 +19,7 @@ export async function analyzeVideoWithQwen(input: {
   prompt: string;
   remoteVideoUrl?: string | null;
   framePaths: string[];
+  maxTokens?: number;
   signal?: AbortSignal;
 }) {
   const config = requireProvider("qwen");
@@ -39,6 +40,7 @@ export async function analyzeVideoWithQwen(input: {
       response_format: { type: "json_object" },
       enable_thinking: false,
       stream: false,
+      max_tokens: input.maxTokens || 4_500,
     }),
     signal: input.signal
       ? AbortSignal.any([input.signal, AbortSignal.timeout(120_000)])

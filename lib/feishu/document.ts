@@ -13,7 +13,7 @@ import {
 } from "@/lib/feishu/store";
 import type { Product, SceneRecord, VideoRecord } from "@/lib/types";
 
-const defaultProductTemplateToken = "CnlfdBzruo9CFGxL9EwcoBdXnqe";
+const defaultProductTemplateToken = "B3GNdl05HoEdjnx8WPrcwC5Hnlg";
 
 async function setCompanyEditable(client: Client, documentId: string) {
   const response = await client.request({
@@ -394,6 +394,90 @@ export async function deleteFeishuChildRange(
     data: { start_index: startIndex, end_index: endIndex },
   });
   apiError(response, "删除飞书文档内容失败");
+}
+
+function feishuBlockText(block: Record<string, unknown>) {
+  const text = block.text as { elements?: Array<{ text_run?: { content?: string } }> } | undefined;
+  return text?.elements?.map((element) => element.text_run?.content || "").join("").trim() || "";
+}
+
+/** Add the employee-maintained three-image prop area to a product-card template. */
+export async function insertProductPropsSection(
+  client: Client,
+  documentId: string,
+  parentBlockId: string,
+  index: number,
+) {
+  const existingBlocks = await listFeishuDocumentBlocks(client, documentId);
+  const existingHeading = existingBlocks.find((block) => feishuBlockText(block).includes("道具列表"));
+  const existingTable = existingBlocks.find((block) => {
+    const table = block.table as { property?: { row_size?: number; column_size?: number } } | undefined;
+    return table?.property?.row_size === 1 && table.property.column_size === 3;
+  });
+  if (existingHeading && existingTable) {
+    return { reused: true, tableBlockId: String(existingTable.block_id || "") };
+  }
+
+  const created = await client.docx.v1.documentBlockChildren.create({
+    path: { document_id: documentId, block_id: parentBlockId },
+    params: { client_token: randomUUID() },
+    data: {
+      index,
+      children: [
+        {
+          block_type: 2,
+          text: {
+            style: { background_color: "LightPurpleBackground" },
+            elements: [{
+              text_run: {
+                content: "🧰 道具列表（员工手动录入）",
+                text_element_style: { bold: true },
+              },
+            }],
+          },
+        },
+        {
+          block_type: 31,
+          table: {
+            property: {
+              row_size: 1,
+              column_size: 3,
+              column_width: [292, 292, 292],
+            },
+          },
+        },
+      ],
+    },
+  });
+  apiError(created, "创建道具列表失败");
+  await throttle();
+
+  const blocks = await listFeishuDocumentBlocks(client, documentId);
+  const tableBlockId = created.data?.children?.find((block) => block.block_type === 31)?.block_id;
+  const tableBlock = blocks.find((block) => block.block_id === tableBlockId)
+    || [...blocks].reverse().find((block) => {
+      const table = block.table as { property?: { row_size?: number; column_size?: number } } | undefined;
+      return table?.property?.row_size === 1 && table.property.column_size === 3;
+    });
+  const table = tableBlock?.table as { cells?: string[] } | undefined;
+  if (!tableBlock?.block_id || table?.cells?.length !== 3) throw new Error("道具列表已创建，但没有找到三个图片单元格");
+
+  const blockMap = new Map(blocks.map((block) => [String(block.block_id || ""), block]));
+  for (let cellIndex = 0; cellIndex < table.cells.length; cellIndex += 1) {
+    const cellId = table.cells[cellIndex];
+    const cachedCell = blockMap.get(cellId);
+    const cell = cachedCell || await getFeishuDocumentBlock(client, documentId, cellId);
+    const childId = String((cell.children as string[] | undefined)?.[0] || "");
+    if (!childId) throw new Error(`道具图片 ${cellIndex + 1} 单元格缺少可编辑文本块`);
+    await updateFeishuTextBlock(
+      client,
+      documentId,
+      childId,
+      `图片${cellIndex + 1}\n请在此粘贴道具图片`,
+    );
+    if (cellIndex < table.cells.length - 1) await throttle();
+  }
+  return { reused: false, tableBlockId: String(tableBlock.block_id) };
 }
 
 function replaceTemplateText(content: string, values: Record<string, string>) {

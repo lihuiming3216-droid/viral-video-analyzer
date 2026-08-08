@@ -652,6 +652,15 @@ export function listVideos(filters: { search?: string; productId?: string; accou
     .map((row) => videoFromRow(row as Record<string, unknown>));
 }
 
+export function getVideoBySourceUrl(sourceUrl: string) {
+  const normalized = sourceUrl.trim();
+  if (!normalized) return null;
+  const row = getDb()
+    .prepare("SELECT v.*, p.name AS product_name FROM videos v JOIN products p ON p.id=v.product_id WHERE v.source_url=?")
+    .get(normalized) as Record<string, unknown> | undefined;
+  return row ? videoFromRow(row) : null;
+}
+
 export function getVideo(id: string, withScenes = true) {
   const row = getDb()
     .prepare("SELECT v.*, p.name AS product_name FROM videos v JOIN products p ON p.id=v.product_id WHERE v.id=?")
@@ -682,7 +691,7 @@ export function createVideo(input: {
     .prepare(`INSERT INTO videos(
       id, product_id, source_type, source_url, source_file_name, analysis_mode, original_path, title,
       status, stage, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', '已加入队列', ?, ?)`)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', '已加入队列', ?, ?)`)
     .run(
       id,
       input.productId,

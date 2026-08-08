@@ -145,7 +145,7 @@ export async function extractVideoAssets(
   videoId: string,
   relativeVideoPath: string,
   signal?: AbortSignal,
-  options: { light?: boolean } = {},
+  options: { light?: boolean; includeAudio?: boolean } = {},
 ) {
   const absoluteVideoPath = resolveMediaPath(relativeVideoPath);
   signal?.throwIfAborted();
@@ -173,6 +173,9 @@ export async function extractVideoAssets(
       screenshotPath: relativeScreenshot,
       clipPath: null,
     });
+  }
+  if (options.includeAudio === false) {
+    return { ...metadata, scenes, audioPath: null as string | null };
   }
   const audioRelative = path.join(videoId, `audio-${randomUUID().slice(0, 6)}.mp3`);
   const audioAbsolute = resolveMediaPath(audioRelative);

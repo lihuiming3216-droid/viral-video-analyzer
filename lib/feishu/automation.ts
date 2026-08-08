@@ -34,6 +34,11 @@ export const defaultFeishuAutomationFieldMap: FeishuAutomationFieldMap = {
   status: "分析状态",
 };
 
+export function productUrlFromPid(pid: string) {
+  const normalized = pid.trim();
+  return normalized ? `https://www.tiktok.com/view/product/${encodeURIComponent(normalized)}` : "";
+}
+
 function text(value: unknown): string {
   if (value == null) return "";
   if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return String(value).trim();
@@ -65,10 +70,13 @@ export function resolveAutomationFields(
   inputMap: Partial<FeishuAutomationFieldMap> = {},
 ) {
   const map = { ...defaultFeishuAutomationFieldMap, ...inputMap };
+  const pid = field(fields, map.pid, ["PID", "商品ID/PID"]);
+  const documentField = inputMap.productDocument
+    || ("产品手卡" in fields ? "产品手卡" : map.productDocument);
   return {
-    map,
-    productUrl: cleanUrl(field(fields, map.productUrl, ["商品链接", "产品链接"])) ,
-    pid: field(fields, map.pid, ["PID", "商品ID/PID"]),
+    map: { ...map, productDocument: documentField },
+    productUrl: cleanUrl(field(fields, map.productUrl, ["商品链接", "产品链接"])) || productUrlFromPid(pid),
+    pid,
     productName: field(fields, map.productName, ["商品名称", "产品名"]),
     productDocument: field(fields, map.productDocument),
     videoUrl: cleanUrl(field(fields, map.videoUrl, ["样片链接", "视频链接"])),

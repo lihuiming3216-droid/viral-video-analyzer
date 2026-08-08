@@ -28,7 +28,9 @@ function payloadFields(body: Record<string, unknown>) {
       if (fields && typeof fields === "object" && !Array.isArray(fields)) return fields as Record<string, unknown>;
     }
   }
-  return {};
+  const controlKeys = new Set(["appToken", "app_token", "tableId", "table_id", "recordId", "record_id", "secret", "fieldMap", "field_map"]);
+  const directFields = Object.fromEntries(Object.entries(body).filter(([key]) => !controlKeys.has(key)));
+  return directFields;
 }
 
 export async function POST(request: NextRequest) {

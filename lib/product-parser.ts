@@ -129,14 +129,20 @@ function parsedValue(parsed: Partial<ParsedProductInfo>, aliases: string[]) {
   return undefined;
 }
 
-function normalizeParsed(parsed: Partial<ParsedProductInfo>, base: ParsedProductInfo): ParsedProductInfo {
+function normalizeParsed(
+  parsed: Partial<ParsedProductInfo>,
+  base: ParsedProductInfo,
+  productId: string,
+): ParsedProductInfo {
   const rawFunctions = parsedValue(parsed, ["coreFunctions", "核心功能", "核心功能（按重要程度）"]);
   const functions = Array.isArray(rawFunctions)
     ? rawFunctions
     : String(rawFunctions || "").split(/[；;\n]+/);
+  const rawSku = clean(parsedValue(parsed, ["sku", "SKU", "产品SKU"]));
+  const skuWithoutLabel = rawSku.replace(/^(?:SKU|PID|商品ID|产品ID)\s*[:：#-]?\s*/i, "");
   return {
     ...base,
-    sku: clean(parsedValue(parsed, ["sku", "SKU", "产品SKU"])) || "页面未说明",
+    sku: rawSku && skuWithoutLabel !== clean(productId) ? rawSku : "页面未说明",
     coreFunctions: [...new Set(functions.map(cleanFunction).filter(Boolean))].slice(0, 5),
     productParameters: clean(parsedValue(parsed, ["productParameters", "产品参数"])) || base.productParameters || "页面未说明",
     usageMethod: clean(parsedValue(parsed, ["usageMethod", "使用方法"])),
@@ -183,7 +189,7 @@ function extractionPrompt(input: {
   const evidence = input.searchMode
     ? `阿里云服务器无法直连商品页。请联网搜索上述 PID、商品链接和产品名称，优先采用 TikTok 商品页、商家页及同一 PID 的公开资料。`
     : `页面标题：${input.title}\n页面描述：${input.description}\n页面正文：${input.pageText}`;
-  return `你在整理 TikTok Shop 产品手卡。\n${identity}\n${evidence}\n\n请输出以下字段：SKU、3至5条核心功能、产品参数、使用方法、适用人群、使用场景、产品卖点。核心功能按重要程度排序，但内容中不要写 A/B/C/D/E 前缀。不得编造精确尺寸、功率、材质、兼容型号或认证；公开资料没有精确参数时，产品参数写“页面未说明”，其他字段可以根据已确认的产品品类进行保守归纳。产品卖点要具体、便于短视频拍摄，不写治疗、预防或控制疾病等违规功效。只返回合法 JSON，不要使用 Markdown 代码块。JSON 键名必须严格使用以下英文键：{"sku":"","coreFunctions":[""],"productParameters":"","usageMethod":"","audience":"","scenes":"","sellingPoints":""}。`;
+  return `你在整理 TikTok Shop 产品手卡。\n${identity}\n${evidence}\n\n请输出以下字段：SKU、3至5条核心功能、产品参数、使用方法、适用人群、使用场景、产品卖点。核心功能按重要程度排序，但内容中不要写 A/B/C/D/E 前缀。SKU 不得填写 PID 或商品ID；找不到真实 SKU 时写“页面未说明”。不得编造精确尺寸、功率、材质、兼容型号或认证；公开资料没有精确参数时，产品参数写“页面未说明”，其他字段可以根据已确认的产品品类进行保守归纳。产品卖点要具体、便于短视频拍摄，不写治疗、预防或控制疾病等违规功效。只返回合法 JSON，不要使用 Markdown 代码块。JSON 键名必须严格使用以下英文键：{"sku":"","coreFunctions":[""],"productParameters":"","usageMethod":"","audience":"","scenes":"","sellingPoints":""}。`;
 }
 
 async function qwenExtract(prompt: string, enableSearch: boolean) {
@@ -235,9 +241,10 @@ export async function parsePublicProductPage(
   const page = await readProductPage(productUrl);
   const base = baseInfo(page.title, page.description, hints);
   const searchMode = !page.text;
+  const productId = hints.pid || extractProductIdFromUrl(productUrl);
   const prompt = extractionPrompt({
     productUrl,
-    hints: { ...hints, pid: hints.pid || extractProductIdFromUrl(productUrl) },
+    hints: { ...hints, pid: productId },
     title: page.title,
     description: page.description,
     pageText: page.text,
@@ -247,20 +254,20 @@ export async function parsePublicProductPage(
   // One model call in the normal path: page extraction when reachable, or
   // Qwen web search when the mainland server cannot reach TikTok directly.
   let parsed = await qwenExtract(prompt, searchMode).catch(() => null);
-  let normalized = parsed ? normalizeParsed(parsed, base) : null;
+  let normalized = parsed ? normalizeParsed(parsed, base, productId) : null;
 
   // Some Qwen model variants may not accept web-search parameters. Retry once
   // without search so a category-level card can still be produced from the
   // team's Chinese product name, while keeping exact unknown parameters honest.
   if (searchMode && (!normalized || !hasUsableProductInfo(normalized))) {
     parsed = await qwenExtract(prompt, false).catch(() => null);
-    normalized = parsed ? normalizeParsed(parsed, base) : null;
+    normalized = parsed ? normalizeParsed(parsed, base, productId) : null;
   }
 
   // OpenAI is only a failure fallback, not part of the ordinary token spend.
   if (!normalized || !hasUsableProductInfo(normalized)) {
     parsed = await openAiExtract(prompt);
-    normalized = parsed ? normalizeParsed(parsed, base) : normalized;
+    normalized = parsed ? normalizeParsed(parsed, base, productId) : normalized;
   }
 
   if (!normalized || !hasUsableProductInfo(normalized)) {

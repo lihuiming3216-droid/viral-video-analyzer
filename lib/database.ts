@@ -519,7 +519,7 @@ export function createProduct(input: Partial<Product>) {
     .prepare(`INSERT INTO products(
       id, name, pid, sku, document_id, document_url, image_path, prop_images_json, category, market, price, selling_points, target_audience,
       pain_points, competitors, product_url, banned_terms, notes, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
     .run(
       id,
       input.name?.trim() || "未命名产品",

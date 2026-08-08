@@ -31,6 +31,15 @@ test("database schema covers archive, scenes, providers, learning, Feishu and se
   }
 });
 
+test("new product insert keeps its columns and bound values aligned", async () => {
+  const database = await readFile(new URL("lib/database.ts", root), "utf8");
+  const statement = database.match(/INSERT INTO products\(([\s\S]*?)\) VALUES \(([\s\S]*?)\)`/);
+  assert.ok(statement, "createProduct INSERT statement is present");
+  const columns = statement[1].split(",").map((item) => item.trim()).filter(Boolean);
+  const placeholders = statement[2].match(/\?/g) || [];
+  assert.equal(placeholders.length, columns.length);
+});
+
 test("Feishu bot receives links, returns scored reports, and excludes remake copy from documents", async () => {
   const [runtime, handler, cards, document, app, packageJson] = await Promise.all([
     readFile(new URL("lib/feishu/runtime.ts", root), "utf8"),

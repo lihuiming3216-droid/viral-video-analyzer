@@ -427,8 +427,8 @@ function syncProductFieldText(content: string, values: Record<string, string>) {
   for (const [label, value] of labels) next = replaceLabeledValue(next, label, value);
   const ranked = next.match(/^(\s*([A-E])[.．、:：]\s*).*$/i);
   if (ranked) {
-    const value = values[`核心功能${ranked[2].toUpperCase()}`];
-    if (value) next = `${ranked[1]}${value}`;
+    const value = values[`核心功能${ranked[2].toUpperCase()}`] || "";
+    next = `${ranked[1]}${value}`;
   }
   return next;
 }

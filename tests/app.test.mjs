@@ -183,6 +183,8 @@ test("product cards use Qwen search when TikTok is unreachable and resync reused
   assert.match(database, /visual_analyzed_at/);
   assert.match(automation, /已停止生成空白产品手卡/);
   assert.match(document, /syncProductFieldText/);
+  assert.match(document, /values\[`核心功能\$\{ranked\[2\]\.toUpperCase\(\)\}`\] \|\| ""/);
+  assert.match(document, /next = `\$\{ranked\[1\]\}\$\{value\}`/);
   assert.match(document, /const reused = Boolean\(product\.documentId && product\.documentUrl\)/);
 });
 

@@ -159,6 +159,8 @@ test("product cards use Qwen search when TikTok is unreachable and resync reused
   assert.match(parser, /enable_search:\s*true/);
   assert.match(parser, /forced_search:\s*true/);
   assert.match(parser, /hasUsableProductInfo/);
+  assert.match(parser, /核心功能（按重要程度）/);
+  assert.match(parser, /JSON 键名必须严格使用以下英文键/);
   assert.match(automation, /已停止生成空白产品手卡/);
   assert.match(document, /syncProductFieldText/);
   assert.match(document, /const reused = Boolean\(product\.documentId && product\.documentUrl\)/);

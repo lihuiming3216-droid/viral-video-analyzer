@@ -121,16 +121,28 @@ function baseInfo(title: string, description: string, hints: ProductParseHints):
   };
 }
 
+function parsedValue(parsed: Partial<ParsedProductInfo>, aliases: string[]) {
+  const record = parsed as Record<string, unknown>;
+  for (const key of aliases) {
+    if (record[key] != null) return record[key];
+  }
+  return undefined;
+}
+
 function normalizeParsed(parsed: Partial<ParsedProductInfo>, base: ParsedProductInfo): ParsedProductInfo {
+  const rawFunctions = parsedValue(parsed, ["coreFunctions", "核心功能", "核心功能（按重要程度）"]);
+  const functions = Array.isArray(rawFunctions)
+    ? rawFunctions
+    : String(rawFunctions || "").split(/[；;\n]+/);
   return {
     ...base,
-    sku: clean(parsed.sku) || "页面未说明",
-    coreFunctions: [...new Set((parsed.coreFunctions || []).map(cleanFunction).filter(Boolean))].slice(0, 5),
-    productParameters: clean(parsed.productParameters) || base.productParameters || "页面未说明",
-    usageMethod: clean(parsed.usageMethod),
-    audience: clean(parsed.audience),
-    scenes: clean(parsed.scenes),
-    sellingPoints: clean(parsed.sellingPoints),
+    sku: clean(parsedValue(parsed, ["sku", "SKU", "产品SKU"])) || "页面未说明",
+    coreFunctions: [...new Set(functions.map(cleanFunction).filter(Boolean))].slice(0, 5),
+    productParameters: clean(parsedValue(parsed, ["productParameters", "产品参数"])) || base.productParameters || "页面未说明",
+    usageMethod: clean(parsedValue(parsed, ["usageMethod", "使用方法"])),
+    audience: clean(parsedValue(parsed, ["audience", "适用人群", "目标人群"])),
+    scenes: clean(parsedValue(parsed, ["scenes", "使用场景", "适用场景"])),
+    sellingPoints: clean(parsedValue(parsed, ["sellingPoints", "产品卖点", "卖点"])),
   };
 }
 
@@ -171,7 +183,7 @@ function extractionPrompt(input: {
   const evidence = input.searchMode
     ? `阿里云服务器无法直连商品页。请联网搜索上述 PID、商品链接和产品名称，优先采用 TikTok 商品页、商家页及同一 PID 的公开资料。`
     : `页面标题：${input.title}\n页面描述：${input.description}\n页面正文：${input.pageText}`;
-  return `你在整理 TikTok Shop 产品手卡。\n${identity}\n${evidence}\n\n请输出以下字段：SKU、3至5条核心功能、产品参数、使用方法、适用人群、使用场景、产品卖点。核心功能按重要程度排序，但内容中不要写 A/B/C/D/E 前缀。不得编造精确尺寸、功率、材质、兼容型号或认证；公开资料没有精确参数时，产品参数写“页面未说明”，其他字段可以根据已确认的产品品类进行保守归纳。产品卖点要具体、便于短视频拍摄，不写治疗、预防或控制疾病等违规功效。只返回合法 JSON，不要使用 Markdown 代码块。`;
+  return `你在整理 TikTok Shop 产品手卡。\n${identity}\n${evidence}\n\n请输出以下字段：SKU、3至5条核心功能、产品参数、使用方法、适用人群、使用场景、产品卖点。核心功能按重要程度排序，但内容中不要写 A/B/C/D/E 前缀。不得编造精确尺寸、功率、材质、兼容型号或认证；公开资料没有精确参数时，产品参数写“页面未说明”，其他字段可以根据已确认的产品品类进行保守归纳。产品卖点要具体、便于短视频拍摄，不写治疗、预防或控制疾病等违规功效。只返回合法 JSON，不要使用 Markdown 代码块。JSON 键名必须严格使用以下英文键：{"sku":"","coreFunctions":[""],"productParameters":"","usageMethod":"","audience":"","scenes":"","sellingPoints":""}。`;
 }
 
 async function qwenExtract(prompt: string, enableSearch: boolean) {
@@ -240,7 +252,7 @@ export async function parsePublicProductPage(
   // Some Qwen model variants may not accept web-search parameters. Retry once
   // without search so a category-level card can still be produced from the
   // team's Chinese product name, while keeping exact unknown parameters honest.
-  if (!normalized && searchMode) {
+  if (searchMode && (!normalized || !hasUsableProductInfo(normalized))) {
     parsed = await qwenExtract(prompt, false).catch(() => null);
     normalized = parsed ? normalizeParsed(parsed, base) : null;
   }

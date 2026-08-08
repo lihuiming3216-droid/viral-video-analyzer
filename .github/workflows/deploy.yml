@@ -67,6 +67,10 @@ jobs:
               docker compose ps
               test -n "$(docker compose ps -q viral-analyzer)"
             else
+              # ECS currently uses docker-compose v1.29.2. Remove only the
+              # replaceable container first to avoid its ContainerConfig bug;
+              # the named viral_data volume is intentionally preserved.
+              docker-compose rm -sf viral-analyzer || true
               docker-compose up -d --no-build --remove-orphans
               docker-compose ps
               test -n "$(docker-compose ps -q viral-analyzer)"

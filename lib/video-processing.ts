@@ -141,12 +141,21 @@ async function extractScreenshot(videoPath: string, seconds: number, outputPath:
   );
 }
 
-export async function extractVideoAssets(videoId: string, relativeVideoPath: string, signal?: AbortSignal) {
+export async function extractVideoAssets(
+  videoId: string,
+  relativeVideoPath: string,
+  signal?: AbortSignal,
+  options: { light?: boolean } = {},
+) {
   const absoluteVideoPath = resolveMediaPath(relativeVideoPath);
   signal?.throwIfAborted();
   const metadata = await probeVideo(absoluteVideoPath, signal);
   if (metadata.duration > 600.5) throw new Error("视频超过 10 分钟，请上传更短版本");
-  const boundaries = buildBoundaries(metadata.duration, await detectCuts(absoluteVideoPath, signal));
+  // Table automation only needs a few visual checkpoints. Avoid the expensive
+  // scene-cut pass and dozens of screenshots in the lightweight path.
+  const boundaries = options.light
+    ? [0, metadata.duration / 3, (metadata.duration * 2) / 3, metadata.duration]
+    : buildBoundaries(metadata.duration, await detectCuts(absoluteVideoPath, signal));
   const shotsDir = resolveMediaPath(path.join(videoId, "shots"));
   mkdirSync(shotsDir, { recursive: true });
   const scenes: ExtractedScene[] = [];

@@ -12,10 +12,11 @@ const MAX_ANALYSIS_FRAMES = 8;
 export const analysisSchema = {
   type: "object",
   additionalProperties: false,
-  required: ["summary", "language", "scores", "hook", "viralPoints", "strengths", "weaknesses", "structureFormula", "rewriteScript", "storyboard", "scenes"],
+  required: ["summary", "language", "translationZh", "scores", "hook", "viralPoints", "strengths", "weaknesses", "structureFormula", "rewriteScript", "storyboard", "scenes"],
   properties: {
     summary: { type: "string" },
     language: { type: "string" },
+    translationZh: { type: "string" },
     scores: {
       type: "object",
       additionalProperties: false,

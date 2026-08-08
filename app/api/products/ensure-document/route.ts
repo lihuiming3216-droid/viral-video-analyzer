@@ -38,6 +38,9 @@ export async function POST(request: NextRequest) {
       });
     }
     const currentProduct = getProductByPid(pid) || product;
+    if (Array.isArray(body.propImages)) {
+      updateProduct(currentProduct.id, { propImages: body.propImages.map(String).slice(0, 3) });
+    }
     const channel = getConnectedFeishuChannel() || await ensureFeishuConnection();
     if (!channel) return NextResponse.json({ error: "飞书应用尚未连接" }, { status: 400 });
     const result = await ensureProductDocument(channel.rawClient, currentProduct, {
@@ -47,6 +50,7 @@ export async function POST(request: NextRequest) {
       audience: String(body.audience || parsed?.audience || currentProduct.targetAudience || ""),
       scenes: String(body.scenes || parsed?.scenes || currentProduct.usageScenes || ""),
       coreFunctions: Array.isArray(body.coreFunctions) ? body.coreFunctions.map(String) : parsed?.coreFunctions || currentProduct.coreFunctions || [],
+      propImages: Array.isArray(body.propImages) ? body.propImages.map(String).slice(0, 3) : currentProduct.propImages,
     });
     return NextResponse.json({ ok: true, product, parsed, result });
   } catch (error) {

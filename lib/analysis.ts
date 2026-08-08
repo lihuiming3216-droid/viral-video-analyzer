@@ -61,6 +61,7 @@ function normalizeAnalysis(value: Partial<AnalysisResult>, sceneCount: number, t
   return {
     summary: String(value.summary || "分析已完成"),
     language: String(value.language || "unknown"),
+    translationZh: String(value.translationZh || ""),
     scores: {
       traffic: clampScore(rawScores.traffic), conversion: clampScore(rawScores.conversion),
       visual: clampScore(rawScores.visual), product: clampScore(rawScores.product),
@@ -102,7 +103,8 @@ function buildPrompt(input: {
   if (input.mode === "product_doc") {
     return `你是 TikTok 带货短视频拆解专家。请用中文输出精炼的产品样片分析。
 
-只输出：核心判断、开头钩子、分析爆点、内容结构、可借鉴点。不要输出评分、原视频链接、复拍口播稿、分镜脚本或逐镜头翻译。不要臆造页面或视频没有提供的信息。原口播文案保留原文。
+只输出：核心判断、开头钩子、分析爆点、内容结构、产品呈现、用户痛点或情绪、转化方式、可借鉴点，以及完整的中文口播翻译。不要输出评分、原视频链接、复拍口播稿或分镜脚本。不要臆造页面或视频没有提供的信息。
+translationZh 必须是完整原口播的自然中文翻译，不要只翻译其中几句；听不清的部分标记为“[听不清]”。
 
 产品：${JSON.stringify(input.product)}
 镜头时间轴：${JSON.stringify(timeline)}
@@ -110,7 +112,7 @@ function buildPrompt(input: {
 完整原文：${input.transcript}
 历史经验：${JSON.stringify(input.learningContext)}`;
   }
-  return `你是 TikTok 带货短视频拆解专家。请用中文输出，原文案保留英语或西语，并逐段给出中文翻译。
+  return `你是 TikTok 带货短视频拆解专家。请用中文输出，原文案保留英语或西语，并逐段给出中文翻译。translationZh 字段必须给出完整口播的中文翻译。
 
 目标：分别判断流量潜力和带货转化，不要因为播放量高就默认转化高。分析每个镜头的画面、声音、清晰度、美感、光线、产品主体是否清晰、节奏、情绪和商业作用。
 
@@ -150,7 +152,10 @@ function isUsableAnalysis(value: Record<string, unknown> | undefined, sceneCount
   if (!value || typeof value.summary !== "string" || !value.summary.trim()) return false;
   const scores = value.scores;
   const scenes = value.scenes;
-  if (mode === "product_doc") return Array.isArray(scenes) && scenes.length >= sceneCount;
+  // The table path deliberately asks for a compact object without scene rows
+  // or scores. Accept it here so an incomplete scene array does not trigger a
+  // second, expensive OpenAI request after Qwen already produced the answer.
+  if (mode === "product_doc") return typeof value.translationZh === "string" && Boolean(value.translationZh.trim());
   return Boolean(
     scores && typeof scores === "object"
     && Array.isArray(scenes)
@@ -222,7 +227,8 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal) {
 
     if (!relativeVideoPath) throw new Error("没有可分析的视频文件");
     setStage(videoId, "extracting", "正在识别镜头并提取关键画面", 36);
-    const assets = await extractVideoAssets(videoId, relativeVideoPath, signal);
+    const analysisMode = initial.analysisMode;
+    const assets = await extractVideoAssets(videoId, relativeVideoPath, signal, { light: analysisMode === "product_doc" });
     updateVideo(videoId, {
       duration_seconds: assets.duration,
       cover_path: getVideo(videoId, false)?.coverPath || assets.scenes[0]?.screenshotPath || null,
@@ -238,7 +244,6 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal) {
     const learningContext = getLearningContext(product, videoId);
     const learnedExamples = Array.isArray(learningContext.similarExamples) ? learningContext.similarExamples.length : 0;
     if (learnedExamples) trace.push(`长期学习：参考 ${learnedExamples} 条相似历史经验`);
-    const analysisMode = initial.analysisMode;
     const prompt = buildPrompt({ product, scenes: assets.scenes, transcript, transcriptSegments, learningContext, mode: analysisMode });
     const framePaths = assets.scenes.map((scene) => resolveMediaPath(scene.screenshotPath));
     setStage(videoId, "analyzing", "正在分析画面、声音、钩子和转化结构", 66);
@@ -254,7 +259,7 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal) {
       }
     }
 
-    setStage(videoId, "analyzing", "正在生成中文深度报告和复拍脚本", 82);
+    setStage(videoId, "analyzing", analysisMode === "product_doc" ? "正在生成轻量视频分析和中文翻译" : "正在生成中文深度报告和复拍脚本", 82);
     let rawAnalysis: Partial<AnalysisResult>;
     if (isUsableAnalysis(qwenContext, assets.scenes.length, analysisMode)) {
       rawAnalysis = qwenContext as Partial<AnalysisResult>;
@@ -335,10 +340,15 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal) {
       score_rhythm: analysis.scores.rhythm,
       summary: analysis.summary,
       hook_summary: analysis.hook.description,
-      transcript_zh: analysis.scenes.map((scene) => scene.translationZh).filter(Boolean).join(" "),
+      transcript_zh: analysis.translationZh || analysis.scenes.map((scene) => scene.translationZh).filter(Boolean).join(" "),
       analysis_json: JSON.stringify(analysis),
       error_message: null,
     });
+    // A video created by a Feishu Base automation carries a pending job. Push
+    // the compact result back to that exact record after analysis completes.
+    void import("@/lib/feishu/automation")
+      .then(({ completeFeishuAutomation }) => completeFeishuAutomation(videoId))
+      .catch(() => undefined);
     emitVideoProgress(videoId);
     try {
       learnFromVideo(videoId);
@@ -351,6 +361,9 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal) {
       stage: signal?.aborted ? "已停止" : "分析失败",
       error_message: signal?.aborted ? null : error instanceof Error ? error.message : "未知错误",
     });
+    void import("@/lib/feishu/automation")
+      .then(({ completeFeishuAutomation }) => completeFeishuAutomation(videoId))
+      .catch(() => undefined);
     emitVideoProgress(videoId);
     throw error;
   }

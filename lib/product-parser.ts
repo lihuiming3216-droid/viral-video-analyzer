@@ -1,7 +1,7 @@
 import "server-only";
 
 import { fetchOpenAI } from "@/lib/network";
-import { requireProvider } from "@/lib/provider-config";
+import { getProviderConfig, requireProvider } from "@/lib/provider-config";
 import { parseJsonLoose, readTextFromModelResponse } from "@/lib/json-utils";
 
 export interface ParsedProductInfo {
@@ -83,23 +83,15 @@ export async function parsePublicProductPage(productUrl: string): Promise<Parsed
   const description = meta(html, "og:description") || meta(html, "description");
   // Product pages often contain duplicated tracking/variant markup. Sending
   // all of it to the model adds cost without improving the extracted fields.
-  const text = htmlText(html).slice(0, 12_000);
+  const text = htmlText(html).slice(0, 8_000);
   const base = fallback(title, description, text);
 
-  try {
-    const config = requireProvider("openai");
-    const response = await fetchOpenAI(`${config.baseUrl}/responses`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${config.apiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: config.model || "gpt-4.1-mini",
-        input: [{ role: "user", content: [{ type: "input_text", text: `请从以下 TikTok Shop 公开商品页资料中整理产品资料。不要臆造页面没有提供的精确参数；不确定时写“页面未说明”。核心功能按重要程度输出最多5条。\n\n标题：${title}\n描述：${description}\n页面文本：${text}` }] }],
-        text: { format: { type: "json_schema", name: "product_info", strict: true, schema } },
-      }),
-      signal: AbortSignal.timeout(90_000),
-    });
-    if (!response.ok) return base;
-    const payload = await response.json() as Record<string, unknown>;
+  const prompt = `请从以下 TikTok Shop 公开商品页资料中整理产品资料。不要臆造页面没有提供的精确参数；不确定时写“页面未说明”。核心功能按重要程度输出最多5条，并在每条前加 A、B、C、D 或 E。
+
+标题：${title}
+描述：${description}
+页面文本：${text}`;
+  const parseResponse = (payload: Record<string, unknown>) => {
     const parsed = parseJsonLoose<Partial<ParsedProductInfo>>(readTextFromModelResponse(payload));
     return {
       ...base,
@@ -111,6 +103,43 @@ export async function parsePublicProductPage(productUrl: string): Promise<Parsed
       scenes: clean(parsed.scenes) || base.scenes,
       sellingPoints: clean(parsed.sellingPoints) || base.sellingPoints,
     };
+  };
+
+  try {
+    const qwen = getProviderConfig("qwen");
+    if (qwen.enabled && qwen.apiKey) {
+      const response = await fetch(`${qwen.baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${qwen.apiKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: qwen.model || "qwen3.7-plus",
+          messages: [{ role: "user", content: `${prompt}\n只返回合法 JSON，不要使用 Markdown 代码块。` }],
+          response_format: { type: "json_object" },
+          enable_thinking: false,
+        }),
+        signal: AbortSignal.timeout(60_000),
+      });
+      if (response.ok) return parseResponse(await response.json() as Record<string, unknown>);
+    }
+  } catch {
+    // Fall through to the optional OpenAI fallback.
+  }
+
+  try {
+    const config = requireProvider("openai");
+    const response = await fetchOpenAI(`${config.baseUrl}/responses`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${config.apiKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+        model: config.model || "gpt-4.1-mini",
+        input: [{ role: "user", content: [{ type: "input_text", text: prompt }] }],
+        text: { format: { type: "json_schema", name: "product_info", strict: true, schema } },
+      }),
+      signal: AbortSignal.timeout(90_000),
+    });
+    if (!response.ok) return base;
+    const payload = await response.json() as Record<string, unknown>;
+    return parseResponse(payload);
   } catch {
     return base;
   }

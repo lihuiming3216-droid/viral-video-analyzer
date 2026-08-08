@@ -336,6 +336,26 @@ export async function listFeishuDocumentBlocks(client: Client, documentId: strin
   return response.data?.items || [];
 }
 
+/** Normalize the legacy product-template header in place. */
+export async function normalizeProductTemplate(client: Client, documentId: string) {
+  const blocks = await listFeishuDocumentBlocks(client, documentId);
+  let updated = 0;
+  for (const block of blocks) {
+    const text = block.text as { elements?: Array<{ text_run?: { content?: string } }> } | undefined;
+    const content = text?.elements?.map((element) => element.text_run?.content || "").join("") || "";
+    const isLegacyHeader = content.includes("原口播文案") || content.trim() === "文案";
+    if (!isLegacyHeader || !block.block_id) continue;
+    const next = content.includes("原口播文案")
+      ? content.replaceAll("原口播文案", "中文翻译")
+      : content.replace(/^\s*文案\s*$/, "中文翻译");
+    if (next !== content) {
+      await updateFeishuTextBlock(client, documentId, String(block.block_id), next);
+      updated += 1;
+    }
+  }
+  return { scanned: blocks.length, updated };
+}
+
 export async function getFeishuDocumentBlock(client: Client, documentId: string, blockId: string) {
   const response = await client.request<{ code?: number; msg?: string; data?: { block?: Record<string, unknown> } }>({
     url: `/open-apis/docx/v1/documents/${encodeURIComponent(documentId)}/blocks/${encodeURIComponent(blockId)}`,
@@ -391,6 +411,7 @@ export async function ensureProductDocument(
     audience?: string;
     scenes?: string;
     sellingPoints?: string;
+    propImages?: string[];
   } = {},
 ) {
   if (product.documentId && product.documentUrl) {
@@ -430,12 +451,18 @@ export async function ensureProductDocument(
     适用人群: input.audience || product.targetAudience,
     使用场景: input.scenes || "",
     产品卖点: input.sellingPoints || product.sellingPoints,
+    道具列表: "图片1：员工手动录入\n图片2：员工手动录入\n图片3：员工手动录入",
+    图片1: input.propImages?.[0] || product.propImages?.[0] || "",
+    图片2: input.propImages?.[1] || product.propImages?.[1] || "",
+    图片3: input.propImages?.[2] || product.propImages?.[2] || "",
   };
   for (const block of blocks) {
     const text = block.text as { elements?: Array<{ text_run?: { content?: string } }> } | undefined;
     const content = text?.elements?.map((element) => element.text_run?.content || "").join("");
-    if (!content || !content.includes("{{")) continue;
-    const next = replaceTemplateText(content, values);
+    // Keep the template compatible with the previous header while standardizing
+    // the field name used by all future tables.
+    if (!content) continue;
+    const next = replaceTemplateText(content, values).replaceAll("原口播文案", "中文翻译");
     if (next !== content && block.block_id) await updateFeishuTextBlock(client, copied.documentId, String(block.block_id), next);
   }
   updateProduct(product.id, { documentId: copied.documentId, documentUrl: copied.documentUrl });

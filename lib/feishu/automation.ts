@@ -1,0 +1,226 @@
+import "server-only";
+
+import type { Client } from "@larksuiteoapi/node-sdk";
+import {
+  createProduct, createVideo, deleteFeishuAutomationJob, getFeishuAutomationJob,
+  getProduct, getProductByPid, getVideo, listVideos, saveFeishuAutomationJob,
+  updateProduct,
+} from "@/lib/database";
+import { ensureFeishuConnection, getConnectedFeishuChannel } from "@/lib/feishu/runtime";
+import { ensureProductDocument } from "@/lib/feishu/document";
+import { enqueueVideos } from "@/lib/queue";
+import { parsePublicProductPage } from "@/lib/product-parser";
+import type { AnalysisResult } from "@/lib/types";
+
+export interface FeishuAutomationFieldMap {
+  productUrl: string;
+  pid: string;
+  productName: string;
+  productDocument: string;
+  videoUrl: string;
+  analysis: string;
+  translation: string;
+  status: string;
+}
+
+export const defaultFeishuAutomationFieldMap: FeishuAutomationFieldMap = {
+  productUrl: "产品链接",
+  pid: "商品ID",
+  productName: "产品名称",
+  productDocument: "产品文档",
+  videoUrl: "视频链接",
+  analysis: "视频分析",
+  translation: "中文翻译",
+  status: "分析状态",
+};
+
+function text(value: unknown): string {
+  if (value == null) return "";
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return String(value).trim();
+  if (Array.isArray(value)) return value.map(text).filter(Boolean).join(", ");
+  if (typeof value === "object") {
+    const item = value as Record<string, unknown>;
+    return text(item.text ?? item.link ?? item.url ?? item.value ?? item.name ?? item.id);
+  }
+  return "";
+}
+
+function field(fields: Record<string, unknown>, name: string, aliases: string[] = []) {
+  for (const key of [name, ...aliases]) {
+    if (key in fields) return text(fields[key]);
+  }
+  return "";
+}
+
+function cleanUrl(value: string) {
+  return value.replace(/[，。；;、!！?？)）\]】}]+$/g, "");
+}
+
+function apiError(response: { code?: number; msg?: string } | null | undefined, fallback: string) {
+  if (response?.code && response.code !== 0) throw new Error(response.msg || fallback);
+}
+
+export function resolveAutomationFields(
+  fields: Record<string, unknown>,
+  inputMap: Partial<FeishuAutomationFieldMap> = {},
+) {
+  const map = { ...defaultFeishuAutomationFieldMap, ...inputMap };
+  return {
+    map,
+    productUrl: cleanUrl(field(fields, map.productUrl, ["商品链接", "产品链接"])) ,
+    pid: field(fields, map.pid, ["PID", "商品ID/PID"]),
+    productName: field(fields, map.productName, ["商品名称", "产品名"]),
+    productDocument: field(fields, map.productDocument),
+    videoUrl: cleanUrl(field(fields, map.videoUrl, ["样片链接", "视频链接"])),
+    analysis: field(fields, map.analysis),
+    translation: field(fields, map.translation),
+    status: field(fields, map.status),
+  };
+}
+
+async function patchBaseRecord(
+  client: Client,
+  input: { appToken: string; tableId: string; recordId: string; fields: Record<string, unknown> },
+) {
+  const response = await client.request<{ code?: number; msg?: string }>({
+    url: `/open-apis/bitable/v1/apps/${encodeURIComponent(input.appToken)}/tables/${encodeURIComponent(input.tableId)}/records/${encodeURIComponent(input.recordId)}`,
+    method: "PUT",
+    data: { fields: input.fields },
+  });
+  apiError(response, "回写飞书多维表格失败");
+}
+
+function conciseAnalysis(video: NonNullable<ReturnType<typeof getVideo>>) {
+  const analysis = video.analysis as AnalysisResult | null;
+  const hook = analysis?.hook;
+  const points = Array.isArray(analysis?.viralPoints) ? analysis.viralPoints : [];
+  const strengths = Array.isArray(analysis?.strengths) ? analysis.strengths : [];
+  const summary = String(video.summary || "通过痛点切入、产品演示和场景证明推动转化。")
+    .split(/(?<=[。！？])/)
+    .filter((sentence) => !/(评分|分数|潜力\s*[高低]|\d+\s*分|转化率)/.test(sentence))
+    .join("")
+    .trim();
+  return [
+    `核心判断：${summary || "通过痛点切入、产品演示和场景证明推动转化。"}`,
+    hook?.description ? `开头钩子：${hook.description}` : "",
+    points.slice(0, 3).map((point) => `分析爆点：${point.description || point.reason || "突出产品价值并推动继续观看"}`).join("\n"),
+    strengths.length ? `可借鉴点：${strengths.slice(0, 2).join("；")}` : "",
+    analysis?.structureFormula ? `内容结构：${analysis.structureFormula}` : "",
+  ].filter(Boolean).join("\n").trim();
+}
+
+export async function completeFeishuAutomation(videoId: string) {
+  const job = getFeishuAutomationJob(videoId);
+  const video = getVideo(videoId);
+  if (!job || !video || !["completed", "failed", "stopped"].includes(video.status)) return false;
+  const product = getProduct(video.productId);
+  const channel = getConnectedFeishuChannel() || await ensureFeishuConnection();
+  if (!channel) throw new Error("飞书应用尚未连接，无法回写自动化结果");
+  const map = { ...defaultFeishuAutomationFieldMap, ...job.fieldMap };
+  const fields: Record<string, unknown> = {
+    [map.status]: video.status === "completed" ? "已完成" : video.status === "failed" ? "失败" : "已停止",
+  };
+  if (video.status === "completed") {
+    fields[map.analysis] = conciseAnalysis(video);
+    fields[map.translation] = video.transcriptZh || "暂无中文翻译";
+    if (product?.documentUrl) fields[map.productDocument] = product.documentUrl;
+  } else if (video.errorMessage) {
+    fields[map.analysis] = `处理失败：${video.errorMessage}`;
+  }
+  await patchBaseRecord(channel.rawClient, { ...job, fields });
+  deleteFeishuAutomationJob(videoId);
+  return true;
+}
+
+export async function handleFeishuAutomation(input: {
+  client: Client;
+  appToken: string;
+  tableId: string;
+  recordId: string;
+  fields: Record<string, unknown>;
+  fieldMap?: Partial<FeishuAutomationFieldMap>;
+}) {
+  const resolved = resolveAutomationFields(input.fields, input.fieldMap);
+  const patch: Record<string, unknown> = {};
+  let product = resolved.pid ? getProductByPid(resolved.pid) : null;
+
+  if (!product && (resolved.productName || resolved.pid || resolved.productUrl)) {
+    product = createProduct({ name: resolved.productName || "未命名产品", pid: resolved.pid, productUrl: resolved.productUrl });
+  }
+
+  if (product && resolved.productUrl && product.productUrl !== resolved.productUrl) {
+    product = updateProduct(product.id, { productUrl: resolved.productUrl }) || product;
+  }
+
+  // Product docs need the three identifying values, but video analysis itself
+  // can still run when the product row is not complete.
+  if (product && resolved.productName && resolved.pid && resolved.productUrl) {
+    let parsed = null;
+    if (!product.productParameters && resolved.productUrl) {
+      parsed = await parsePublicProductPage(resolved.productUrl).catch(() => null);
+      if (parsed) {
+        product = updateProduct(product.id, {
+          productUrl: resolved.productUrl,
+          sku: parsed.sku || product.sku,
+          sellingPoints: parsed.sellingPoints,
+          targetAudience: parsed.audience,
+          coreFunctions: parsed.coreFunctions,
+          productParameters: parsed.productParameters,
+          usageMethod: parsed.usageMethod,
+          usageScenes: parsed.scenes,
+          sourceTitle: parsed.sourceTitle,
+          sourceDescription: parsed.sourceDescription,
+        }) || product;
+      }
+    }
+    const result = await ensureProductDocument(input.client, product, {
+      coreFunctions: product.coreFunctions,
+      productParameters: product.productParameters,
+      usageMethod: product.usageMethod,
+      audience: product.targetAudience,
+      scenes: product.usageScenes,
+      sellingPoints: product.sellingPoints,
+      propImages: product.propImages,
+    });
+    patch[resolved.map.productDocument] = result.documentUrl;
+  }
+
+  if (resolved.videoUrl) {
+    const targetProduct = product || getProductByPid(resolved.pid) || getProduct("system-unclassified");
+    if (!targetProduct) throw new Error("无法找到可归档视频的产品档案");
+    const existing = listVideos({ productId: targetProduct.id }).find((video) => video.sourceUrl === resolved.videoUrl);
+    const video = existing || createVideo({
+      productId: targetProduct.id,
+      sourceType: "tiktok",
+      sourceUrl: resolved.videoUrl,
+      title: resolved.productName ? `${resolved.productName}样片` : "飞书自动化样片",
+      analysisMode: "product_doc",
+    });
+    saveFeishuAutomationJob({
+      videoId: video.id,
+      appToken: input.appToken,
+      tableId: input.tableId,
+      recordId: input.recordId,
+      fieldMap: resolved.map,
+    });
+    if (existing?.status === "completed") {
+      // Reusing a finished URL must not spend API tokens a second time.
+      await completeFeishuAutomation(video.id);
+      patch[resolved.map.status] = "已完成";
+      patch[resolved.map.analysis] = conciseAnalysis(video);
+      patch[resolved.map.translation] = video.transcriptZh || "暂无中文翻译";
+      if (targetProduct.documentUrl) patch[resolved.map.productDocument] = targetProduct.documentUrl;
+    } else {
+      enqueueVideos([video.id]);
+      patch[resolved.map.status] = "排队中";
+    }
+  }
+
+  if (Object.keys(patch).length) await patchBaseRecord(input.client, {
+    appToken: input.appToken,
+    tableId: input.tableId,
+    recordId: input.recordId,
+    fields: patch,
+  });
+  return { ...resolved, patch };
+}

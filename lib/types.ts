@@ -21,6 +21,8 @@ export interface Product {
   documentId: string | null;
   documentUrl: string | null;
   imagePath: string | null;
+  /** Employee-entered prop images for the product document. */
+  propImages: string[];
   category: string;
   market: string;
   price: string;
@@ -140,6 +142,8 @@ export interface AnalysisScene {
 export interface AnalysisResult {
   summary: string;
   language: string;
+  /** Full Chinese translation used by Feishu's lightweight table output. */
+  translationZh: string;
   scores: ScoreSet;
   hook: {
     timeRange: string;

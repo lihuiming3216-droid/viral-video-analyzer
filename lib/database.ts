@@ -58,6 +58,7 @@ function initialize(db: DatabaseSync) {
       document_id TEXT,
       document_url TEXT,
       image_path TEXT,
+      prop_images_json TEXT NOT NULL DEFAULT '[]',
       category TEXT NOT NULL DEFAULT '',
       market TEXT NOT NULL DEFAULT '',
       price TEXT NOT NULL DEFAULT '',
@@ -203,6 +204,16 @@ function initialize(db: DatabaseSync) {
       updated_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS feishu_automation_jobs (
+      video_id TEXT PRIMARY KEY REFERENCES videos(id) ON DELETE CASCADE,
+      app_token TEXT NOT NULL,
+      table_id TEXT NOT NULL,
+      record_id TEXT NOT NULL,
+      field_map_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS feishu_targets (
       target_id TEXT PRIMARY KEY,
       target_type TEXT NOT NULL,
@@ -305,6 +316,7 @@ function initialize(db: DatabaseSync) {
     ["usage_scenes", "TEXT NOT NULL DEFAULT ''"],
     ["source_title", "TEXT NOT NULL DEFAULT ''"],
     ["source_description", "TEXT NOT NULL DEFAULT ''"],
+    ["prop_images_json", "TEXT NOT NULL DEFAULT '[]'"],
   ]) {
     if (!productColumns.some((column) => String(column.name) === name)) db.exec(`ALTER TABLE products ADD COLUMN ${name} ${definition}`);
   }
@@ -350,6 +362,38 @@ export function getDb() {
   return dbGlobal.__viralDb;
 }
 
+export function saveFeishuAutomationJob(input: {
+  videoId: string;
+  appToken: string;
+  tableId: string;
+  recordId: string;
+  fieldMap?: Record<string, string>;
+}) {
+  const timestamp = now();
+  getDb().prepare(`INSERT INTO feishu_automation_jobs(
+    video_id, app_token, table_id, record_id, field_map_json, created_at, updated_at
+  ) VALUES (?, ?, ?, ?, ?, ?, ?)
+  ON CONFLICT(video_id) DO UPDATE SET app_token=excluded.app_token, table_id=excluded.table_id,
+    record_id=excluded.record_id, field_map_json=excluded.field_map_json, updated_at=excluded.updated_at`)
+    .run(input.videoId, input.appToken, input.tableId, input.recordId, JSON.stringify(input.fieldMap || {}), timestamp, timestamp);
+}
+
+export function getFeishuAutomationJob(videoId: string) {
+  const row = getDb().prepare("SELECT * FROM feishu_automation_jobs WHERE video_id=?").get(videoId) as Record<string, unknown> | undefined;
+  if (!row) return null;
+  return {
+    videoId: String(row.video_id),
+    appToken: String(row.app_token),
+    tableId: String(row.table_id),
+    recordId: String(row.record_id),
+    fieldMap: json<Record<string, string>>(row.field_map_json, {}),
+  };
+}
+
+export function deleteFeishuAutomationJob(videoId: string) {
+  getDb().prepare("DELETE FROM feishu_automation_jobs WHERE video_id=?").run(videoId);
+}
+
 function productFromRow(row: Record<string, unknown>): Product {
   return {
     id: String(row.id),
@@ -359,6 +403,7 @@ function productFromRow(row: Record<string, unknown>): Product {
     documentId: row.document_id ? String(row.document_id) : null,
     documentUrl: row.document_url ? String(row.document_url) : null,
     imagePath: row.image_path ? String(row.image_path) : null,
+    propImages: json<string[]>(row.prop_images_json, []),
     category: String(row.category ?? ""),
     market: String(row.market ?? ""),
     price: String(row.price ?? ""),
@@ -472,9 +517,9 @@ export function createProduct(input: Partial<Product>) {
   const timestamp = now();
   getDb()
     .prepare(`INSERT INTO products(
-      id, name, pid, sku, document_id, document_url, image_path, category, market, price, selling_points, target_audience,
+      id, name, pid, sku, document_id, document_url, image_path, prop_images_json, category, market, price, selling_points, target_audience,
       pain_points, competitors, product_url, banned_terms, notes, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
     .run(
       id,
       input.name?.trim() || "未命名产品",
@@ -483,6 +528,7 @@ export function createProduct(input: Partial<Product>) {
       input.documentId || null,
       input.documentUrl || null,
       input.imagePath || null,
+      JSON.stringify(input.propImages || []),
       input.category || "",
       input.market || "",
       input.price || "",
@@ -521,7 +567,7 @@ export function updateProduct(id: string, input: Partial<Product>) {
   const current = getProduct(id);
   if (!current) return null;
   getDb()
-    .prepare(`UPDATE products SET name=?, pid=?, sku=?, document_id=?, document_url=?, image_path=?, category=?, market=?, price=?, selling_points=?,
+    .prepare(`UPDATE products SET name=?, pid=?, sku=?, document_id=?, document_url=?, image_path=?, prop_images_json=?, category=?, market=?, price=?, selling_points=?,
       target_audience=?, pain_points=?, competitors=?, product_url=?, banned_terms=?, notes=?,
       core_functions_json=?, product_parameters=?, usage_method=?, usage_scenes=?, source_title=?, source_description=?, updated_at=? WHERE id=?`)
     .run(
@@ -531,6 +577,7 @@ export function updateProduct(id: string, input: Partial<Product>) {
       input.documentId ?? current.documentId,
       input.documentUrl ?? current.documentUrl,
       input.imagePath ?? current.imagePath,
+      JSON.stringify(input.propImages ?? current.propImages),
       input.category ?? current.category,
       input.market ?? current.market,
       input.price ?? current.price,

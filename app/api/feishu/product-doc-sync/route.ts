@@ -87,8 +87,7 @@ export async function POST(request: NextRequest) {
       if (childIds.some((id) => !id)) continue;
       let childBlocks;
       try {
-        childBlocks = [];
-        for (const childId of childIds) childBlocks.push(await getBlock(channel.rawClient, documentId, childId));
+        childBlocks = await Promise.all(childIds.map((childId) => getBlock(channel.rawClient, documentId, childId)));
       } catch (error) { throw new Error(`读取单元格文本失败（${childIds.join(",")}）：${error instanceof Error ? error.message : "未知错误"}`); }
       const statusBlock = childBlocks[1];
       const status = textFrom(statusBlock);
@@ -105,7 +104,10 @@ export async function POST(request: NextRequest) {
       if (existing.status === "completed") {
         const analysis = conciseAnalysis(existing);
         if (textFrom(childBlocks[2]) !== analysis) await updateFeishuTextBlock(channel.rawClient, documentId, childIds[2], analysis);
-        if (textFrom(childBlocks[3]) !== existing.transcriptOriginal) await updateFeishuTextBlock(channel.rawClient, documentId, childIds[3], existing.transcriptOriginal || "暂无原口播文案");
+        // The product-document table intentionally receives the Chinese
+        // translation only. The original transcript remains available in the
+        // full report inside the app.
+        if (textFrom(childBlocks[3]) !== existing.transcriptZh) await updateFeishuTextBlock(channel.rawClient, documentId, childIds[3], existing.transcriptZh || "暂无中文翻译");
         completed += 1;
       }
     }

@@ -142,19 +142,12 @@ export async function handleFeishuAutomation(input: {
 }) {
   const resolved = resolveAutomationFields(input.fields, input.fieldMap);
   const patch: Record<string, unknown> = {};
-  // The lightweight Base workflow can now trigger on product URL alone.
-  // Parse only when a name/PID is missing; existing complete rows avoid the
-  // extra page fetch and model call.
+  // The Base workflow requires the team's Chinese product name and URL.
+  // PID is optional input and is derived from the public URL when omitted.
+  if (!resolved.productUrl || !resolved.productName) return { ...resolved, patch };
   let parsed = null;
-  let effectivePid = resolved.pid || extractProductIdFromUrl(resolved.productUrl);
-  let effectiveName = resolved.productName;
-  if (resolved.productUrl && (!effectivePid || !effectiveName)) {
-    parsed = await parsePublicProductPage(resolved.productUrl).catch(() => null);
-    if (parsed) {
-      effectiveName = effectiveName || parsed.productName || parsed.sourceTitle;
-      effectivePid = effectivePid || extractProductIdFromUrl(resolved.productUrl);
-    }
-  }
+  const effectivePid = resolved.pid || extractProductIdFromUrl(resolved.productUrl);
+  const effectiveName = resolved.productName;
   let product = effectivePid ? getProductByPid(effectivePid) : null;
 
   if (!product && (effectiveName || effectivePid || resolved.productUrl)) {
@@ -169,7 +162,6 @@ export async function handleFeishuAutomation(input: {
     }) || product;
   }
 
-  if (effectiveName && effectiveName !== resolved.productName) patch[resolved.map.productName] = effectiveName;
   if (effectivePid && effectivePid !== resolved.pid) patch[resolved.map.pid] = effectivePid;
 
   // Product docs need the three identifying values, but video analysis itself
@@ -189,7 +181,7 @@ export async function handleFeishuAutomation(input: {
           usageScenes: parsed.scenes,
           sourceTitle: parsed.sourceTitle,
           sourceDescription: parsed.sourceDescription,
-          name: effectiveName || parsed.productName || parsed.sourceTitle || product.name,
+          name: effectiveName,
           pid: effectivePid || product.pid,
         }) || product;
       }

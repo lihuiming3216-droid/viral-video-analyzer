@@ -161,7 +161,7 @@ test("product cards use Qwen search when TikTok is unreachable and resync reused
   assert.match(parser, /tools: \[\{ type: "web_search_image" \}\]/);
   assert.match(parser, /enable_thinking: false/);
   assert.match(parser, /hasUsableProductInfo/);
-  assert.match(parser, /核心功能（按重要程度）/);
+  assert.match(parser, /产品主要功能/);
   assert.match(parser, /JSON 键名必须严格使用以下英文键/);
   assert.match(parser, /SKU 不得填写 PID 或商品ID/);
   assert.match(parser, /skuWithoutLabel !== clean\(productId\)/);
@@ -173,6 +173,8 @@ test("product cards use Qwen search when TikTok is unreachable and resync reused
   assert.match(parser, /hasReliableVisualEvidence/);
   assert.match(parser, /categoryFallbackPrompt/);
   assert.match(parser, /产品参数和 visualEvidence 必须严格写“页面未说明”/);
+  assert.match(parser, /sellingPoints 必须严格返回空字符串/);
+  assert.match(parser, /sellingPoints: ""/);
   assert.match(parser, /productParameters: "页面未说明"/);
   assert.match(parser, /sourceImageUrls: \[\]/);
   assert.match(automation, /!product\.visualAnalyzedAt/);
@@ -183,6 +185,9 @@ test("product cards use Qwen search when TikTok is unreachable and resync reused
   assert.match(database, /visual_analyzed_at/);
   assert.match(automation, /已停止生成空白产品手卡/);
   assert.match(document, /syncProductFieldText/);
+  assert.match(document, /\["产品卖点", "", true\]/);
+  assert.match(document, /核心功能A: ""/);
+  assert.match(document, /核心功能E: ""/);
   assert.match(document, /values\[`核心功能\$\{ranked\[2\]\.toUpperCase\(\)\}`\] \|\| ""/);
   assert.match(document, /next = `\$\{ranked\[1\]\}\$\{value\}`/);
   assert.match(document, /const reused = Boolean\(product\.documentId && product\.documentUrl\)/);

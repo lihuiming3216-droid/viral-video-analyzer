@@ -238,7 +238,8 @@ function normalizeParsed(
     usageMethod: clean(parsedValue(parsed, ["usageMethod", "使用方法"])),
     audience: clean(parsedValue(parsed, ["audience", "适用人群", "目标人群"])),
     scenes: clean(parsedValue(parsed, ["scenes", "使用场景", "适用场景"])),
-    sellingPoints: clean(parsedValue(parsed, ["sellingPoints", "产品卖点", "卖点"])),
+    // 产品卖点暂不由 AI 生成，避免把品类常识包装成未经证实的商品卖点。
+    sellingPoints: "",
     visualEvidence: clean(parsedValue(parsed, ["visualEvidence", "图片证据", "视觉证据", "图片分析"])),
   };
 }
@@ -285,13 +286,13 @@ function extractionPrompt(input: {
     : input.visualMode === "search"
       ? "使用可靠图片确认产品外观结构、接口/按键、随附配件、可见文字和使用方式，并把这些可靠信息融入各字段。如果没有可靠图片，visualEvidence 必须严格写“页面未说明”，且不得使用相似商品图推断该商品功能。"
       : "当前没有可靠商品图片，只能根据公开文字资料整理。";
-  return `你在整理 TikTok Shop 产品手卡。\n${identity}\n${evidence}\n${visualInstruction}\n\n请输出以下字段：SKU、3至5条核心功能、产品参数、使用方法、适用人群、使用场景、产品卖点，以及一条简短的图片证据摘要 visualEvidence。核心功能按重要程度排序，但内容中不要写 A/B/C/D/E 前缀。SKU 不得填写 PID 或商品ID；找不到真实 SKU 时写“页面未说明”。不得根据图片猜测精确尺寸、功率、材质、兼容型号、认证或包装数量；公开资料没有精确参数时，产品参数写“页面未说明”。无法从可靠图片确认时 visualEvidence 写“页面未说明”。其他字段可以根据已确认的产品品类进行保守归纳。产品卖点要具体、便于短视频拍摄，不写治疗、预防或控制疾病等违规功效。只返回合法 JSON，不要使用 Markdown 代码块。JSON 键名必须严格使用以下英文键：{"sku":"","coreFunctions":[""],"productParameters":"","usageMethod":"","audience":"","scenes":"","sellingPoints":"","visualEvidence":""}。`;
+  return `你在整理 TikTok Shop 产品手卡。\n${identity}\n${evidence}\n${visualInstruction}\n\n请输出以下字段：SKU、2至5条产品主要功能、产品参数、使用方法、适用人群、使用场景，以及一条简短的图片证据摘要 visualEvidence。产品主要功能按重要程度排序，但内容中不要写 A/B/C/D/E 前缀。SKU 不得填写 PID 或商品ID；找不到真实 SKU 时写“页面未说明”。不得根据图片猜测精确尺寸、功率、材质、兼容型号、认证或包装数量；公开资料没有精确参数时，产品参数写“页面未说明”。无法从可靠图片确认时 visualEvidence 写“页面未说明”。其他字段可以根据已确认的产品品类进行保守归纳。sellingPoints 暂不生成，必须严格返回空字符串。只返回合法 JSON，不要使用 Markdown 代码块。JSON 键名必须严格使用以下英文键：{"sku":"","coreFunctions":[""],"productParameters":"","usageMethod":"","audience":"","scenes":"","sellingPoints":"","visualEvidence":""}。`;
 }
 
 function categoryFallbackPrompt(productUrl: string, hints: ProductParseHints) {
   const productName = clean(hints.productName) || "未命名产品";
   const productId = clean(hints.pid) || extractProductIdFromUrl(productUrl) || "未提供";
-  return `你在整理 TikTok Shop 产品手卡，但目前没有可验证的商品页文字或商品图片。唯一可用证据是团队中文品类名“${productName}”和 PID ${productId}。请只做被这个品类名直接支持的保守归纳：输出2至4条最基础核心功能、通用使用方法、适用人群、使用场景和不含具体规格的拍摄卖点。不得写入品类名没有明确表达的屏幕、接口、遥控器、配件、材质、尺寸、容量、功率、芯片、型号、兼容标准、包装数量或其他精确特征；不得出现品类名中没有的数字或型号。SKU、产品参数和 visualEvidence 必须严格写“页面未说明”。只返回合法 JSON，不要使用 Markdown 代码块。JSON 键名必须严格使用以下英文键：{"sku":"页面未说明","coreFunctions":[""],"productParameters":"页面未说明","usageMethod":"","audience":"","scenes":"","sellingPoints":"","visualEvidence":"页面未说明"}。`;
+  return `你在整理 TikTok Shop 产品手卡，但目前没有可验证的商品页文字或商品图片。唯一可用证据是团队中文品类名“${productName}”和 PID ${productId}。请只做被这个品类名直接支持的保守归纳：输出2至4条最基础产品主要功能、通用使用方法、适用人群和使用场景。不得写入品类名没有明确表达的屏幕、接口、遥控器、配件、材质、尺寸、容量、功率、芯片、型号、兼容标准、包装数量或其他精确特征；不得出现品类名中没有的数字或型号。SKU、产品参数和 visualEvidence 必须严格写“页面未说明”，sellingPoints 必须严格返回空字符串。只返回合法 JSON，不要使用 Markdown 代码块。JSON 键名必须严格使用以下英文键：{"sku":"页面未说明","coreFunctions":[""],"productParameters":"页面未说明","usageMethod":"","audience":"","scenes":"","sellingPoints":"","visualEvidence":"页面未说明"}。`;
 }
 
 async function qwenExtract(prompt: string) {

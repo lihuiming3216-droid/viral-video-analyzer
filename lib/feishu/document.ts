@@ -400,8 +400,8 @@ function replaceTemplateText(content: string, values: Record<string, string>) {
   return Object.entries(values).reduce((result, [key, value]) => result.replaceAll(`{{${key}}}`, value || ""), content);
 }
 
-function replaceLabeledValue(content: string, label: string, value: string) {
-  if (!value || !content.includes(label)) return content;
+function replaceLabeledValue(content: string, label: string, value: string, allowEmpty = false) {
+  if ((!value && !allowEmpty) || !content.includes(label)) return content;
   const labelIndex = content.indexOf(label);
   const colonIndex = [content.indexOf("：", labelIndex), content.indexOf(":", labelIndex)]
     .filter((index) => index >= 0)
@@ -412,7 +412,7 @@ function replaceLabeledValue(content: string, label: string, value: string) {
 
 function syncProductFieldText(content: string, values: Record<string, string>) {
   let next = replaceTemplateText(content, values).replaceAll("原口播文案", "中文翻译");
-  const labels: Array<[string, string]> = [
+  const labels: Array<[string, string, boolean?]> = [
     ["商品名称", values.商品名称],
     ["产品链接", values.产品链接],
     ["商品ID", values.商品ID],
@@ -422,9 +422,9 @@ function syncProductFieldText(content: string, values: Record<string, string>) {
     ["使用方法", values.使用方法],
     ["适用人群", values.适用人群],
     ["使用场景", values.使用场景],
-    ["产品卖点", values.产品卖点],
+    ["产品卖点", "", true],
   ];
-  for (const [label, value] of labels) next = replaceLabeledValue(next, label, value);
+  for (const [label, value, allowEmpty] of labels) next = replaceLabeledValue(next, label, value, allowEmpty);
   const ranked = next.match(/^(\s*([A-E])[.．、:：]\s*).*$/i);
   if (ranked) {
     const value = values[`核心功能${ranked[2].toUpperCase()}`] || "";
@@ -469,16 +469,17 @@ export async function ensureProductDocument(
     商品ID: product.pid,
     SKU: product.sku,
     核心功能: functions.slice(0, 3).join("；"),
-    核心功能A: functions[0] || "",
-    核心功能B: functions[1] || "",
-    核心功能C: functions[2] || "",
-    核心功能D: functions[3] || "",
-    核心功能E: functions[4] || "",
+    // “产品主要功能”已经展示同一组信息，A-E 暂时统一留空。
+    核心功能A: "",
+    核心功能B: "",
+    核心功能C: "",
+    核心功能D: "",
+    核心功能E: "",
     产品参数: input.productParameters || "",
     使用方法: input.usageMethod || "",
     适用人群: input.audience || product.targetAudience,
     使用场景: input.scenes || "",
-    产品卖点: input.sellingPoints || product.sellingPoints,
+    产品卖点: "",
     道具列表: "图片1：员工手动录入\n图片2：员工手动录入\n图片3：员工手动录入",
     图片1: input.propImages?.[0] || product.propImages?.[0] || "",
     图片2: input.propImages?.[1] || product.propImages?.[1] || "",

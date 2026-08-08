@@ -80,6 +80,7 @@ export function resolveAutomationFields(
     // PID is the source of truth. Always regenerate the public product URL
     // so the two fields cannot drift apart.
     productUrl: productUrlFromPid(pid) || cleanUrl(field(fields, map.productUrl, ["商品链接", "产品链接"])),
+    hasProductUrlField: hasExplicitProductUrl,
     pid,
     productName: field(fields, map.productName, ["商品名称", "产品名"]),
     productDocument: field(fields, map.productDocument),
@@ -175,7 +176,7 @@ export async function handleFeishuAutomation(input: {
   }
 
   if (effectivePid && effectivePid !== resolved.pid) patch[resolved.map.pid] = effectivePid;
-  if (resolved.productUrl) patch[resolved.map.productUrl] = resolved.productUrl;
+  if (resolved.hasProductUrlField && resolved.productUrl) patch[resolved.map.productUrl] = resolved.productUrl;
 
   // Product docs need the PID, the team's Chinese name, and the generated URL.
   if (product && effectiveName && effectivePid && resolved.productUrl) {

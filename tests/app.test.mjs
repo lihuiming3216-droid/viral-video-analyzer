@@ -150,6 +150,20 @@ test("Feishu automation can return fields without requiring Base write permissio
   assert.match(route, /writeBackError/);
 });
 
+test("product cards use Qwen search when TikTok is unreachable and resync reused documents", async () => {
+  const [parser, automation, document] = await Promise.all([
+    readFile(new URL("lib/product-parser.ts", root), "utf8"),
+    readFile(new URL("lib/feishu/automation.ts", root), "utf8"),
+    readFile(new URL("lib/feishu/document.ts", root), "utf8"),
+  ]);
+  assert.match(parser, /enable_search:\s*true/);
+  assert.match(parser, /forced_search:\s*true/);
+  assert.match(parser, /hasUsableProductInfo/);
+  assert.match(automation, /已停止生成空白产品手卡/);
+  assert.match(document, /syncProductFieldText/);
+  assert.match(document, /const reused = Boolean\(product\.documentId && product\.documentUrl\)/);
+});
+
 test("long-term learning is visible and used by future analysis", async () => {
   const [learning, analysis, app, feedbackRoute] = await Promise.all([
     readFile(new URL("lib/learning.ts", root), "utf8"),

@@ -8,7 +8,10 @@ export async function POST(request: NextRequest) {
     const body = await request.json();
     const productUrl = String(body.productUrl || "").trim();
     if (!productUrl) return NextResponse.json({ error: "缺少产品链接" }, { status: 400 });
-    const parsed = await parsePublicProductPage(productUrl);
+    const parsed = await parsePublicProductPage(productUrl, {
+      productName: String(body.productName || body.name || "").trim(),
+      pid: String(body.pid || "").trim(),
+    });
     return NextResponse.json({ ok: true, parsed });
   } catch (error) {
     return NextResponse.json({ error: error instanceof Error ? error.message : "商品页解析失败" }, { status: 500 });

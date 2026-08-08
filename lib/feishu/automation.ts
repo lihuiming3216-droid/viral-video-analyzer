@@ -9,7 +9,7 @@ import {
 import { ensureFeishuConnection, getConnectedFeishuChannel } from "@/lib/feishu/runtime";
 import { ensureProductDocument } from "@/lib/feishu/document";
 import { enqueueVideos } from "@/lib/queue";
-import { parsePublicProductPage } from "@/lib/product-parser";
+import { hasUsableProductInfo, parsePublicProductPage } from "@/lib/product-parser";
 import type { AnalysisResult } from "@/lib/types";
 
 export interface FeishuAutomationFieldMap {
@@ -194,8 +194,11 @@ export async function handleFeishuAutomation(input: {
 
   // Product docs need the PID, the team's Chinese name, and the generated URL.
   if (product && effectiveName && effectivePid && resolved.productUrl) {
-    if (!product.productParameters && resolved.productUrl) {
-      parsed = parsed || await parsePublicProductPage(resolved.productUrl).catch(() => null);
+    if (!hasUsableProductInfo(product) && resolved.productUrl) {
+      parsed = parsed || await parsePublicProductPage(resolved.productUrl, {
+        productName: effectiveName,
+        pid: effectivePid,
+      });
       if (parsed) {
         product = updateProduct(product.id, {
           productUrl: resolved.productUrl,
@@ -212,6 +215,9 @@ export async function handleFeishuAutomation(input: {
           pid: effectivePid || product.pid,
         }) || product;
       }
+    }
+    if (!hasUsableProductInfo(product)) {
+      throw new Error("商品资料不足，已停止生成空白产品手卡，请稍后重试");
     }
     const result = await ensureProductDocument(input.client, product, {
       coreFunctions: product.coreFunctions,

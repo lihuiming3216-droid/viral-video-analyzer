@@ -4,7 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { createReadStream, statSync } from "node:fs";
 import path from "node:path";
 import type { Client } from "@larksuiteoapi/node-sdk";
-import { getProduct, getProductByPid, getVideo, updateProduct } from "@/lib/database";
+import { getProduct, getVideo, updateProduct } from "@/lib/database";
 import { formatTime } from "@/lib/json-utils";
 import { resolveMediaPath } from "@/lib/video-processing";
 import {
@@ -400,6 +400,39 @@ function replaceTemplateText(content: string, values: Record<string, string>) {
   return Object.entries(values).reduce((result, [key, value]) => result.replaceAll(`{{${key}}}`, value || ""), content);
 }
 
+function replaceLabeledValue(content: string, label: string, value: string) {
+  if (!value || !content.includes(label)) return content;
+  const labelIndex = content.indexOf(label);
+  const colonIndex = [content.indexOf("：", labelIndex), content.indexOf(":", labelIndex)]
+    .filter((index) => index >= 0)
+    .sort((a, b) => a - b)[0];
+  const prefixEnd = colonIndex == null ? labelIndex + label.length : colonIndex + 1;
+  return `${content.slice(0, prefixEnd)}${colonIndex == null ? "：" : ""}${value}`;
+}
+
+function syncProductFieldText(content: string, values: Record<string, string>) {
+  let next = replaceTemplateText(content, values).replaceAll("原口播文案", "中文翻译");
+  const labels: Array<[string, string]> = [
+    ["商品名称", values.商品名称],
+    ["产品链接", values.产品链接],
+    ["商品ID", values.商品ID],
+    ["产品主要功能", values.核心功能],
+    ["产品SKU", values.SKU],
+    ["产品参数", values.产品参数],
+    ["使用方法", values.使用方法],
+    ["适用人群", values.适用人群],
+    ["使用场景", values.使用场景],
+    ["产品卖点", values.产品卖点],
+  ];
+  for (const [label, value] of labels) next = replaceLabeledValue(next, label, value);
+  const ranked = next.match(/^(\s*([A-E])[.．、:：]\s*).*$/i);
+  if (ranked) {
+    const value = values[`核心功能${ranked[2].toUpperCase()}`];
+    if (value) next = `${ranked[1]}${value}`;
+  }
+  return next;
+}
+
 export async function ensureProductDocument(
   client: Client,
   product: Product,
@@ -414,22 +447,17 @@ export async function ensureProductDocument(
     propImages?: string[];
   } = {},
 ) {
-  if (product.documentId && product.documentUrl) {
-    let permissionWarning = "";
-    try { await setCompanyEditable(client, product.documentId); }
-    catch (error) { permissionWarning = error instanceof Error ? error.message : "设置公司内编辑权限失败"; }
-    return { documentId: product.documentId, documentUrl: product.documentUrl, reused: true, permissionWarning };
-  }
   if (!product.pid.trim()) throw new Error("创建产品文档前必须有 PID");
 
   const settings = getFeishuSettings();
-  const templateToken = input.templateToken?.trim() || process.env.FEISHU_PRODUCT_TEMPLATE_TOKEN?.trim() || defaultProductTemplateToken;
-  const title = safeName(`${product.name}_${product.pid}`);
-  const copied = await copyFeishuTemplateDocument(client, {
-    templateToken,
-    name: title,
-    folderToken: settings.rootFolderToken || undefined,
-  });
+  const reused = Boolean(product.documentId && product.documentUrl);
+  const copied = reused
+    ? { documentId: String(product.documentId), documentUrl: String(product.documentUrl), title: safeName(`${product.name}_${product.pid}`), type: "docx" }
+    : await copyFeishuTemplateDocument(client, {
+      templateToken: input.templateToken?.trim() || process.env.FEISHU_PRODUCT_TEMPLATE_TOKEN?.trim() || defaultProductTemplateToken,
+      name: safeName(`${product.name}_${product.pid}`),
+      folderToken: settings.rootFolderToken || undefined,
+    });
   let permissionWarning = "";
   try { await setCompanyEditable(client, copied.documentId); }
   catch (error) { permissionWarning = error instanceof Error ? error.message : "设置公司内编辑权限失败"; }
@@ -440,7 +468,7 @@ export async function ensureProductDocument(
     产品链接: product.productUrl,
     商品ID: product.pid,
     SKU: product.sku,
-    核心功能: functions[0] || "",
+    核心功能: functions.slice(0, 3).join("；"),
     核心功能A: functions[0] || "",
     核心功能B: functions[1] || "",
     核心功能C: functions[2] || "",
@@ -462,11 +490,11 @@ export async function ensureProductDocument(
     // Keep the template compatible with the previous header while standardizing
     // the field name used by all future tables.
     if (!content) continue;
-    const next = replaceTemplateText(content, values).replaceAll("原口播文案", "中文翻译");
+    const next = syncProductFieldText(content, values);
     if (next !== content && block.block_id) await updateFeishuTextBlock(client, copied.documentId, String(block.block_id), next);
   }
   updateProduct(product.id, { documentId: copied.documentId, documentUrl: copied.documentUrl });
-  return { ...copied, reused: false, permissionWarning };
+  return { ...copied, reused, permissionWarning };
 }
 
 export async function insertFeishuTextBlocks(

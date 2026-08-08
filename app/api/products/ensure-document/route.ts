@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { createProduct, getProductByPid, updateProduct } from "@/lib/database";
 import { ensureProductDocument } from "@/lib/feishu/document";
 import { ensureFeishuConnection, getConnectedFeishuChannel } from "@/lib/feishu/runtime";
-import { parsePublicProductPage } from "@/lib/product-parser";
+import { hasUsableProductInfo, parsePublicProductPage } from "@/lib/product-parser";
 
 export const runtime = "nodejs";
 
@@ -18,10 +18,9 @@ export async function POST(request: NextRequest) {
 
     const product = getProductByPid(pid) || createProduct({ name, pid, productUrl });
     let parsed = null;
-    const hasCachedProductInfo = product.productUrl === productUrl
-      && (product.productParameters || product.usageMethod || product.coreFunctions.length);
+    const hasCachedProductInfo = product.productUrl === productUrl && hasUsableProductInfo(product);
     if (body.parseProduct !== false && !hasCachedProductInfo) {
-      try { parsed = await parsePublicProductPage(productUrl); } catch { parsed = null; }
+      parsed = await parsePublicProductPage(productUrl, { productName: name, pid });
     }
     if (parsed) {
       updateProduct(product.id, {

@@ -158,8 +158,8 @@ test("product cards use Qwen search when TikTok is unreachable and resync reused
     readFile(new URL("lib/database.ts", root), "utf8"),
     readFile(new URL("app/api/products/ensure-document/route.ts", root), "utf8"),
   ]);
-  assert.match(parser, /enable_search:\s*true/);
-  assert.match(parser, /forced_search:\s*true/);
+  assert.match(parser, /tools: \[\{ type: "web_search_image" \}\]/);
+  assert.match(parser, /enable_thinking: false/);
   assert.match(parser, /hasUsableProductInfo/);
   assert.match(parser, /核心功能（按重要程度）/);
   assert.match(parser, /JSON 键名必须严格使用以下英文键/);
@@ -170,6 +170,11 @@ test("product cards use Qwen search when TikTok is unreachable and resync reused
   assert.match(parser, /MAX_PRODUCT_IMAGES = 4/);
   assert.match(parser, /max_pixels: MAX_IMAGE_PIXELS/);
   assert.match(parser, /visualEvidence/);
+  assert.match(parser, /hasReliableVisualEvidence/);
+  assert.match(parser, /categoryFallbackPrompt/);
+  assert.match(parser, /产品参数和 visualEvidence 必须严格写“页面未说明”/);
+  assert.match(parser, /productParameters: "页面未说明"/);
+  assert.match(parser, /sourceImageUrls: \[\]/);
   assert.match(automation, /!product\.visualAnalyzedAt/);
   assert.match(automation, /visualAnalyzedAt: new Date\(\)\.toISOString\(\)/);
   assert.match(ensureDocument, /forceProductParse === true/);

@@ -72,6 +72,12 @@ function useful(value: unknown) {
   return Boolean(normalized && !/^(?:(?:页面|网页|商品页)?(?:暂未|未)(?:提供|说明|展示|找到)|无法(?:确认|判断|识别)|无可靠|不确定$|未知$)/i.test(normalized));
 }
 
+function hasReliableVisualEvidence(value: unknown) {
+  const normalized = clean(value);
+  return useful(normalized)
+    && !/(?:未发现|未能找到|没有找到|没有可靠|无可靠|无法确认|无法判断|无法作为|不能作为|仅为.+示意|与.+不对应|缺乏.+(?:图片|图像))/i.test(normalized);
+}
+
 export function hasUsableProductInfo(info: {
   coreFunctions: string[];
   productParameters: string;
@@ -272,17 +278,23 @@ function extractionPrompt(input: {
 }) {
   const identity = `团队中文名称：${clean(input.hints.productName) || "未提供"}\n商品 PID：${clean(input.hints.pid) || extractProductIdFromUrl(input.productUrl) || "未提供"}\n商品链接：${input.productUrl}`;
   const evidence = input.visualMode === "search"
-    ? `阿里云服务器无法直连商品页。请同时搜索上述 PID、商品链接和产品名称的网页与图片，优先采用 TikTok 商品页、商家页及同一 PID 的公开资料；只有能与 PID 或商品名称可靠对应的图片才可作为证据。`
+    ? `阿里云服务器无法直连商品页。请只调用一次图片搜索，搜索上述 PID、商品链接和产品名称；只有能与 PID 或商品可靠对应的图片才可作为证据，普通同品类图片不得作为该商品证据。`
     : `页面标题：${input.title}\n页面描述：${input.description}\n页面正文：${input.pageText}`;
   const visualInstruction = input.visualMode === "direct"
     ? "下方会附带商品图片。必须结合图片确认产品外观结构、接口/按键、随附配件、可见文字和使用方式，并把这些可靠信息融入各字段。"
     : input.visualMode === "search"
-      ? "必须使用图片搜索结果确认产品外观结构、接口/按键、随附配件、可见文字和使用方式，并把这些可靠信息融入各字段。"
+      ? "使用可靠图片确认产品外观结构、接口/按键、随附配件、可见文字和使用方式，并把这些可靠信息融入各字段。如果没有可靠图片，visualEvidence 必须严格写“页面未说明”，且不得使用相似商品图推断该商品功能。"
       : "当前没有可靠商品图片，只能根据公开文字资料整理。";
   return `你在整理 TikTok Shop 产品手卡。\n${identity}\n${evidence}\n${visualInstruction}\n\n请输出以下字段：SKU、3至5条核心功能、产品参数、使用方法、适用人群、使用场景、产品卖点，以及一条简短的图片证据摘要 visualEvidence。核心功能按重要程度排序，但内容中不要写 A/B/C/D/E 前缀。SKU 不得填写 PID 或商品ID；找不到真实 SKU 时写“页面未说明”。不得根据图片猜测精确尺寸、功率、材质、兼容型号、认证或包装数量；公开资料没有精确参数时，产品参数写“页面未说明”。无法从可靠图片确认时 visualEvidence 写“页面未说明”。其他字段可以根据已确认的产品品类进行保守归纳。产品卖点要具体、便于短视频拍摄，不写治疗、预防或控制疾病等违规功效。只返回合法 JSON，不要使用 Markdown 代码块。JSON 键名必须严格使用以下英文键：{"sku":"","coreFunctions":[""],"productParameters":"","usageMethod":"","audience":"","scenes":"","sellingPoints":"","visualEvidence":""}。`;
 }
 
-async function qwenExtract(prompt: string, enableSearch: boolean) {
+function categoryFallbackPrompt(productUrl: string, hints: ProductParseHints) {
+  const productName = clean(hints.productName) || "未命名产品";
+  const productId = clean(hints.pid) || extractProductIdFromUrl(productUrl) || "未提供";
+  return `你在整理 TikTok Shop 产品手卡，但目前没有可验证的商品页文字或商品图片。唯一可用证据是团队中文品类名“${productName}”和 PID ${productId}。请只做被这个品类名直接支持的保守归纳：输出2至4条最基础核心功能、通用使用方法、适用人群、使用场景和不含具体规格的拍摄卖点。不得写入品类名没有明确表达的屏幕、接口、遥控器、配件、材质、尺寸、容量、功率、芯片、型号、兼容标准、包装数量或其他精确特征；不得出现品类名中没有的数字或型号。SKU、产品参数和 visualEvidence 必须严格写“页面未说明”。只返回合法 JSON，不要使用 Markdown 代码块。JSON 键名必须严格使用以下英文键：{"sku":"页面未说明","coreFunctions":[""],"productParameters":"页面未说明","usageMethod":"","audience":"","scenes":"","sellingPoints":"","visualEvidence":"页面未说明"}。`;
+}
+
+async function qwenExtract(prompt: string) {
   const qwen = getProviderConfig("qwen");
   if (!qwen.enabled || !qwen.apiKey) return null;
   const response = await fetchOpenAI(`${qwen.baseUrl.replace(/\/$/, "")}/chat/completions`, {
@@ -294,12 +306,8 @@ async function qwenExtract(prompt: string, enableSearch: boolean) {
       response_format: { type: "json_object" },
       enable_thinking: false,
       max_tokens: 1_800,
-      ...(enableSearch ? {
-        enable_search: true,
-        search_options: { forced_search: true, enable_source: false },
-      } : {}),
     }),
-    signal: AbortSignal.timeout(enableSearch ? 90_000 : 60_000),
+    signal: AbortSignal.timeout(60_000),
   });
   if (!response.ok) return null;
   return parseJsonLoose<Partial<ParsedProductInfo>>(readTextFromModelResponse(await response.json() as Record<string, unknown>));
@@ -343,10 +351,11 @@ async function qwenSearchVisualExtract(prompt: string) {
     body: JSON.stringify({
       model: qwen.model || "qwen3.7-plus",
       input: prompt,
-      tools: [{ type: "web_search" }, { type: "web_search_image" }],
+      tools: [{ type: "web_search_image" }],
+      enable_thinking: false,
       max_output_tokens: 1_800,
     }),
-    signal: AbortSignal.timeout(120_000),
+    signal: AbortSignal.timeout(60_000),
   });
   if (!response.ok) return null;
   const payload = await response.json() as Record<string, unknown>;
@@ -415,41 +424,60 @@ export async function parsePublicProductPage(
     visualMode,
   });
 
-  // One model call in the normal path: page extraction when reachable, or
-  // Qwen text + image search when the mainland server cannot reach TikTok.
+  // One model call when the page or an exact product image is available. When
+  // image search cannot verify this exact product, use one cheap text-only
+  // fallback instead of keeping details inferred from similar products.
   const searchResult = searchMode ? await qwenSearchVisualExtract(prompt).catch(() => null) : null;
   if (searchResult?.imageUrls.length) base.sourceImageUrls = searchResult.imageUrls;
   let parsed = searchMode
     ? searchResult?.parsed || null
     : page.imageUrls.length
       ? await qwenVisualExtract(prompt, page.imageUrls).catch(() => null)
-      : await qwenExtract(prompt, false).catch(() => null);
+      : await qwenExtract(prompt).catch(() => null);
   let normalized = parsed ? normalizeParsed(parsed, base, productId) : null;
   let visualAnalysisStatus: ParsedProductInfo["visualAnalysisStatus"] = normalized
     && hasUsableProductInfo(normalized)
-    && useful(normalized.visualEvidence)
+    && hasReliableVisualEvidence(normalized.visualEvidence)
     && (searchMode ? searchResult?.usedImageSearch : page.imageUrls.length)
     ? "completed"
     : "unavailable";
 
-  // If image search is unavailable, retain the existing text-search path.
-  if (!normalized || !hasUsableProductInfo(normalized)) {
-    parsed = await qwenExtract(prompt, searchMode).catch(() => null);
+  // Search results may contain visually similar but unrelated products. If
+  // Qwen cannot tie an image back to this PID/product, discard all image-based
+  // details and generate only conservative category-level copy.
+  const fallbackPrompt = searchMode ? categoryFallbackPrompt(productUrl, hints) : prompt;
+  if (searchMode && visualAnalysisStatus !== "completed") {
+    base.sourceImageUrls = [];
+    parsed = await qwenExtract(fallbackPrompt).catch(() => null);
     normalized = parsed ? normalizeParsed(parsed, base, productId) : null;
+    if (normalized) {
+      normalized = {
+        ...normalized,
+        sku: "页面未说明",
+        productParameters: "页面未说明",
+        sourceImageUrls: [],
+        visualEvidence: "页面未说明",
+      };
+    }
     visualAnalysisStatus = "unavailable";
-  }
-
-  // Some Qwen variants may reject search parameters. A final Qwen retry can
-  // still produce a conservative category-level card from the team name.
-  if (searchMode && (!normalized || !hasUsableProductInfo(normalized))) {
-    parsed = await qwenExtract(prompt, false).catch(() => null);
+  } else if (!normalized || !hasUsableProductInfo(normalized)) {
+    parsed = await qwenExtract(prompt).catch(() => null);
     normalized = parsed ? normalizeParsed(parsed, base, productId) : null;
   }
 
   // OpenAI is only a failure fallback, not part of the ordinary token spend.
   if (!normalized || !hasUsableProductInfo(normalized)) {
-    parsed = await openAiExtract(prompt);
+    parsed = await openAiExtract(fallbackPrompt);
     normalized = parsed ? normalizeParsed(parsed, base, productId) : normalized;
+    if (searchMode && normalized) {
+      normalized = {
+        ...normalized,
+        sku: "页面未说明",
+        productParameters: "页面未说明",
+        sourceImageUrls: [],
+        visualEvidence: "页面未说明",
+      };
+    }
     visualAnalysisStatus = "unavailable";
   }
 

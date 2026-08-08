@@ -37,6 +37,13 @@ export interface Product {
   usageScenes: string;
   sourceTitle: string;
   sourceDescription: string;
+  /** Public product images discovered from the source page. */
+  sourceImageUrls: string[];
+  /** Short list of product details that were confirmed from images. */
+  visualEvidence: string;
+  visualAnalysisStatus: "" | "completed" | "unavailable";
+  /** Cache marker: a PID is visually analyzed at most once unless forced. */
+  visualAnalyzedAt: string | null;
   bannedTerms: string;
   notes: string;
   isSystem: boolean;

@@ -18,8 +18,10 @@ export async function POST(request: NextRequest) {
 
     const product = getProductByPid(pid) || createProduct({ name, pid, productUrl });
     let parsed = null;
-    const hasCachedProductInfo = product.productUrl === productUrl && hasUsableProductInfo(product);
-    if (body.parseProduct !== false && !hasCachedProductInfo) {
+    const hasCachedProductInfo = product.productUrl === productUrl
+      && hasUsableProductInfo(product)
+      && Boolean(product.visualAnalyzedAt);
+    if (body.parseProduct !== false && (body.forceProductParse === true || !hasCachedProductInfo)) {
       parsed = await parsePublicProductPage(productUrl, { productName: name, pid });
     }
     if (parsed) {
@@ -34,11 +36,15 @@ export async function POST(request: NextRequest) {
         usageScenes: parsed.scenes,
         sourceTitle: parsed.sourceTitle,
         sourceDescription: parsed.sourceDescription,
+        sourceImageUrls: parsed.sourceImageUrls.length ? parsed.sourceImageUrls : product.sourceImageUrls,
+        visualEvidence: parsed.visualEvidence || product.visualEvidence,
+        visualAnalysisStatus: parsed.visualAnalysisStatus,
+        visualAnalyzedAt: new Date().toISOString(),
       });
     }
-    const currentProduct = getProductByPid(pid) || product;
+    let currentProduct = getProductByPid(pid) || product;
     if (Array.isArray(body.propImages)) {
-      updateProduct(currentProduct.id, { propImages: body.propImages.map(String).slice(0, 3) });
+      currentProduct = updateProduct(currentProduct.id, { propImages: body.propImages.map(String).slice(0, 3) }) || currentProduct;
     }
     const channel = getConnectedFeishuChannel() || await ensureFeishuConnection();
     if (!channel) return NextResponse.json({ error: "飞书应用尚未连接" }, { status: 400 });
@@ -51,7 +57,7 @@ export async function POST(request: NextRequest) {
       coreFunctions: Array.isArray(body.coreFunctions) ? body.coreFunctions.map(String) : parsed?.coreFunctions || currentProduct.coreFunctions || [],
       propImages: Array.isArray(body.propImages) ? body.propImages.map(String).slice(0, 3) : currentProduct.propImages,
     });
-    return NextResponse.json({ ok: true, product, parsed, result });
+    return NextResponse.json({ ok: true, product: currentProduct, parsed, result });
   } catch (error) {
     return NextResponse.json({ error: error instanceof Error ? error.message : "创建产品文档失败" }, { status: 500 });
   }

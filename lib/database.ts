@@ -73,6 +73,10 @@ function initialize(db: DatabaseSync) {
       usage_scenes TEXT NOT NULL DEFAULT '',
       source_title TEXT NOT NULL DEFAULT '',
       source_description TEXT NOT NULL DEFAULT '',
+      source_image_urls_json TEXT NOT NULL DEFAULT '[]',
+      visual_evidence TEXT NOT NULL DEFAULT '',
+      visual_analysis_status TEXT NOT NULL DEFAULT '',
+      visual_analyzed_at TEXT,
       banned_terms TEXT NOT NULL DEFAULT '',
       notes TEXT NOT NULL DEFAULT '',
       is_system INTEGER NOT NULL DEFAULT 0,
@@ -316,6 +320,10 @@ function initialize(db: DatabaseSync) {
     ["usage_scenes", "TEXT NOT NULL DEFAULT ''"],
     ["source_title", "TEXT NOT NULL DEFAULT ''"],
     ["source_description", "TEXT NOT NULL DEFAULT ''"],
+    ["source_image_urls_json", "TEXT NOT NULL DEFAULT '[]'"],
+    ["visual_evidence", "TEXT NOT NULL DEFAULT ''"],
+    ["visual_analysis_status", "TEXT NOT NULL DEFAULT ''"],
+    ["visual_analyzed_at", "TEXT"],
     ["prop_images_json", "TEXT NOT NULL DEFAULT '[]'"],
   ]) {
     if (!productColumns.some((column) => String(column.name) === name)) db.exec(`ALTER TABLE products ADD COLUMN ${name} ${definition}`);
@@ -418,6 +426,12 @@ function productFromRow(row: Record<string, unknown>): Product {
     usageScenes: String(row.usage_scenes ?? ""),
     sourceTitle: String(row.source_title ?? ""),
     sourceDescription: String(row.source_description ?? ""),
+    sourceImageUrls: json<string[]>(row.source_image_urls_json, []),
+    visualEvidence: String(row.visual_evidence ?? ""),
+    visualAnalysisStatus: (["completed", "unavailable"].includes(String(row.visual_analysis_status))
+      ? String(row.visual_analysis_status)
+      : "") as Product["visualAnalysisStatus"],
+    visualAnalyzedAt: row.visual_analyzed_at ? String(row.visual_analyzed_at) : null,
     bannedTerms: String(row.banned_terms ?? ""),
     notes: String(row.notes ?? ""),
     isSystem: Boolean(row.is_system),
@@ -518,8 +532,9 @@ export function createProduct(input: Partial<Product>) {
   getDb()
     .prepare(`INSERT INTO products(
       id, name, pid, sku, document_id, document_url, image_path, prop_images_json, category, market, price, selling_points, target_audience,
-      pain_points, competitors, product_url, banned_terms, notes, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      pain_points, competitors, product_url, source_image_urls_json, visual_evidence, visual_analysis_status, visual_analyzed_at,
+      banned_terms, notes, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
     .run(
       id,
       input.name?.trim() || "未命名产品",
@@ -537,6 +552,10 @@ export function createProduct(input: Partial<Product>) {
       input.painPoints || "",
       input.competitors || "",
       input.productUrl || "",
+      JSON.stringify(input.sourceImageUrls || []),
+      input.visualEvidence || "",
+      input.visualAnalysisStatus || "",
+      input.visualAnalyzedAt || null,
       input.bannedTerms || "",
       input.notes || "",
       timestamp,
@@ -569,7 +588,8 @@ export function updateProduct(id: string, input: Partial<Product>) {
   getDb()
     .prepare(`UPDATE products SET name=?, pid=?, sku=?, document_id=?, document_url=?, image_path=?, prop_images_json=?, category=?, market=?, price=?, selling_points=?,
       target_audience=?, pain_points=?, competitors=?, product_url=?, banned_terms=?, notes=?,
-      core_functions_json=?, product_parameters=?, usage_method=?, usage_scenes=?, source_title=?, source_description=?, updated_at=? WHERE id=?`)
+      core_functions_json=?, product_parameters=?, usage_method=?, usage_scenes=?, source_title=?, source_description=?,
+      source_image_urls_json=?, visual_evidence=?, visual_analysis_status=?, visual_analyzed_at=?, updated_at=? WHERE id=?`)
     .run(
       input.name ?? current.name,
       input.pid?.trim() ?? current.pid,
@@ -594,6 +614,10 @@ export function updateProduct(id: string, input: Partial<Product>) {
       input.usageScenes ?? current.usageScenes,
       input.sourceTitle ?? current.sourceTitle,
       input.sourceDescription ?? current.sourceDescription,
+      JSON.stringify(input.sourceImageUrls ?? current.sourceImageUrls),
+      input.visualEvidence ?? current.visualEvidence,
+      input.visualAnalysisStatus ?? current.visualAnalysisStatus,
+      input.visualAnalyzedAt ?? current.visualAnalyzedAt,
       now(),
       id,
     );

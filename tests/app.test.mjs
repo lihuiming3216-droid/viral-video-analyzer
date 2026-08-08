@@ -151,10 +151,12 @@ test("Feishu automation can return fields without requiring Base write permissio
 });
 
 test("product cards use Qwen search when TikTok is unreachable and resync reused documents", async () => {
-  const [parser, automation, document] = await Promise.all([
+  const [parser, automation, document, database, ensureDocument] = await Promise.all([
     readFile(new URL("lib/product-parser.ts", root), "utf8"),
     readFile(new URL("lib/feishu/automation.ts", root), "utf8"),
     readFile(new URL("lib/feishu/document.ts", root), "utf8"),
+    readFile(new URL("lib/database.ts", root), "utf8"),
+    readFile(new URL("app/api/products/ensure-document/route.ts", root), "utf8"),
   ]);
   assert.match(parser, /enable_search:\s*true/);
   assert.match(parser, /forced_search:\s*true/);
@@ -163,6 +165,17 @@ test("product cards use Qwen search when TikTok is unreachable and resync reused
   assert.match(parser, /JSON 键名必须严格使用以下英文键/);
   assert.match(parser, /SKU 不得填写 PID 或商品ID/);
   assert.match(parser, /skuWithoutLabel !== clean\(productId\)/);
+  assert.match(parser, /web_search_image/);
+  assert.match(parser, /type: "image_url"/);
+  assert.match(parser, /MAX_PRODUCT_IMAGES = 4/);
+  assert.match(parser, /max_pixels: MAX_IMAGE_PIXELS/);
+  assert.match(parser, /visualEvidence/);
+  assert.match(automation, /!product\.visualAnalyzedAt/);
+  assert.match(automation, /visualAnalyzedAt: new Date\(\)\.toISOString\(\)/);
+  assert.match(ensureDocument, /forceProductParse === true/);
+  assert.match(database, /source_image_urls_json/);
+  assert.match(database, /visual_analysis_status/);
+  assert.match(database, /visual_analyzed_at/);
   assert.match(automation, /已停止生成空白产品手卡/);
   assert.match(document, /syncProductFieldText/);
   assert.match(document, /const reused = Boolean\(product\.documentId && product\.documentUrl\)/);

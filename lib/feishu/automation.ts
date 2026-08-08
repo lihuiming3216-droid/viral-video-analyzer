@@ -194,7 +194,7 @@ export async function handleFeishuAutomation(input: {
 
   // Product docs need the PID, the team's Chinese name, and the generated URL.
   if (product && effectiveName && effectivePid && resolved.productUrl) {
-    if (!hasUsableProductInfo(product) && resolved.productUrl) {
+    if ((!hasUsableProductInfo(product) || !product.visualAnalyzedAt) && resolved.productUrl) {
       parsed = parsed || await parsePublicProductPage(resolved.productUrl, {
         productName: effectiveName,
         pid: effectivePid,
@@ -211,6 +211,10 @@ export async function handleFeishuAutomation(input: {
           usageScenes: parsed.scenes,
           sourceTitle: parsed.sourceTitle,
           sourceDescription: parsed.sourceDescription,
+          sourceImageUrls: parsed.sourceImageUrls.length ? parsed.sourceImageUrls : product.sourceImageUrls,
+          visualEvidence: parsed.visualEvidence || product.visualEvidence,
+          visualAnalysisStatus: parsed.visualAnalysisStatus,
+          visualAnalyzedAt: new Date().toISOString(),
           name: effectiveName,
           pid: effectivePid || product.pid,
         }) || product;

@@ -9,7 +9,7 @@ import {
 import { ensureFeishuConnection, getConnectedFeishuChannel } from "@/lib/feishu/runtime";
 import { ensureProductDocument } from "@/lib/feishu/document";
 import { enqueueVideos } from "@/lib/queue";
-import { parsePublicProductPage } from "@/lib/product-parser";
+import { extractProductIdFromUrl, parsePublicProductPage } from "@/lib/product-parser";
 import type { AnalysisResult } from "@/lib/types";
 
 export interface FeishuAutomationFieldMap {
@@ -142,22 +142,41 @@ export async function handleFeishuAutomation(input: {
 }) {
   const resolved = resolveAutomationFields(input.fields, input.fieldMap);
   const patch: Record<string, unknown> = {};
-  let product = resolved.pid ? getProductByPid(resolved.pid) : null;
+  // The lightweight Base workflow can now trigger on product URL alone.
+  // Parse only when a name/PID is missing; existing complete rows avoid the
+  // extra page fetch and model call.
+  let parsed = null;
+  let effectivePid = resolved.pid || extractProductIdFromUrl(resolved.productUrl);
+  let effectiveName = resolved.productName;
+  if (resolved.productUrl && (!effectivePid || !effectiveName)) {
+    parsed = await parsePublicProductPage(resolved.productUrl).catch(() => null);
+    if (parsed) {
+      effectiveName = effectiveName || parsed.productName || parsed.sourceTitle;
+      effectivePid = effectivePid || extractProductIdFromUrl(resolved.productUrl);
+    }
+  }
+  let product = effectivePid ? getProductByPid(effectivePid) : null;
 
-  if (!product && (resolved.productName || resolved.pid || resolved.productUrl)) {
-    product = createProduct({ name: resolved.productName || "未命名产品", pid: resolved.pid, productUrl: resolved.productUrl });
+  if (!product && (effectiveName || effectivePid || resolved.productUrl)) {
+    product = createProduct({ name: effectiveName || "未命名产品", pid: effectivePid, productUrl: resolved.productUrl });
   }
 
-  if (product && resolved.productUrl && product.productUrl !== resolved.productUrl) {
-    product = updateProduct(product.id, { productUrl: resolved.productUrl }) || product;
+  if (product && (resolved.productUrl && product.productUrl !== resolved.productUrl || effectiveName && product.name !== effectiveName || effectivePid && product.pid !== effectivePid)) {
+    product = updateProduct(product.id, {
+      productUrl: resolved.productUrl || product.productUrl,
+      name: effectiveName || product.name,
+      pid: effectivePid || product.pid,
+    }) || product;
   }
+
+  if (effectiveName && effectiveName !== resolved.productName) patch[resolved.map.productName] = effectiveName;
+  if (effectivePid && effectivePid !== resolved.pid) patch[resolved.map.pid] = effectivePid;
 
   // Product docs need the three identifying values, but video analysis itself
   // can still run when the product row is not complete.
-  if (product && resolved.productName && resolved.pid && resolved.productUrl) {
-    let parsed = null;
+  if (product && effectiveName && effectivePid && resolved.productUrl) {
     if (!product.productParameters && resolved.productUrl) {
-      parsed = await parsePublicProductPage(resolved.productUrl).catch(() => null);
+      parsed = parsed || await parsePublicProductPage(resolved.productUrl).catch(() => null);
       if (parsed) {
         product = updateProduct(product.id, {
           productUrl: resolved.productUrl,
@@ -170,6 +189,8 @@ export async function handleFeishuAutomation(input: {
           usageScenes: parsed.scenes,
           sourceTitle: parsed.sourceTitle,
           sourceDescription: parsed.sourceDescription,
+          name: effectiveName || parsed.productName || parsed.sourceTitle || product.name,
+          pid: effectivePid || product.pid,
         }) || product;
       }
     }
@@ -193,7 +214,7 @@ export async function handleFeishuAutomation(input: {
       productId: targetProduct.id,
       sourceType: "tiktok",
       sourceUrl: resolved.videoUrl,
-      title: resolved.productName ? `${resolved.productName}样片` : "飞书自动化样片",
+      title: effectiveName ? `${effectiveName}样片` : "飞书自动化样片",
       analysisMode: "product_doc",
     });
     saveFeishuAutomationJob({
@@ -222,5 +243,5 @@ export async function handleFeishuAutomation(input: {
     recordId: input.recordId,
     fields: patch,
   });
-  return { ...resolved, patch };
+  return { ...resolved, productName: effectiveName, pid: effectivePid, patch };
 }

@@ -17,6 +17,21 @@ export interface ParsedProductInfo {
   sourceDescription: string;
 }
 
+/** Extract a TikTok Shop product identifier when the public URL exposes it. */
+export function extractProductIdFromUrl(productUrl: string) {
+  try {
+    const url = new URL(productUrl);
+    for (const key of ["pid", "product_id", "productId", "item_id", "itemId"]) {
+      const value = url.searchParams.get(key)?.trim();
+      if (value) return value;
+    }
+    const candidates = url.pathname.match(/\d{6,}/g) || [];
+    return candidates.sort((a, b) => b.length - a.length)[0] || "";
+  } catch {
+    return (productUrl.match(/\d{6,}/g) || []).sort((a, b) => b.length - a.length)[0] || "";
+  }
+}
+
 const schema = {
   type: "object",
   additionalProperties: false,

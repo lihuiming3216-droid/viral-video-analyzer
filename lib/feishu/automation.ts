@@ -71,8 +71,10 @@ export function resolveAutomationFields(
 ) {
   const map = { ...defaultFeishuAutomationFieldMap, ...inputMap };
   const pid = field(fields, map.pid, ["PID", "商品ID/PID"]);
+  const hasExplicitProductUrl = [map.productUrl, "商品链接", "产品链接"]
+    .some((key) => key in fields && Boolean(text(fields[key])));
   const documentField = inputMap.productDocument
-    || ("产品手卡" in fields ? "产品手卡" : map.productDocument);
+    || ("产品手卡" in fields || (pid && !hasExplicitProductUrl) ? "产品手卡" : map.productDocument);
   return {
     map: { ...map, productDocument: documentField },
     productUrl: cleanUrl(field(fields, map.productUrl, ["商品链接", "产品链接"])) || productUrlFromPid(pid),

@@ -83,7 +83,7 @@ export function resolveAutomationFields(
     hasProductUrlField: hasExplicitProductUrl,
     pid,
     productName: field(fields, map.productName, ["商品名称", "产品名", "productName", "product_name"]),
-    productDocument: field(fields, map.productDocument),
+    productDocument: field(fields, documentField, [map.productDocument, "产品手卡", "产品文档"]),
     videoUrl: cleanUrl(field(fields, map.videoUrl, ["样片链接", "视频链接"])),
     analysis: field(fields, map.analysis),
     translation: field(fields, map.translation),
@@ -208,7 +208,12 @@ export async function handleFeishuAutomation(input: {
       sellingPoints: product.sellingPoints,
       propImages: product.propImages,
     });
-    patch[resolved.map.productDocument] = result.documentUrl;
+    // Keep the webhook idempotent. Feishu may fire an automation again after
+    // our record update, so writing an unchanged document URL wastes requests
+    // and can create a self-triggering loop in less restrictive workflows.
+    if (cleanUrl(resolved.productDocument) !== result.documentUrl) {
+      patch[resolved.map.productDocument] = result.documentUrl;
+    }
   }
 
   if (resolved.videoUrl) {

@@ -9,7 +9,7 @@ import {
 import { ensureFeishuConnection, getConnectedFeishuChannel } from "@/lib/feishu/runtime";
 import { ensureProductDocument } from "@/lib/feishu/document";
 import { enqueueVideos } from "@/lib/queue";
-import { extractProductIdFromUrl, parsePublicProductPage } from "@/lib/product-parser";
+import { parsePublicProductPage } from "@/lib/product-parser";
 import type { AnalysisResult } from "@/lib/types";
 
 export interface FeishuAutomationFieldMap {
@@ -77,7 +77,9 @@ export function resolveAutomationFields(
     || ("产品手卡" in fields || (pid && !hasExplicitProductUrl) ? "产品手卡" : map.productDocument);
   return {
     map: { ...map, productDocument: documentField },
-    productUrl: cleanUrl(field(fields, map.productUrl, ["商品链接", "产品链接"])) || productUrlFromPid(pid),
+    // PID is the source of truth. Always regenerate the public product URL
+    // so the two fields cannot drift apart.
+    productUrl: productUrlFromPid(pid) || cleanUrl(field(fields, map.productUrl, ["商品链接", "产品链接"])),
     pid,
     productName: field(fields, map.productName, ["商品名称", "产品名"]),
     productDocument: field(fields, map.productDocument),
@@ -152,11 +154,11 @@ export async function handleFeishuAutomation(input: {
 }) {
   const resolved = resolveAutomationFields(input.fields, input.fieldMap);
   const patch: Record<string, unknown> = {};
-  // The Base workflow requires the team's Chinese product name and URL.
-  // PID is optional input and is derived from the public URL when omitted.
-  if (!resolved.productUrl || !resolved.productName) return { ...resolved, patch };
+  // PID and the team's Chinese product name are the only trigger fields.
+  // The public product URL is always derived from PID.
+  if (!resolved.pid || !resolved.productName) return { ...resolved, patch };
   let parsed = null;
-  const effectivePid = resolved.pid || extractProductIdFromUrl(resolved.productUrl);
+  const effectivePid = resolved.pid;
   const effectiveName = resolved.productName;
   let product = effectivePid ? getProductByPid(effectivePid) : null;
 
@@ -173,9 +175,9 @@ export async function handleFeishuAutomation(input: {
   }
 
   if (effectivePid && effectivePid !== resolved.pid) patch[resolved.map.pid] = effectivePid;
+  if (resolved.productUrl) patch[resolved.map.productUrl] = resolved.productUrl;
 
-  // Product docs need the three identifying values, but video analysis itself
-  // can still run when the product row is not complete.
+  // Product docs need the PID, the team's Chinese name, and the generated URL.
   if (product && effectiveName && effectivePid && resolved.productUrl) {
     if (!product.productParameters && resolved.productUrl) {
       parsed = parsed || await parsePublicProductPage(resolved.productUrl).catch(() => null);

@@ -212,8 +212,10 @@ test("product cards use verified TikTok evidence and resync reused documents", a
   assert.match(parser, /hasUsableProductInfo/);
   assert.match(parser, /needsCompletenessRetry/);
   assert.match(parser, /explicitBundleCount/);
+  assert.match(parser, /enumeratedBundleFeatures/);
+  assert.match(parser, /qwenTranslateBundleFeatures/);
   assert.match(parser, /numericSpecificationCount/);
-  assert.match(parser, /coreFunctions 必须恰好返回 \$\{bundleCount\} 条/);
+  assert.match(parser, /coreFunctions 必须恰好返回 \$\{bundleOutputCount\} 条/);
   assert.match(parser, /temperature: 0/);
   assert.match(parser, /产品主要功能/);
   assert.match(parser, /JSON 键名必须严格使用/);

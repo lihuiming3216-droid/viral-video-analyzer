@@ -151,7 +151,26 @@ function explicitBundleCount(evidenceText: string) {
     ...evidenceText.matchAll(/\b([2-9])\s*[-‑–]?in[-‑–]?1\b/gi),
     ...evidenceText.matchAll(/\b([2-9])\s+things?\s+in\s+one\b/gi),
   ];
-  return Math.min(5, Math.max(0, ...matches.map((match) => Number(match[1]) || 0)));
+  return Math.max(0, ...matches.map((match) => Number(match[1]) || 0));
+}
+
+function enumeratedBundleFeatures(evidenceText: string) {
+  const bundleCount = explicitBundleCount(evidenceText);
+  if (bundleCount < 2) return [];
+  const expected = Math.min(5, bundleCount);
+  const patterns = [
+    new RegExp(`\\b${bundleCount}\\s+things?\\s+in\\s+one\\s*:\\s*([^\\n\\r]+)`, "i"),
+    new RegExp(`\\b${bundleCount}\\s*[-‑–]?in[-‑–]?1(?:\\s+[a-z]+){0,3}\\s*:\\s*([^\\n\\r]+)`, "i"),
+  ];
+  for (const pattern of patterns) {
+    const segment = clean(evidenceText.match(pattern)?.[1]).split(/\.(?:\s|$)/)[0];
+    const features = segment
+      .split(/\s*(?:\/|\+|\||•|;)\s*/)
+      .map((item) => clean(item).replace(/[.,:]+$/g, ""))
+      .filter(Boolean);
+    if (features.length >= expected) return features.slice(0, expected);
+  }
+  return [];
 }
 
 function numericSpecificationCount(evidenceText: string) {
@@ -161,7 +180,7 @@ function numericSpecificationCount(evidenceText: string) {
 
 function needsCompletenessRetry(info: ParsedProductInfo | null, evidenceText: string) {
   if (!info || !hasUsableProductInfo(info)) return true;
-  const expectedFunctions = explicitBundleCount(evidenceText);
+  const expectedFunctions = Math.min(5, explicitBundleCount(evidenceText));
   if (expectedFunctions && info.coreFunctions.length < expectedFunctions) return true;
   return numericSpecificationCount(evidenceText) >= 2 && !useful(info.productParameters);
 }
@@ -539,8 +558,11 @@ function extractionPrompt(input: {
       ? "当前没有经过 PID 校验的商品图片，visualEvidence 必须留空，不得用相似商品图片推断。"
       : "当前没有可靠商品图片，只能根据公开文字资料整理。";
   const bundleCount = explicitBundleCount(input.pageText);
+  const bundleOutputCount = Math.min(5, bundleCount);
   const bundleInstruction = bundleCount
-    ? `本页文字明确列出 ${bundleCount}-in-1 功能清单，因此 coreFunctions 必须恰好返回 ${bundleCount} 条，逐项覆盖清单，不得遗漏、合并或只移到其他字段。`
+    ? bundleCount <= 5
+      ? `本页文字明确列出 ${bundleCount}-in-1 功能清单，因此 coreFunctions 必须恰好返回 ${bundleOutputCount} 条，逐项覆盖清单，不得遗漏、合并或只移到其他字段。`
+      : `本页文字明确列出 ${bundleCount}-in-1 组合功能；受字段上限影响，coreFunctions 必须返回其中最重要且有原文证据的 ${bundleOutputCount} 条。`
     : "若页面明确写有 N-in-1 或 N things in one 并逐项列出功能，coreFunctions 必须逐项覆盖清单中的每一项（最多5项），不得省略，也不得只把某项放入产品参数。";
   return `你在整理 TikTok Shop 产品手卡。\n${identity}\n${evidence}\n${visualInstruction}\n\n只能把上述页面文字中明确出现的信息翻译、归纳成中文。不得使用常识补齐，不得根据团队中文名推断，不得把相似商品的功能写进来。商品图片只用于 visualEvidence，不得用来扩写 coreFunctions、productParameters、usageMethod、audience 或 scenes。某字段没有直接文字证据时必须返回空字符串或空数组。请输出：页面原始标题 sourceTitle、页面原始描述 sourceDescription、真实 SKU、1至5条产品主要功能、产品参数、使用方法、适用人群、使用场景，以及简短图片证据 visualEvidence。除 sourceTitle、sourceDescription 和 evidenceQuotes 保留英文原文外，其余所有字段值必须使用中文。产品主要功能按重要程度排序，每项只表达一个有证据的功能，不要写 A/B/C/D/E 前缀；页面有足够证据时应整理3至5项。${bundleInstruction}productParameters、usageMethod、audience、scenes 必须返回字符串，不得返回对象或数组；多项用中文分号分隔。产品参数只保留3至8项与购买或使用直接相关的信息，忽略合规声明、危险品声明和无意义的否定属性。SKU 不得填写 PID 或商品ID。精确尺寸、功率、材质、兼容型号、认证和包装数量必须能在证据中找到；页面文字与图片冲突时省略该字段，不要添加冲突说明。sellingPoints 暂不生成，必须返回空字符串。evidenceQuotes 必须为每个输出字段提供页面英文原文逐字短引文：coreFunctions 与引文数组按下标一一对应，其余字段列出支持其中每个事实的引文；中文值必须只是引文的直接翻译或压缩，不得扩大含义。只返回合法 JSON，不要使用 Markdown 代码块。JSON 键名必须严格使用：{"sourceTitle":"","sourceDescription":"","sku":"","coreFunctions":[""],"productParameters":"","usageMethod":"","audience":"","scenes":"","sellingPoints":"","visualEvidence":"","evidenceQuotes":{"sku":[""],"coreFunctions":[""],"productParameters":[""],"usageMethod":[""],"audience":[""],"scenes":[""]}}。`;
 }
@@ -563,6 +585,33 @@ async function qwenExtract(prompt: string) {
   });
   if (!response.ok) return null;
   return parseJsonLoose<ParsedProductModel>(readTextFromModelResponse(await response.json() as Record<string, unknown>));
+}
+
+async function qwenTranslateBundleFeatures(features: string[]) {
+  const qwen = getProviderConfig("qwen");
+  if (!qwen.enabled || !qwen.apiKey || !features.length) return [];
+  const response = await fetchOpenAI(`${qwen.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${qwen.apiKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: qwen.model || "qwen-plus",
+      messages: [{
+        role: "user",
+        content: `把下面 ${features.length} 个英文商品功能逐项直译为简洁中文。必须保持原顺序和原数量，不得合并、扩写或补充。只返回 JSON：{"features":[""]}。输入：${JSON.stringify(features)}`,
+      }],
+      response_format: { type: "json_object" },
+      enable_thinking: false,
+      temperature: 0,
+      max_tokens: 400,
+    }),
+    signal: AbortSignal.timeout(30_000),
+  });
+  if (!response.ok) return [];
+  const parsed = parseJsonLoose<{ features?: unknown }>(readTextFromModelResponse(await response.json() as Record<string, unknown>));
+  const translated = Array.isArray(parsed?.features)
+    ? parsed.features.map(cleanFunction).filter((item) => /[\u3400-\u9fff]/.test(item))
+    : [];
+  return translated.length === features.length ? translated : [];
 }
 
 async function qwenVisualExtract(prompt: string, imageUrls: string[]) {
@@ -701,6 +750,15 @@ export async function parsePublicProductPage(
     parsed = await qwenExtract(prompt).catch(() => null);
     const candidate = parsed ? normalizeParsed(parsed, base, productId, page.text) : null;
     normalized = preferMoreCompleteProductInfo(normalized, candidate);
+  }
+
+  // Explicit "N-in-1" lists are stronger than model summarization. If the
+  // evidence contains a complete slash/plus-separated list, translate that
+  // exact list with one small call so no verified function is silently lost.
+  const bundleFeatures = searchMode ? [] : enumeratedBundleFeatures(page.text);
+  if (normalized && bundleFeatures.length && normalized.coreFunctions.length < bundleFeatures.length) {
+    const translated = await qwenTranslateBundleFeatures(bundleFeatures).catch(() => []);
+    if (translated.length === bundleFeatures.length) normalized = { ...normalized, coreFunctions: translated };
   }
 
   // OpenAI may organize already-downloaded evidence, but it is never allowed

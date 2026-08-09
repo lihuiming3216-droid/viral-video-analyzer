@@ -146,6 +146,40 @@ export function hasUsableProductInfo(info: {
   return hasSourceEvidence && functions.length >= 1 && descriptiveFields.length >= 2;
 }
 
+function explicitBundleCount(evidenceText: string) {
+  const matches = [
+    ...evidenceText.matchAll(/\b([2-9])\s*[-‑–]?in[-‑–]?1\b/gi),
+    ...evidenceText.matchAll(/\b([2-9])\s+things?\s+in\s+one\b/gi),
+  ];
+  return Math.min(5, Math.max(0, ...matches.map((match) => Number(match[1]) || 0)));
+}
+
+function numericSpecificationCount(evidenceText: string) {
+  const matches = evidenceText.match(/\b\d+(?:\.\d+)?\s*(?:mAh|W|V|mmHg|mm|cm|kg|g|inch(?:es)?|ft|Gbps|Mbps|x)\b/gi) || [];
+  return new Set(matches.map((item) => item.toLowerCase().replace(/\s+/g, ""))).size;
+}
+
+function needsCompletenessRetry(info: ParsedProductInfo | null, evidenceText: string) {
+  if (!info || !hasUsableProductInfo(info)) return true;
+  const expectedFunctions = explicitBundleCount(evidenceText);
+  if (expectedFunctions && info.coreFunctions.length < expectedFunctions) return true;
+  return numericSpecificationCount(evidenceText) >= 2 && !useful(info.productParameters);
+}
+
+function productInfoScore(info: ParsedProductInfo | null) {
+  if (!info) return -1;
+  return info.coreFunctions.length * 5
+    + (useful(info.productParameters) ? 4 : 0)
+    + (useful(info.usageMethod) ? 3 : 0)
+    + (useful(info.audience) ? 2 : 0)
+    + (useful(info.scenes) ? 2 : 0)
+    + (useful(info.sku) ? 1 : 0);
+}
+
+function preferMoreCompleteProductInfo(current: ParsedProductInfo | null, candidate: ParsedProductInfo | null) {
+  return productInfoScore(candidate) > productInfoScore(current) ? candidate : current;
+}
+
 function htmlText(html: string) {
   return html
     .replace(/<script[\s\S]*?<\/script>/gi, " ")
@@ -504,7 +538,7 @@ function extractionPrompt(input: {
     : input.visualMode === "search"
       ? "当前没有经过 PID 校验的商品图片，visualEvidence 必须留空，不得用相似商品图片推断。"
       : "当前没有可靠商品图片，只能根据公开文字资料整理。";
-  return `你在整理 TikTok Shop 产品手卡。\n${identity}\n${evidence}\n${visualInstruction}\n\n只能把上述页面文字中明确出现的信息翻译、归纳成中文。不得使用常识补齐，不得根据团队中文名推断，不得把相似商品的功能写进来。商品图片只用于 visualEvidence，不得用来扩写 coreFunctions、productParameters、usageMethod、audience 或 scenes。某字段没有直接文字证据时必须返回空字符串或空数组。请输出：页面原始标题 sourceTitle、页面原始描述 sourceDescription、真实 SKU、1至5条产品主要功能、产品参数、使用方法、适用人群、使用场景，以及简短图片证据 visualEvidence。除 sourceTitle、sourceDescription 和 evidenceQuotes 保留英文原文外，其余所有字段值必须使用中文。产品主要功能按重要程度排序，每项只表达一个有证据的功能，不要写 A/B/C/D/E 前缀；页面有足够证据时应整理3至5项。productParameters、usageMethod、audience、scenes 必须返回字符串，不得返回对象或数组；多项用中文分号分隔。产品参数只保留3至8项与购买或使用直接相关的信息，忽略合规声明、危险品声明和无意义的否定属性。SKU 不得填写 PID 或商品ID。精确尺寸、功率、材质、兼容型号、认证和包装数量必须能在证据中找到；页面文字与图片冲突时省略该字段，不要添加冲突说明。sellingPoints 暂不生成，必须返回空字符串。evidenceQuotes 必须为每个输出字段提供页面英文原文逐字短引文：coreFunctions 与引文数组按下标一一对应，其余字段列出支持其中每个事实的引文；中文值必须只是引文的直接翻译或压缩，不得扩大含义。只返回合法 JSON，不要使用 Markdown 代码块。JSON 键名必须严格使用：{"sourceTitle":"","sourceDescription":"","sku":"","coreFunctions":[""],"productParameters":"","usageMethod":"","audience":"","scenes":"","sellingPoints":"","visualEvidence":"","evidenceQuotes":{"sku":[""],"coreFunctions":[""],"productParameters":[""],"usageMethod":[""],"audience":[""],"scenes":[""]}}。`;
+  return `你在整理 TikTok Shop 产品手卡。\n${identity}\n${evidence}\n${visualInstruction}\n\n只能把上述页面文字中明确出现的信息翻译、归纳成中文。不得使用常识补齐，不得根据团队中文名推断，不得把相似商品的功能写进来。商品图片只用于 visualEvidence，不得用来扩写 coreFunctions、productParameters、usageMethod、audience 或 scenes。某字段没有直接文字证据时必须返回空字符串或空数组。请输出：页面原始标题 sourceTitle、页面原始描述 sourceDescription、真实 SKU、1至5条产品主要功能、产品参数、使用方法、适用人群、使用场景，以及简短图片证据 visualEvidence。除 sourceTitle、sourceDescription 和 evidenceQuotes 保留英文原文外，其余所有字段值必须使用中文。产品主要功能按重要程度排序，每项只表达一个有证据的功能，不要写 A/B/C/D/E 前缀；页面有足够证据时应整理3至5项。若页面明确写有 N-in-1 或 N things in one 并逐项列出功能，coreFunctions 必须逐项覆盖清单中的每一项（最多5项），不得省略，也不得只把某项放入产品参数。productParameters、usageMethod、audience、scenes 必须返回字符串，不得返回对象或数组；多项用中文分号分隔。产品参数只保留3至8项与购买或使用直接相关的信息，忽略合规声明、危险品声明和无意义的否定属性。SKU 不得填写 PID 或商品ID。精确尺寸、功率、材质、兼容型号、认证和包装数量必须能在证据中找到；页面文字与图片冲突时省略该字段，不要添加冲突说明。sellingPoints 暂不生成，必须返回空字符串。evidenceQuotes 必须为每个输出字段提供页面英文原文逐字短引文：coreFunctions 与引文数组按下标一一对应，其余字段列出支持其中每个事实的引文；中文值必须只是引文的直接翻译或压缩，不得扩大含义。只返回合法 JSON，不要使用 Markdown 代码块。JSON 键名必须严格使用：{"sourceTitle":"","sourceDescription":"","sku":"","coreFunctions":[""],"productParameters":"","usageMethod":"","audience":"","scenes":"","sellingPoints":"","visualEvidence":"","evidenceQuotes":{"sku":[""],"coreFunctions":[""],"productParameters":[""],"usageMethod":[""],"audience":[""],"scenes":[""]}}。`;
 }
 
 async function qwenExtract(prompt: string) {
@@ -657,16 +691,18 @@ export async function parsePublicProductPage(
     ? "completed"
     : "unavailable";
 
-  if (!searchMode && (!normalized || !hasUsableProductInfo(normalized))) {
+  if (!searchMode && needsCompletenessRetry(normalized, page.text)) {
     parsed = await qwenExtract(prompt).catch(() => null);
-    normalized = parsed ? normalizeParsed(parsed, base, productId, page.text) : null;
+    const candidate = parsed ? normalizeParsed(parsed, base, productId, page.text) : null;
+    normalized = preferMoreCompleteProductInfo(normalized, candidate);
   }
 
   // OpenAI may organize already-downloaded evidence, but it is never allowed
   // to invent a product from only a PID or the team's Chinese name.
-  if (!searchMode && (!normalized || !hasUsableProductInfo(normalized))) {
+  if (!searchMode && needsCompletenessRetry(normalized, page.text)) {
     parsed = await openAiExtract(prompt);
-    normalized = parsed ? normalizeParsed(parsed, base, productId, page.text) : normalized;
+    const candidate = parsed ? normalizeParsed(parsed, base, productId, page.text) : null;
+    normalized = preferMoreCompleteProductInfo(normalized, candidate);
   }
 
   if (!normalized || !hasUsableProductInfo(normalized)) {

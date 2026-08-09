@@ -600,7 +600,7 @@ export async function ensureProductDocument(
     产品链接: product.productUrl,
     商品ID: product.pid,
     SKU: product.sku,
-    核心功能: functions.slice(0, 3).join("；"),
+    核心功能: functions.join("；"),
     // “产品主要功能”已经展示同一组信息，A-E 暂时统一留空。
     核心功能A: "",
     核心功能B: "",

@@ -210,6 +210,9 @@ test("product cards use verified TikTok evidence and resync reused documents", a
   assert.match(parser, /tools: \[\{ type: "web_search" \}\]/);
   assert.match(parser, /enable_thinking: false/);
   assert.match(parser, /hasUsableProductInfo/);
+  assert.match(parser, /needsCompletenessRetry/);
+  assert.match(parser, /explicitBundleCount/);
+  assert.match(parser, /numericSpecificationCount/);
   assert.match(parser, /产品主要功能/);
   assert.match(parser, /JSON 键名必须严格使用/);
   assert.match(parser, /SKU 不得填写 PID 或商品ID/);
@@ -238,6 +241,7 @@ test("product cards use verified TikTok evidence and resync reused documents", a
   assert.match(document, /text_element_style: \{ link: \{ url: productUrl \} \}/);
   assert.match(document, /核心功能A: ""/);
   assert.match(document, /核心功能E: ""/);
+  assert.match(document, /核心功能: functions\.join\("；"\)/);
   assert.match(document, /values\[`核心功能\$\{ranked\[2\]\.toUpperCase\(\)\}`\] \|\| ""/);
   assert.match(document, /next = `\$\{ranked\[1\]\}\$\{value\}`/);
   assert.match(document, /const reused = Boolean\(product\.documentId && product\.documentUrl\)/);

@@ -11,6 +11,7 @@ import { ensureProductDocument } from "@/lib/feishu/document";
 import { enqueueVideos } from "@/lib/queue";
 import { hasUsableProductInfo, parsePublicProductPage } from "@/lib/product-parser";
 import { conciseProductDocAnalysis } from "@/lib/product-doc-analysis";
+import { tiktokProductUrlFromPid } from "@/lib/tiktok-product";
 
 export interface FeishuAutomationFieldMap {
   productUrl: string;
@@ -35,8 +36,7 @@ export const defaultFeishuAutomationFieldMap: FeishuAutomationFieldMap = {
 };
 
 export function productUrlFromPid(pid: string) {
-  const normalized = pid.trim();
-  return normalized ? `https://www.tiktok.com/view/product/${encodeURIComponent(normalized)}` : "";
+  return tiktokProductUrlFromPid(pid);
 }
 
 function text(value: unknown): string {
@@ -157,6 +157,7 @@ export async function handleFeishuAutomation(input: {
   const effectivePid = resolved.pid;
   const effectiveName = resolved.productName;
   let product = effectivePid ? getProductByPid(effectivePid) : null;
+  const productUrlChanged = Boolean(product && resolved.productUrl && product.productUrl !== resolved.productUrl);
 
   if (!product && (effectiveName || effectivePid || resolved.productUrl)) {
     product = createProduct({ name: effectiveName || "未命名产品", pid: effectivePid, productUrl: resolved.productUrl });
@@ -175,16 +176,39 @@ export async function handleFeishuAutomation(input: {
 
   // Product docs need the PID, the team's Chinese name, and the generated URL.
   if (product && effectiveName && effectivePid && resolved.productUrl) {
-    if ((!hasUsableProductInfo(product) || !product.visualAnalyzedAt) && resolved.productUrl) {
-      parsed = parsed || await parsePublicProductPage(resolved.productUrl, {
-        productName: effectiveName,
-        pid: effectivePid,
-      });
+    if ((productUrlChanged || !hasUsableProductInfo(product) || !product.visualAnalyzedAt) && resolved.productUrl) {
+      try {
+        parsed = parsed || await parsePublicProductPage(resolved.productUrl, {
+          productName: effectiveName,
+          pid: effectivePid,
+        });
+      } catch (error) {
+        product = updateProduct(product.id, {
+          productUrl: resolved.productUrl,
+          sku: "",
+          sellingPoints: "",
+          targetAudience: "",
+          coreFunctions: [],
+          productParameters: "",
+          usageMethod: "",
+          usageScenes: "",
+          sourceTitle: "",
+          sourceDescription: "",
+          sourceImageUrls: [],
+          visualEvidence: "",
+          visualAnalysisStatus: "unavailable",
+          visualAnalyzedAt: null,
+        }) || product;
+        if (product.documentId && product.documentUrl) {
+          await ensureProductDocument(input.client, product).catch(() => undefined);
+        }
+        throw error;
+      }
       if (parsed) {
         product = updateProduct(product.id, {
           productUrl: resolved.productUrl,
-          sku: parsed.sku || product.sku,
-          sellingPoints: parsed.sellingPoints,
+          sku: parsed.sku,
+          sellingPoints: "",
           targetAudience: parsed.audience,
           coreFunctions: parsed.coreFunctions,
           productParameters: parsed.productParameters,
@@ -192,8 +216,8 @@ export async function handleFeishuAutomation(input: {
           usageScenes: parsed.scenes,
           sourceTitle: parsed.sourceTitle,
           sourceDescription: parsed.sourceDescription,
-          sourceImageUrls: parsed.sourceImageUrls.length ? parsed.sourceImageUrls : product.sourceImageUrls,
-          visualEvidence: parsed.visualEvidence || product.visualEvidence,
+          sourceImageUrls: parsed.sourceImageUrls,
+          visualEvidence: parsed.visualEvidence,
           visualAnalysisStatus: parsed.visualAnalysisStatus,
           visualAnalyzedAt: new Date().toISOString(),
           name: effectiveName,

@@ -617,7 +617,7 @@ export function updateProduct(id: string, input: Partial<Product>) {
       JSON.stringify(input.sourceImageUrls ?? current.sourceImageUrls),
       input.visualEvidence ?? current.visualEvidence,
       input.visualAnalysisStatus ?? current.visualAnalysisStatus,
-      input.visualAnalyzedAt ?? current.visualAnalyzedAt,
+      input.visualAnalyzedAt === undefined ? current.visualAnalyzedAt : input.visualAnalyzedAt,
       now(),
       id,
     );

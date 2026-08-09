@@ -367,9 +367,28 @@ export async function getFeishuDocumentBlock(client: Client, documentId: string,
 }
 
 export async function updateFeishuTextBlock(client: Client, documentId: string, blockId: string, content: string) {
+  return updateFeishuTextBlockElements(client, documentId, blockId, [{ text_run: { content } }]);
+}
+
+type FeishuTextElement = {
+  text_run: {
+    content: string;
+    text_element_style?: {
+      bold?: boolean;
+      link?: { url: string };
+    };
+  };
+};
+
+export async function updateFeishuTextBlockElements(
+  client: Client,
+  documentId: string,
+  blockId: string,
+  elements: FeishuTextElement[],
+) {
   const response = await client.docx.v1.documentBlock.patch({
     path: { document_id: documentId, block_id: blockId },
-    data: { update_text_elements: { elements: [{ text_run: { content } }] } },
+    data: { update_text_elements: { elements } },
   });
   apiError(response, "更新飞书文档文本失败");
 }
@@ -500,12 +519,12 @@ function syncProductFieldText(content: string, values: Record<string, string>) {
     ["商品名称", values.商品名称],
     ["产品链接", values.产品链接],
     ["商品ID", values.商品ID],
-    ["产品主要功能", values.核心功能],
-    ["产品SKU", values.SKU],
-    ["产品参数", values.产品参数],
-    ["使用方法", values.使用方法],
-    ["适用人群", values.适用人群],
-    ["使用场景", values.使用场景],
+    ["产品主要功能", values.核心功能, true],
+    ["产品SKU", values.SKU, true],
+    ["产品参数", values.产品参数, true],
+    ["使用方法", values.使用方法, true],
+    ["适用人群", values.适用人群, true],
+    ["使用场景", values.使用场景, true],
     ["产品卖点", "", true],
   ];
   for (const [label, value, allowEmpty] of labels) next = replaceLabeledValue(next, label, value, allowEmpty);
@@ -515,6 +534,35 @@ function syncProductFieldText(content: string, values: Record<string, string>) {
     next = `${ranked[1]}${value}`;
   }
   return next;
+}
+
+function styledProductFieldElements(content: string, productUrl: string): FeishuTextElement[] {
+  const labels = ["商品名称", "产品链接", "商品ID", "产品主要功能", "产品SKU", "产品参数", "使用方法", "适用人群", "使用场景", "产品卖点"];
+  const label = labels.find((candidate) => content.includes(candidate));
+  if (!label) return [{ text_run: { content } }];
+  const labelIndex = content.indexOf(label);
+  const colonIndex = [content.indexOf("：", labelIndex), content.indexOf(":", labelIndex)]
+    .filter((index) => index >= 0)
+    .sort((a, b) => a - b)[0];
+  const prefixEnd = colonIndex == null ? labelIndex + label.length : colonIndex + 1;
+  const elements: FeishuTextElement[] = [];
+  if (prefixEnd > 0) {
+    elements.push({ text_run: { content: content.slice(0, prefixEnd), text_element_style: { bold: true } } });
+  }
+  const suffix = content.slice(prefixEnd);
+  if (label === "产品链接" && productUrl) {
+    const linkIndex = suffix.indexOf(productUrl);
+    if (linkIndex >= 0) {
+      if (linkIndex > 0) elements.push({ text_run: { content: suffix.slice(0, linkIndex) } });
+      elements.push({ text_run: { content: productUrl, text_element_style: { link: { url: productUrl } } } });
+      if (linkIndex + productUrl.length < suffix.length) {
+        elements.push({ text_run: { content: suffix.slice(linkIndex + productUrl.length) } });
+      }
+      return elements;
+    }
+  }
+  if (suffix) elements.push({ text_run: { content: suffix } });
+  return elements;
 }
 
 export async function ensureProductDocument(
@@ -570,13 +618,22 @@ export async function ensureProductDocument(
     图片3: input.propImages?.[2] || product.propImages?.[2] || "",
   };
   for (const block of blocks) {
-    const text = block.text as { elements?: Array<{ text_run?: { content?: string } }> } | undefined;
+    const text = block.text as { elements?: Array<{ text_run?: { content?: string; text_element_style?: { link?: { url?: string } } } }> } | undefined;
     const content = text?.elements?.map((element) => element.text_run?.content || "").join("");
     // Keep the template compatible with the previous header while standardizing
     // the field name used by all future tables.
     if (!content) continue;
     const next = syncProductFieldText(content, values);
-    if (next !== content && block.block_id) await updateFeishuTextBlock(client, copied.documentId, String(block.block_id), next);
+    const isProductLink = next.includes("产品链接") && next.includes(product.productUrl);
+    const hasExpectedLink = text?.elements?.some((element) => element.text_run?.text_element_style?.link?.url === product.productUrl);
+    if ((next !== content || isProductLink && !hasExpectedLink) && block.block_id) {
+      await updateFeishuTextBlockElements(
+        client,
+        copied.documentId,
+        String(block.block_id),
+        styledProductFieldElements(next, product.productUrl),
+      );
+    }
   }
   updateProduct(product.id, { documentId: copied.documentId, documentUrl: copied.documentUrl });
   return { ...copied, reused, permissionWarning };

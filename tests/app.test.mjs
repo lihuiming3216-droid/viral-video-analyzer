@@ -193,42 +193,49 @@ test("Feishu automation can return fields without requiring Base write permissio
   assert.match(route, /writeBackError/);
 });
 
-test("product cards use Qwen search when TikTok is unreachable and resync reused documents", async () => {
-  const [parser, automation, document, database, ensureDocument] = await Promise.all([
+test("product cards use verified TikTok evidence and resync reused documents", async () => {
+  const [parser, automation, document, database, ensureDocument, tiktokProduct] = await Promise.all([
     readFile(new URL("lib/product-parser.ts", root), "utf8"),
     readFile(new URL("lib/feishu/automation.ts", root), "utf8"),
     readFile(new URL("lib/feishu/document.ts", root), "utf8"),
     readFile(new URL("lib/database.ts", root), "utf8"),
     readFile(new URL("app/api/products/ensure-document/route.ts", root), "utf8"),
+    readFile(new URL("lib/tiktok-product.ts", root), "utf8"),
   ]);
-  assert.match(parser, /tools: \[\{ type: "web_search_image" \}\]/);
+  assert.match(tiktokProduct, /https:\/\/shop\.tiktok\.com\/us\/pdp\/\$\{TIKTOK_SHOP_SLUG\}\/\$\{normalized\}\?source=anchor/);
+  assert.match(tiktokProduct, /shop\.tiktokw\.us/);
+  assert.match(parser, /__MODERN_ROUTER_DATA__/);
+  assert.match(parser, /product_model/);
+  assert.match(parser, /clean\(model\.product_id\) !== productId/);
+  assert.match(parser, /tools: \[\{ type: "web_search" \}\]/);
   assert.match(parser, /enable_thinking: false/);
   assert.match(parser, /hasUsableProductInfo/);
   assert.match(parser, /产品主要功能/);
-  assert.match(parser, /JSON 键名必须严格使用以下英文键/);
+  assert.match(parser, /JSON 键名必须严格使用/);
   assert.match(parser, /SKU 不得填写 PID 或商品ID/);
   assert.match(parser, /skuWithoutLabel !== clean\(productId\)/);
-  assert.match(parser, /web_search_image/);
   assert.match(parser, /type: "image_url"/);
   assert.match(parser, /MAX_PRODUCT_IMAGES = 4/);
   assert.match(parser, /max_pixels: MAX_IMAGE_PIXELS/);
   assert.match(parser, /visualEvidence/);
   assert.match(parser, /hasReliableVisualEvidence/);
-  assert.match(parser, /categoryFallbackPrompt/);
-  assert.match(parser, /产品参数和 visualEvidence 必须严格写“页面未说明”/);
-  assert.match(parser, /sellingPoints 必须严格返回空字符串/);
+  assert.doesNotMatch(parser, /categoryFallbackPrompt/);
+  assert.match(parser, /不得使用常识补齐/);
+  assert.match(parser, /exactSourceMatched/);
   assert.match(parser, /sellingPoints: ""/);
-  assert.match(parser, /productParameters: "页面未说明"/);
   assert.match(parser, /sourceImageUrls: \[\]/);
   assert.match(automation, /!product\.visualAnalyzedAt/);
+  assert.match(automation, /productUrlChanged/);
   assert.match(automation, /visualAnalyzedAt: new Date\(\)\.toISOString\(\)/);
   assert.match(ensureDocument, /forceProductParse === true/);
   assert.match(database, /source_image_urls_json/);
   assert.match(database, /visual_analysis_status/);
   assert.match(database, /visual_analyzed_at/);
+  assert.match(database, /input\.visualAnalyzedAt === undefined/);
   assert.match(automation, /已停止生成空白产品手卡/);
   assert.match(document, /syncProductFieldText/);
   assert.match(document, /\["产品卖点", "", true\]/);
+  assert.match(document, /text_element_style: \{ link: \{ url: productUrl \} \}/);
   assert.match(document, /核心功能A: ""/);
   assert.match(document, /核心功能E: ""/);
   assert.match(document, /values\[`核心功能\$\{ranked\[2\]\.toUpperCase\(\)\}`\] \|\| ""/);

@@ -1,4 +1,4 @@
-name: Deploy to Alibaba ECS
+name: Deploy to AWS Lightsail
 
 on:
   push:
@@ -22,17 +22,17 @@ jobs:
       - name: Export Docker image
         run: docker save viral-video-analyzer:latest | gzip > viral-video-analyzer.tar.gz
 
-      - name: Copy project to Alibaba ECS
+      - name: Copy runtime configuration to AWS Lightsail
         uses: appleboy/scp-action@v1
         with:
           host: ${{ secrets.ECS_HOST }}
           username: ${{ secrets.ECS_USER }}
           key: ${{ secrets.ECS_SSH_KEY }}
-          source: "docker-compose.yml"
+          source: "docker-compose.yml,deploy/nginx.conf"
           target: "/opt/viral-video-analyzer"
           overwrite: true
 
-      - name: Copy built Docker image to Alibaba ECS
+      - name: Copy built Docker image to AWS Lightsail
         uses: appleboy/scp-action@v1
         with:
           host: ${{ secrets.ECS_HOST }}
@@ -51,28 +51,43 @@ jobs:
           script: |
             set -e
             if ! command -v docker >/dev/null 2>&1; then
-              apt-get update
-              apt-get install -y docker.io
-              systemctl enable --now docker
+              sudo apt-get update
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io
+              sudo systemctl enable --now docker
             fi
-            if ! docker compose version >/dev/null 2>&1 && ! command -v docker-compose >/dev/null 2>&1; then
-              apt-get update
-              apt-get install -y docker-compose
+            if ! sudo docker compose version >/dev/null 2>&1; then
+              sudo apt-get update
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y docker-compose-v2
+            fi
+            if ! command -v nginx >/dev/null 2>&1; then
+              sudo apt-get update
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nginx
             fi
             cd /opt/viral-video-analyzer
-            docker load -i /opt/viral-video-analyzer/viral-video-analyzer.tar.gz
+            sudo docker load -i /opt/viral-video-analyzer/viral-video-analyzer.tar.gz
             rm -f /opt/viral-video-analyzer/viral-video-analyzer.tar.gz
             # The container may have been created manually during recovery,
             # so remove it by its fixed name before Compose recreates it.
             # The named viral_data volume is not removed.
-            docker rm -f viral-video-analyzer 2>/dev/null || true
-            if docker compose version >/dev/null 2>&1; then
-              docker compose up -d --no-build --remove-orphans
-              docker compose ps
-              test -n "$(docker compose ps -q viral-analyzer)"
-            else
-              docker-compose up -d --no-build --remove-orphans
-              docker-compose ps
-              test -n "$(docker-compose ps -q viral-analyzer)"
-            fi
-            docker image prune -f
+            sudo docker rm -f viral-video-analyzer 2>/dev/null || true
+            sudo docker compose up -d --no-build --remove-orphans
+
+            sudo install -m 644 deploy/nginx.conf /etc/nginx/sites-available/viral-video-analyzer
+            sudo ln -sfn /etc/nginx/sites-available/viral-video-analyzer /etc/nginx/sites-enabled/viral-video-analyzer
+            sudo rm -f /etc/nginx/sites-enabled/default
+            sudo nginx -t
+            sudo systemctl enable --now nginx
+            sudo systemctl reload nginx
+
+            for attempt in $(seq 1 30); do
+              if curl -fsS --max-time 5 http://127.0.0.1:3000/ >/dev/null; then
+                break
+              fi
+              if [ "$attempt" -eq 30 ]; then
+                sudo docker logs --tail 120 viral-video-analyzer
+                exit 1
+              fi
+              sleep 2
+            done
+            sudo docker compose ps
+            sudo docker image prune -f

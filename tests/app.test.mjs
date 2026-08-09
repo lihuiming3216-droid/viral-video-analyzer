@@ -213,6 +213,19 @@ test("Feishu button automation acknowledges immediately and writes back in the b
   assert.match(automation, /patch\[resolved\.map\.productDocument\] = product\.documentUrl/);
 });
 
+test("generated Feishu documents grant company editors collaborator management", async () => {
+  const [document, permissionRoute] = await Promise.all([
+    readFile(new URL("lib/feishu/document.ts", root), "utf8"),
+    readFile(new URL("app/api/feishu/product-document-permissions/route.ts", root), "utf8"),
+  ]);
+  assert.match(document, /external_access_entity: "closed"/);
+  assert.match(document, /link_share_entity: "tenant_editable"/);
+  assert.match(document, /manage_collaborator_entity: "collaborator_can_edit"/);
+  assert.match(document, /security_entity: "anyone_can_edit"/);
+  assert.match(permissionRoute, /company_manage_all_generated_documents/);
+  assert.match(permissionRoute, /getCompanyDocumentPermission/);
+});
+
 test("product cards use verified TikTok evidence and resync reused documents", async () => {
   const [parser, automation, document, database, ensureDocument, tiktokProduct] = await Promise.all([
     readFile(new URL("lib/product-parser.ts", root), "utf8"),

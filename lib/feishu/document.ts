@@ -15,14 +15,29 @@ import type { Product, SceneRecord, VideoRecord } from "@/lib/types";
 
 const defaultProductTemplateToken = "B3GNdl05HoEdjnx8WPrcwC5Hnlg";
 
-async function setCompanyEditable(client: Client, documentId: string) {
-  const response = await client.request({
-    url: `/open-apis/drive/v1/permissions/${encodeURIComponent(documentId)}/public`,
-    method: "PATCH",
+export async function setCompanyManaged(client: Client, documentId: string) {
+  const response = await client.drive.v2.permissionPublic.patch({
+    path: { token: documentId },
     params: { type: "docx" },
-    data: { link_share_entity: "tenant_editable", share_entity: "same_tenant" },
+    data: {
+      external_access_entity: "closed",
+      link_share_entity: "tenant_editable",
+      share_entity: "same_tenant",
+      manage_collaborator_entity: "collaborator_can_edit",
+      security_entity: "anyone_can_edit",
+    },
   });
-  apiError(response as { code?: number; msg?: string }, "设置文档公司内可编辑失败");
+  apiError(response, "设置文档公司内管理权限失败");
+  return response.data?.permission_public;
+}
+
+export async function getCompanyDocumentPermission(client: Client, documentId: string) {
+  const response = await client.drive.v2.permissionPublic.get({
+    path: { token: documentId },
+    params: { type: "docx" },
+  });
+  apiError(response, "读取文档权限失败");
+  return response.data?.permission_public;
 }
 
 function apiError(response: { code?: number; msg?: string } | null | undefined, fallback: string) {
@@ -591,8 +606,8 @@ export async function ensureProductDocument(
       folderToken: settings.rootFolderToken || undefined,
     });
   let permissionWarning = "";
-  try { await setCompanyEditable(client, copied.documentId); }
-  catch (error) { permissionWarning = error instanceof Error ? error.message : "设置公司内编辑权限失败"; }
+  try { await setCompanyManaged(client, copied.documentId); }
+  catch (error) { permissionWarning = error instanceof Error ? error.message : "设置公司内管理权限失败"; }
   const blocks = await listFeishuDocumentBlocks(client, copied.documentId);
   const functions = [...(input.coreFunctions || [])].slice(0, 5);
   const values: Record<string, string> = {

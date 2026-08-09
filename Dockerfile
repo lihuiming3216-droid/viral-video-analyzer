@@ -19,7 +19,7 @@ ENV NEXT_TELEMETRY_DISABLED=1
 ENV NODE_OPTIONS=--max-old-space-size=512
 
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
+  && apt-get install -y --no-install-recommends ffmpeg ca-certificates chromium \
   && rm -rf /var/lib/apt/lists/* \
   && corepack enable
 

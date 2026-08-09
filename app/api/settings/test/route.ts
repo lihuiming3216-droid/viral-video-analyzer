@@ -1,5 +1,4 @@
 import { NextRequest, NextResponse } from "next/server";
-import { testOpenAIConnection } from "@/lib/providers/openai";
 import { testQwenConnection } from "@/lib/providers/qwen";
 import { testTokScriptConnection } from "@/lib/providers/tokscript";
 
@@ -8,9 +7,7 @@ export const runtime = "nodejs";
 export async function POST(request: NextRequest) {
   try {
     const { provider } = await request.json();
-    const result = provider === "openai"
-      ? await testOpenAIConnection()
-      : provider === "qwen"
+    const result = provider === "qwen"
         ? await testQwenConnection()
         : provider === "tokscript"
           ? await testTokScriptConnection()

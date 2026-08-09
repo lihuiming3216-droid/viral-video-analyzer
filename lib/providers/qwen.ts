@@ -53,3 +53,35 @@ export async function analyzeVideoWithQwen(input: {
   }
   return parseJsonLoose<Record<string, unknown>>(readTextFromModelResponse(payload));
 }
+
+export async function transcribeAudioWithQwen(audioPath: string, signal?: AbortSignal) {
+  const config = requireProvider("qwen");
+  const audio = readFileSync(audioPath);
+  if (audio.length > 10 * 1024 * 1024) throw new Error("音频超过 Qwen 单次转写的 10MB 限制");
+  const response = await fetch(`${config.baseUrl}/chat/completions`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${config.apiKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: process.env.QWEN_ASR_MODEL || "qwen3-asr-flash",
+      messages: [{
+        role: "user",
+        content: [{
+          type: "input_audio",
+          input_audio: { data: `data:audio/mpeg;base64,${audio.toString("base64")}` },
+        }],
+      }],
+      stream: false,
+    }),
+    signal: signal
+      ? AbortSignal.any([signal, AbortSignal.timeout(120_000)])
+      : AbortSignal.timeout(120_000),
+  });
+  const payload = (await response.json()) as Record<string, unknown>;
+  if (!response.ok) {
+    const error = payload.error as Record<string, unknown> | undefined;
+    throw new Error(String(error?.message || `Qwen 语音转写失败（${response.status}）`));
+  }
+  const transcript = readTextFromModelResponse(payload).trim();
+  if (!transcript) throw new Error("Qwen 没有返回语音转写内容");
+  return transcript;
+}

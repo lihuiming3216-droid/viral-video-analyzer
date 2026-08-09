@@ -13,7 +13,7 @@ export async function PUT(request: NextRequest) {
   try {
     const body = await request.json();
     const provider = String(body.provider || "") as ProviderName;
-    if (!(["tokscript", "openai", "qwen"] as string[]).includes(provider)) {
+    if (!(["tokscript", "qwen"] as string[]).includes(provider)) {
       return NextResponse.json({ error: "服务类型无效" }, { status: 400 });
     }
     const encryptedApiKey = body.clearKey

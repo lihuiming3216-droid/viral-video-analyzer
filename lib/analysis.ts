@@ -4,8 +4,7 @@ import { getProduct, getVideo, replaceScenes, updateVideo } from "@/lib/database
 import { clampScore, formatTime } from "@/lib/json-utils";
 import { getLearningContext, learnFromVideo } from "@/lib/learning";
 import { getProviderConfig } from "@/lib/provider-config";
-import { analyzeFramesWithOpenAI, transcribeAudio } from "@/lib/providers/openai";
-import { analyzeVideoWithQwen } from "@/lib/providers/qwen";
+import { analyzeVideoWithQwen, transcribeAudioWithQwen } from "@/lib/providers/qwen";
 import { fetchTikTok } from "@/lib/providers/tokscript";
 import type { AnalysisResult, AnalysisScene, Product, ScoreSet } from "@/lib/types";
 import { emitVideoProgress } from "@/lib/video-events";
@@ -14,6 +13,7 @@ import {
   downloadMedia,
   extractVideoAssets,
   resolveMediaPath,
+  splitAudioForQwenAsr,
   type ExtractedScene,
 } from "@/lib/video-processing";
 
@@ -146,7 +146,7 @@ translationZh 必须是完整原口播的自然中文翻译，不要只翻译其
 最后生成一份吸收原片优点、但不是逐句抄袭的中文复拍口播稿和分镜脚本。`;
 }
 
-function isConfigured(provider: "openai" | "qwen") {
+function isConfigured(provider: "qwen") {
   const config = getProviderConfig(provider);
   return config.enabled && Boolean(config.apiKey);
 }
@@ -180,19 +180,13 @@ function userFacingAnalysisError(error: unknown) {
   return message;
 }
 
-// Qwen is the default multimodal provider. Set this to false only when an
-// installation wants OpenAI-only analysis.
-function qwenFallbackEnabled() {
-  return process.env.ENABLE_QWEN_FALLBACK !== "false";
-}
-
 function isUsableAnalysis(value: Record<string, unknown> | undefined, sceneCount: number, mode: "full" | "product_doc") {
   if (!value || typeof value.summary !== "string" || !value.summary.trim()) return false;
   const scores = value.scores;
   const scenes = value.scenes;
   // The table path deliberately asks for a compact object without scene rows
-  // or scores. Accept it here so an incomplete scene array does not trigger a
-  // second, expensive OpenAI request after Qwen already produced the answer.
+  // or scores. Accept it here so a valid lightweight result does not trigger
+  // a second Qwen request.
   if (mode === "product_doc") return typeof value.translationZh === "string" && Boolean(value.translationZh.trim());
   return Boolean(
     scores && typeof scores === "object"
@@ -297,13 +291,19 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal) {
     });
 
     if (!transcript && assets.audioPath) {
-      if (!isConfigured("openai")) {
-        throw new Error("TokScript 未返回口播，且 OpenAI 语音转写尚未配置");
+      if (!isConfigured("qwen")) {
+        throw new Error("TokScript 未返回口播，且 Qwen 语音转写尚未配置");
       }
       setStage(videoId, "transcribing", "正在识别英语或西语口播", 52);
-      transcript = await transcribeAudio(resolveMediaPath(assets.audioPath), signal);
+      const audioChunks = await splitAudioForQwenAsr(assets.audioPath, assets.duration, signal);
+      const transcripts: string[] = [];
+      for (const chunk of audioChunks) {
+        signal?.throwIfAborted();
+        transcripts.push(await transcribeAudioWithQwen(resolveMediaPath(chunk), signal));
+      }
+      transcript = transcripts.join(" ").trim();
       updateVideo(videoId, { transcript_original: transcript });
-      trace.push("OpenAI：本地上传视频语音识别");
+      trace.push("Qwen：本地上传视频语音识别");
     }
 
     const learningContext = analysisMode === "product_doc" ? null : getLearningContext(product, videoId);
@@ -314,7 +314,7 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal) {
     setStage(videoId, "analyzing", "正在分析画面、声音、钩子和转化结构", 66);
 
     let qwenContext: Record<string, unknown> | undefined;
-    if (qwenFallbackEnabled() && isConfigured("qwen")) {
+    if (isConfigured("qwen")) {
       try {
         qwenContext = await analyzeVideoWithQwen({
           prompt,
@@ -335,23 +335,21 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal) {
     if (isUsableAnalysis(qwenContext, assets.scenes.length, analysisMode)) {
       rawAnalysis = qwenContext as Partial<AnalysisResult>;
       trace.push("自动路由：Qwen 结果完整，直接生成快速报告");
-    } else if (analysisMode === "product_doc") {
-      throw new Error("Qwen 未返回完整的视频分析和中文翻译，请重试该链接");
-    } else if (isConfigured("openai")) {
+    } else if (isConfigured("qwen")) {
       try {
-        rawAnalysis = await analyzeFramesWithOpenAI({ prompt, framePaths, product, qwenContext, signal });
-        trace.push("OpenAI：画面质检、评分与中文报告合成");
+        rawAnalysis = await analyzeVideoWithQwen({ prompt, remoteVideoUrl, framePaths, maxTokens: analysisMode === "product_doc" ? 2_000 : 4_500, signal });
+        trace.push("Qwen：首次结果不完整，已重试一次");
       } catch (error) {
         if (signal?.aborted) throw error;
         if (!qwenContext) throw error;
         rawAnalysis = qwenContext as Partial<AnalysisResult>;
-        trace.push(`OpenAI 未采用，已由 Qwen 完成：${error instanceof Error ? error.message : "未知错误"}`);
       }
-    } else if (qwenContext) {
-      rawAnalysis = qwenContext as Partial<AnalysisResult>;
-      trace.push("Qwen：中文报告合成");
     } else {
-      throw new Error("请至少配置 OpenAI 或 Qwen，其中 OpenAI 用于获得完整分析效果");
+      throw new Error("请先配置并启用 Qwen，所有 AI 分析只使用 Qwen");
+    }
+
+    if (!isUsableAnalysis(rawAnalysis as Record<string, unknown>, assets.scenes.length, analysisMode)) {
+      throw new Error("Qwen 未返回完整的视频分析和中文翻译，请重试该链接");
     }
 
     const analysis = normalizeAnalysis(rawAnalysis, assets.scenes.length, trace);

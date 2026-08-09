@@ -1,6 +1,6 @@
 import "server-only";
 
-import { fetchOpenAI } from "@/lib/network";
+import { fetchWithProxy } from "@/lib/network";
 import { getProviderConfig, requireProvider } from "@/lib/provider-config";
 
 type McpTool = {
@@ -67,7 +67,7 @@ class TokScriptClient {
     // Use the shared outbound client so a cloud deployment can route TikTok
     // dependencies through HTTPS_PROXY when the server region cannot reach
     // them directly.
-    const response = await fetchOpenAI(this.endpoint, {
+    const response = await fetchWithProxy(this.endpoint, {
       method: "POST",
       headers,
       body: JSON.stringify(body),

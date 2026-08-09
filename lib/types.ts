@@ -1,4 +1,4 @@
-export type ProviderName = "tokscript" | "openai" | "qwen";
+export type ProviderName = "tokscript" | "qwen";
 
 export type VideoStatus =
   | "waiting"

@@ -1,7 +1,8 @@
 import "server-only";
 
-import { fetchOpenAI } from "@/lib/network";
-import { getProviderConfig, requireProvider } from "@/lib/provider-config";
+import { existsSync } from "node:fs";
+import { fetchWithProxy } from "@/lib/network";
+import { getProviderConfig } from "@/lib/provider-config";
 import { parseJsonLoose, readTextFromModelResponse } from "@/lib/json-utils";
 import { canonicalTikTokProductUrl, tiktokProductFetchUrls } from "@/lib/tiktok-product";
 
@@ -54,38 +55,7 @@ export function extractProductIdFromUrl(productUrl: string) {
   }
 }
 
-const schema = {
-  type: "object",
-  additionalProperties: false,
-  required: ["sourceTitle", "sourceDescription", "sku", "coreFunctions", "productParameters", "usageMethod", "audience", "scenes", "sellingPoints", "visualEvidence", "evidenceQuotes"],
-  properties: {
-    sourceTitle: { type: "string" },
-    sourceDescription: { type: "string" },
-    sku: { type: "string" },
-    coreFunctions: { type: "array", items: { type: "string" }, maxItems: 5 },
-    productParameters: { type: "string" },
-    usageMethod: { type: "string" },
-    audience: { type: "string" },
-    scenes: { type: "string" },
-    sellingPoints: { type: "string" },
-    visualEvidence: { type: "string" },
-    evidenceQuotes: {
-      type: "object",
-      additionalProperties: false,
-      required: ["sku", "coreFunctions", "productParameters", "usageMethod", "audience", "scenes"],
-      properties: {
-        sku: { type: "array", items: { type: "string" } },
-        coreFunctions: { type: "array", items: { type: "string" }, maxItems: 5 },
-        productParameters: { type: "array", items: { type: "string" } },
-        usageMethod: { type: "array", items: { type: "string" } },
-        audience: { type: "array", items: { type: "string" } },
-        scenes: { type: "array", items: { type: "string" } },
-      },
-    },
-  },
-} as const;
-
-const MAX_PRODUCT_IMAGES = 4;
+const MAX_PRODUCT_IMAGES = 8;
 const MAX_IMAGE_PIXELS = 768 * 768;
 
 function clean(value: unknown) {
@@ -233,6 +203,20 @@ function htmlText(html: string) {
     .trim();
 }
 
+const NON_PRODUCT_SECTION = /(?:全球评价|客户评价|商品评价|买家评价|Reviews?|Ratings?|Coupon center|优惠券|运输和退货|发货和配送|退货|TikTok Shop 保障|About this shop|关于店铺|安全支付|配送保障|数据隐私|全天候应用内支持|退款保障)/i;
+
+function productDetailText(value: string) {
+  const text = value.replace(/\r/g, "\n");
+  const startMarkers = ["商品描述", "产品描述", "Product description", "About this item"];
+  const starts = startMarkers
+    .map((marker) => text.toLowerCase().indexOf(marker.toLowerCase()))
+    .filter((index) => index >= 0);
+  const start = starts.length ? Math.min(...starts) : 0;
+  const tail = text.slice(start);
+  const endMatch = tail.match(NON_PRODUCT_SECTION);
+  return clean(endMatch ? tail.slice(0, endMatch.index) : tail).slice(0, 18_000);
+}
+
 function attribute(tag: string, name: string) {
   const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const match = tag.match(new RegExp(`(?:^|\\s)${escaped}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`, "i"));
@@ -369,7 +353,8 @@ function normalizeParsed(
   const skuWithoutLabel = rawSku.replace(/^(?:SKU|PID|商品ID|产品ID)\s*[:：#-]?\s*/i, "");
   const sourceTitle = base.sourceTitle || clean(parsedValue(parsed, ["sourceTitle", "title", "页面标题"]));
   const sourceDescription = base.sourceDescription || clean(parsedValue(parsed, ["sourceDescription", "description", "页面描述"]));
-  const source = evidenceText || `${sourceTitle}\n${sourceDescription}`;
+  const visualEvidence = clean(parsedValue(parsed, ["visualEvidence", "图片证据", "视觉证据", "图片分析"]));
+  const source = [evidenceText || `${sourceTitle}\n${sourceDescription}`, visualEvidence].filter(Boolean).join("\n");
   const supportedFunctions = functions
     .map((value, index) => ({ value: cleanFunction(value), quote: evidenceList(parsed, "coreFunctions")[index] || "" }))
     .filter((item) => /[\u3400-\u9fff]/.test(item.value) && quotesExistInSource([item.quote], source))
@@ -390,7 +375,7 @@ function normalizeParsed(
     scenes: supportedString(parsedValue(parsed, ["scenes", "使用场景", "适用场景"]), "scenes"),
     // 产品卖点暂不由 AI 生成，避免把品类常识包装成未经证实的商品卖点。
     sellingPoints: "",
-    visualEvidence: clean(parsedValue(parsed, ["visualEvidence", "图片证据", "视觉证据", "图片分析"])),
+    visualEvidence,
   };
 }
 
@@ -492,13 +477,15 @@ function structuredProductEvidence(html: string, productUrl: string) {
   const skus = (Array.isArray(model.skus) ? model.skus : [])
     .map((item) => item && typeof item === "object" ? clean((item as Record<string, unknown>).sku_name) : "")
     .filter((value, index, all) => Boolean(value) && all.indexOf(value) === index);
-  const imageUrls = [
-    ...(Array.isArray(model.images) ? model.images : []).flatMap((image) => {
+  const coverImages = (Array.isArray(model.images) ? model.images : []).flatMap((image) => {
       if (!image || typeof image !== "object") return [];
       const urls = (image as Record<string, unknown>).url_list;
       return Array.isArray(urls) && urls.length ? [clean(urls[0])] : [];
-    }),
+    });
+  const imageUrls = [
+    coverImages[0],
     ...description.imageUrls,
+    ...coverImages.slice(1),
   ].filter((url, index, all) => /^https?:\/\//i.test(url) && all.indexOf(url) === index);
   const title = clean(model.name);
   const detail = description.texts.join("\n").slice(0, 7_000);
@@ -515,11 +502,92 @@ function structuredProductEvidence(html: string, productUrl: string) {
   };
 }
 
+function browserExecutable() {
+  const candidates = [
+    process.env.PRODUCT_BROWSER_EXECUTABLE_PATH,
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+  ].filter(Boolean) as string[];
+  return candidates.find((candidate) => existsSync(candidate)) || "";
+}
+
+let browserQueue: Promise<void> = Promise.resolve();
+
+async function readExpandedProductPage(productUrl: string) {
+  const previous = browserQueue;
+  let release!: () => void;
+  browserQueue = new Promise<void>((resolve) => { release = resolve; });
+  await previous;
+  try {
+    const executablePath = browserExecutable();
+    if (!executablePath) return null;
+    const { chromium } = await import("playwright-core");
+    const browser = await chromium.launch({
+      executablePath,
+      headless: true,
+      args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+    });
+    try {
+      const page = await browser.newPage({
+        locale: "en-US",
+        userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
+        viewport: { width: 1280, height: 900 },
+      });
+      await page.goto(productUrl, { waitUntil: "domcontentloaded", timeout: 30_000 });
+      const moreText = /^(?:查看更多|View more|See more|Show more|Load more)$/i;
+      for (let round = 0; round < 12; round += 1) {
+        const controls = page.locator("button, [role=button]").filter({ hasText: moreText });
+        const textControls = page.getByText(moreText, { exact: true });
+        for (const locator of [controls, textControls]) {
+          const count = Math.min(await locator.count(), 6);
+          for (let index = 0; index < count; index += 1) {
+            await locator.nth(index).click({ timeout: 1_500 }).catch(() => undefined);
+          }
+        }
+        const reachedBottom = await page.evaluate(() => {
+          const before = window.scrollY;
+          window.scrollBy(0, Math.max(700, window.innerHeight * 0.8));
+          return before + window.innerHeight >= document.documentElement.scrollHeight - 10;
+        });
+        await page.waitForTimeout(250);
+        if (reachedBottom) break;
+      }
+      await page.waitForTimeout(500);
+      const [html, text, imageCandidates] = await Promise.all([
+        page.content(),
+        page.locator("body").innerText().catch(() => ""),
+        page.locator("img").evaluateAll((images) => images.flatMap((image) => {
+          const element = image as HTMLImageElement;
+          const srcset = element.getAttribute("srcset")?.split(",").map((part) => part.trim().split(/\s+/)[0]) || [];
+          let parent: HTMLElement | null = element;
+          for (let level = 0; level < 4 && parent?.parentElement; level += 1) parent = parent.parentElement;
+          const context = (parent?.innerText || element.alt || "").slice(0, 500);
+          return [element.currentSrc, element.src, element.getAttribute("data-src") || "", ...srcset]
+            .filter(Boolean)
+            .map((url) => ({ url, context }));
+        }).filter(Boolean)),
+      ]);
+      const normalizedImages = imageCandidates
+        .filter((candidate) => !NON_PRODUCT_SECTION.test(candidate.context))
+        .map((candidate) => normalizeImageUrl(candidate.url, productUrl))
+        .filter((url, index, all) => Boolean(url) && looksLikeProductImage(url) && all.indexOf(url) === index);
+      return { html, text: productDetailText(text), imageUrls: normalizedImages };
+    } finally {
+      await browser.close();
+    }
+  } catch {
+    return null;
+  } finally {
+    release();
+  }
+}
+
 async function readProductPage(productUrl: string): Promise<ProductPageResult> {
   let lastError = "商品页没有公开资料";
   for (const [index, fetchUrl] of tiktokProductFetchUrls(productUrl).entries()) {
     try {
-      const response = await fetchOpenAI(fetchUrl, {
+      const response = await fetchWithProxy(fetchUrl, {
         headers: {
           "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/126 Safari/537.36",
           "Accept-Language": "en-US,en;q=0.9",
@@ -542,13 +610,29 @@ async function readProductPage(productUrl: string): Promise<ProductPageResult> {
         continue;
       }
       const structured = structuredProductEvidence(html, productUrl);
-      if (structured) return { ...structured, error: "" };
+      const expanded = await readExpandedProductPage(fetchUrl);
+      const renderedStructured = expanded ? structuredProductEvidence(expanded.html, productUrl) : null;
+      const bestStructured = renderedStructured || structured;
+      if (bestStructured) {
+        const imageUrls = [
+          ...bestStructured.imageUrls,
+          ...(expanded?.imageUrls || []),
+        ].filter((url, imageIndex, all) => all.indexOf(url) === imageIndex).slice(0, MAX_PRODUCT_IMAGES);
+        return {
+          ...bestStructured,
+          text: [bestStructured.text, expanded?.text].filter(Boolean).join("\n").slice(0, 20_000),
+          imageUrls,
+          error: "",
+        };
+      }
       if (title || metaDescription || visibleText.length >= 300) {
         return {
           title,
           description: metaDescription,
-          text: visibleText,
-          imageUrls: extractProductImageUrls(html, productUrl),
+          text: [visibleText, expanded?.text].filter(Boolean).join("\n").slice(0, 20_000),
+          imageUrls: [...extractProductImageUrls(html, productUrl), ...(expanded?.imageUrls || [])]
+            .filter((url, imageIndex, all) => all.indexOf(url) === imageIndex)
+            .slice(0, MAX_PRODUCT_IMAGES),
           sku: "",
           error: "",
         };
@@ -574,7 +658,7 @@ function extractionPrompt(input: {
     ? "请只使用联网搜索中 URL 与上述 TikTok Shop 商品链接完全对应（可忽略查询参数）的结果。其他商品、同品类页面和团队中文名都不是证据。"
     : `页面标题：${input.title}\n页面描述：${input.description}\n页面正文：${input.pageText}`;
   const visualInstruction = input.visualMode === "direct"
-    ? "下方会附带商品图片。必须结合图片确认产品外观结构、接口/按键、随附配件、可见文字和使用方式，并把这些可靠信息融入各字段。"
+    ? "下方会附带商品图片。必须结合图片确认产品外观结构、接口/按键、随附配件、可见文字和使用方式。图片中清晰可见的原文可以作为字段证据，但不得根据外观猜测看不见的性能、材质或参数；引用图片文字时，把逐字可见文字同时放入对应 evidenceQuotes 和 visualEvidence。visualEvidence 必须保留引用到的英文原文，不要只写中文概括。"
     : input.visualMode === "search"
       ? "当前没有经过 PID 校验的商品图片，visualEvidence 必须留空，不得用相似商品图片推断。"
       : "当前没有可靠商品图片，只能根据公开文字资料整理。";
@@ -585,13 +669,13 @@ function extractionPrompt(input: {
       ? `本页文字明确列出 ${bundleCount}-in-1 功能清单，因此 coreFunctions 必须恰好返回 ${bundleOutputCount} 条，逐项覆盖清单，不得遗漏、合并或只移到其他字段。`
       : `本页文字明确列出 ${bundleCount}-in-1 组合功能；受字段上限影响，coreFunctions 必须返回其中最重要且有原文证据的 ${bundleOutputCount} 条。`
     : "若页面明确写有 N-in-1 或 N things in one 并逐项列出功能，coreFunctions 必须逐项覆盖清单中的每一项（最多5项），不得省略，也不得只把某项放入产品参数。";
-  return `你在整理 TikTok Shop 产品手卡。\n${identity}\n${evidence}\n${visualInstruction}\n\n只能把上述页面文字中明确出现的信息翻译、归纳成中文。不得使用常识补齐，不得根据团队中文名推断，不得把相似商品的功能写进来。商品图片只用于 visualEvidence，不得用来扩写 coreFunctions、productParameters、usageMethod、audience 或 scenes。某字段没有直接文字证据时必须返回空字符串或空数组。请输出：页面原始标题 sourceTitle、页面原始描述 sourceDescription、真实 SKU、1至5条产品主要功能、产品参数、使用方法、适用人群、使用场景，以及简短图片证据 visualEvidence。除 sourceTitle、sourceDescription 和 evidenceQuotes 保留英文原文外，其余所有字段值必须使用中文。产品主要功能按重要程度排序，每项只表达一个有证据的功能，不要写 A/B/C/D/E 前缀；页面有足够证据时应整理3至5项。${bundleInstruction}productParameters、usageMethod、audience、scenes 必须返回字符串，不得返回对象或数组；多项用中文分号分隔。产品参数只保留3至8项与购买或使用直接相关的信息，忽略合规声明、危险品声明和无意义的否定属性。SKU 不得填写 PID 或商品ID。精确尺寸、功率、材质、兼容型号、认证和包装数量必须能在证据中找到；页面文字与图片冲突时省略该字段，不要添加冲突说明。sellingPoints 暂不生成，必须返回空字符串。evidenceQuotes 必须为每个输出字段提供页面英文原文逐字短引文：coreFunctions 与引文数组按下标一一对应，其余字段列出支持其中每个事实的引文；中文值必须只是引文的直接翻译或压缩，不得扩大含义。只返回合法 JSON，不要使用 Markdown 代码块。JSON 键名必须严格使用：{"sourceTitle":"","sourceDescription":"","sku":"","coreFunctions":[""],"productParameters":"","usageMethod":"","audience":"","scenes":"","sellingPoints":"","visualEvidence":"","evidenceQuotes":{"sku":[""],"coreFunctions":[""],"productParameters":[""],"usageMethod":[""],"audience":[""],"scenes":[""]}}。`;
+  return `你在整理 TikTok Shop 产品手卡。\n${identity}\n${evidence}\n${visualInstruction}\n\n只能把上述页面文字和商品图片中明确可读的文字翻译、归纳成中文。不得使用常识补齐，不得根据团队中文名推断，不得把相似商品的功能写进来。某字段没有直接文字或清晰图片文字证据时必须返回空字符串或空数组。请输出：页面原始标题 sourceTitle、页面原始描述 sourceDescription、真实 SKU、1至5条产品主要功能、产品参数、使用方法、适用人群、使用场景，以及简短图片证据 visualEvidence。除 sourceTitle、sourceDescription 和 evidenceQuotes 保留英文原文外，其余所有字段值必须使用中文。产品主要功能按重要程度排序，每项只表达一个有证据的功能，不要写 A/B/C/D/E 前缀；页面有足够证据时应整理3至5项。${bundleInstruction}productParameters、usageMethod、audience、scenes 必须返回字符串，不得返回对象或数组；多项用中文分号分隔。产品参数只保留3至8项与购买或使用直接相关的信息，忽略合规声明、危险品声明和无意义的否定属性。SKU 不得填写 PID 或商品ID。精确尺寸、功率、材质、兼容型号、认证和包装数量必须能在证据中找到；页面文字与图片冲突时省略该字段，不要添加冲突说明。sellingPoints 暂不生成，必须返回空字符串。evidenceQuotes 必须为每个输出字段提供页面或图片中的英文逐字短引文：coreFunctions 与引文数组按下标一一对应，其余字段列出支持其中每个事实的引文；中文值必须只是引文的直接翻译或压缩，不得扩大含义。只返回合法 JSON，不要使用 Markdown 代码块。JSON 键名必须严格使用：{"sourceTitle":"","sourceDescription":"","sku":"","coreFunctions":[""],"productParameters":"","usageMethod":"","audience":"","scenes":"","sellingPoints":"","visualEvidence":"","evidenceQuotes":{"sku":[""],"coreFunctions":[""],"productParameters":[""],"usageMethod":[""],"audience":[""],"scenes":[""]}}。`;
 }
 
 async function qwenExtract(prompt: string) {
   const qwen = getProviderConfig("qwen");
   if (!qwen.enabled || !qwen.apiKey) return null;
-  const response = await fetchOpenAI(`${qwen.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+  const response = await fetchWithProxy(`${qwen.baseUrl.replace(/\/$/, "")}/chat/completions`, {
     method: "POST",
     headers: { Authorization: `Bearer ${qwen.apiKey}`, "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -611,7 +695,7 @@ async function qwenExtract(prompt: string) {
 async function qwenTranslateBundleFeatures(features: string[]) {
   const qwen = getProviderConfig("qwen");
   if (!qwen.enabled || !qwen.apiKey || !features.length) return [];
-  const response = await fetchOpenAI(`${qwen.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+  const response = await fetchWithProxy(`${qwen.baseUrl.replace(/\/$/, "")}/chat/completions`, {
     method: "POST",
     headers: { Authorization: `Bearer ${qwen.apiKey}`, "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -638,7 +722,7 @@ async function qwenTranslateBundleFeatures(features: string[]) {
 async function qwenVisualExtract(prompt: string, imageUrls: string[]) {
   const qwen = getProviderConfig("qwen");
   if (!qwen.enabled || !qwen.apiKey || !imageUrls.length) return null;
-  const response = await fetchOpenAI(`${qwen.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+  const response = await fetchWithProxy(`${qwen.baseUrl.replace(/\/$/, "")}/chat/completions`, {
     method: "POST",
     headers: { Authorization: `Bearer ${qwen.apiKey}`, "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -668,7 +752,7 @@ async function qwenVisualExtract(prompt: string, imageUrls: string[]) {
 async function qwenWebSearchExtract(prompt: string, productUrl: string) {
   const qwen = getProviderConfig("qwen");
   if (!qwen.enabled || !qwen.apiKey) return null;
-  const response = await fetchOpenAI(`${qwen.baseUrl.replace(/\/$/, "")}/responses`, {
+  const response = await fetchWithProxy(`${qwen.baseUrl.replace(/\/$/, "")}/responses`, {
     method: "POST",
     headers: { Authorization: `Bearer ${qwen.apiKey}`, "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -709,26 +793,6 @@ async function qwenWebSearchExtract(prompt: string, productUrl: string) {
     parsed: parseJsonLoose<ParsedProductModel>(readTextFromModelResponse(payload)),
     exactSourceMatched,
   };
-}
-
-async function openAiExtract(prompt: string) {
-  try {
-    const config = requireProvider("openai");
-    const response = await fetchOpenAI(`${config.baseUrl}/responses`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${config.apiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: config.model || "gpt-4.1-mini",
-        input: [{ role: "user", content: [{ type: "input_text", text: prompt }] }],
-        text: { format: { type: "json_schema", name: "product_info", strict: true, schema } },
-      }),
-      signal: AbortSignal.timeout(90_000),
-    });
-    if (!response.ok) return null;
-    return parseJsonLoose<ParsedProductModel>(readTextFromModelResponse(await response.json() as Record<string, unknown>));
-  } catch {
-    return null;
-  }
 }
 
 export async function parsePublicProductPage(
@@ -780,14 +844,6 @@ export async function parsePublicProductPage(
   if (normalized && bundleFeatures.length && normalized.coreFunctions.length < bundleFeatures.length) {
     const translated = await qwenTranslateBundleFeatures(bundleFeatures).catch(() => []);
     if (translated.length === bundleFeatures.length) normalized = { ...normalized, coreFunctions: translated };
-  }
-
-  // OpenAI may organize already-downloaded evidence, but it is never allowed
-  // to invent a product from only a PID or the team's Chinese name.
-  if (!searchMode && needsCompletenessRetry(normalized, page.text)) {
-    parsed = await openAiExtract(prompt);
-    const candidate = parsed ? normalizeParsed(parsed, base, productId, page.text) : null;
-    normalized = preferMoreCompleteProductInfo(normalized, candidate);
   }
 
   if (!normalized || !hasUsableProductInfo(normalized)) {

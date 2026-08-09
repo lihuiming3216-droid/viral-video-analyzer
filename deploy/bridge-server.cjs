@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-require-imports -- CommonJS entrypoint used directly by Node on the legacy bridge. */
 const http = require("node:http");
 
 const targetHost = process.env.TARGET_HOST || "52.37.212.216";

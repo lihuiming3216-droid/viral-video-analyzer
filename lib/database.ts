@@ -337,14 +337,13 @@ function initialize(db: DatabaseSync) {
   const timestamp = now();
   const providers: Array<[ProviderName, string, string]> = [
     ["tokscript", "https://api.tokscript.com/mcp", ""],
-    ["openai", "https://api.openai.com/v1", "gpt-4.1-mini"],
     ["qwen", "https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen3.7-plus"],
   ];
   const insertProvider = db.prepare(
     "INSERT OR IGNORE INTO provider_settings(provider, base_url, model, enabled, updated_at) VALUES (?, ?, ?, 1, ?)",
   );
   providers.forEach(([provider, baseUrl, model]) => insertProvider.run(provider, baseUrl, model, timestamp));
-  db.prepare("UPDATE provider_settings SET model='gpt-4.1-mini' WHERE provider='openai' AND model='gpt-5.6-terra'").run();
+  db.prepare("DELETE FROM provider_settings WHERE provider='openai'").run();
 
   db.prepare(`INSERT OR IGNORE INTO feishu_settings(
     id, public_base_url, connection_status, updated_at

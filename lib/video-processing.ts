@@ -2,14 +2,14 @@ import "server-only";
 
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { createWriteStream, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { promisify } from "node:util";
 import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
 import ffprobeStatic from "ffprobe-static";
-import { fetchOpenAI } from "@/lib/network";
+import { fetchWithProxy } from "@/lib/network";
 
 const runFile = promisify(execFile);
 const mediaRoot = path.join(process.cwd(), ".data", "media");
@@ -87,7 +87,7 @@ export async function downloadMedia(
   const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
   let response: Response;
   try {
-    response = await fetchOpenAI(url, {
+    response = await fetchWithProxy(url, {
       redirect: "follow",
       headers: { "User-Agent": "Mozilla/5.0 ViralVideoAnalyzer/1.0" },
       signal: requestSignal,
@@ -232,6 +232,22 @@ export async function extractVideoAssets(
     return { ...metadata, scenes, audioPath: null as string | null };
   }
   return { ...metadata, scenes, audioPath: audioRelative };
+}
+
+export async function splitAudioForQwenAsr(relativeAudioPath: string, durationSeconds: number, signal?: AbortSignal) {
+  if (durationSeconds <= 295) return [relativeAudioPath];
+  const source = resolveMediaPath(relativeAudioPath);
+  const chunksDirectory = path.join(path.dirname(source), `asr-${randomUUID().slice(0, 6)}`);
+  mkdirSync(chunksDirectory, { recursive: true });
+  await runFile(
+    ffmpegPath,
+    ["-y", "-i", source, "-f", "segment", "-segment_time", "270", "-reset_timestamps", "1", "-c", "copy", path.join(chunksDirectory, "chunk-%02d.mp3")],
+    { maxBuffer: 8 * 1024 * 1024, signal },
+  );
+  return readdirSync(chunksDirectory)
+    .filter((name) => /^chunk-\d+\.mp3$/.test(name))
+    .sort()
+    .map((name) => path.relative(mediaRoot, path.join(chunksDirectory, name)));
 }
 
 export async function createSceneClip(videoId: string, relativeVideoPath: string, start: number, end: number, label: string, signal?: AbortSignal) {

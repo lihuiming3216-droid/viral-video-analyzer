@@ -39,7 +39,7 @@ function getProxyAgent() {
   return proxyAgent;
 }
 
-export async function fetchOpenAI(input: string | URL | Request, init: RequestInit = {}) {
+export async function fetchWithProxy(input: string | URL | Request, init: RequestInit = {}) {
   const dispatcher = getProxyAgent();
   if (!dispatcher) return fetch(input, init);
   return undiciFetch(

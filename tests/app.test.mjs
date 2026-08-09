@@ -71,12 +71,15 @@ test("product documents auto-sync in lightweight mode and keep the manual prop a
   assert.match(formatter, /分析爆点/);
   assert.doesNotMatch(formatter, /原视频链接|复拍口播稿|分镜脚本/);
   assert.match(qwen, /max_tokens: input\.maxTokens \|\| 4_500/);
+  assert.match(qwen, /input_audio: \{ data:/);
+  assert.match(analysis, /splitAudioForQwenAsr/);
+  assert.match(processing, /segment_time", "270/);
   assert.match(tokscript, /options\.includeCover !== false/);
-  assert.match(tokscript, /fetchOpenAI\(this\.endpoint/);
+  assert.match(tokscript, /fetchWithProxy\(this\.endpoint/);
   assert.match(tokscript, /AbortSignal\.timeout/);
   assert.match(tokscript, /TokScript 口播获取超时，已改用音频转写/);
   assert.match(processing, /includeAudio\?: boolean/);
-  assert.match(processing, /fetchOpenAI\(url/);
+  assert.match(processing, /fetchWithProxy\(url/);
   assert.match(processing, /signal: requestSignal/);
   assert.match(processing, /normalizedDownloadError/);
   assert.match(analysis, /withOneNetworkRetry/);
@@ -112,7 +115,7 @@ test("Feishu bot receives links, returns scored reports, and excludes remake cop
 
 test("source tree contains no pasted API keys", async () => {
   const files = [
-    "app/ViralAnalyzerApp.tsx", "lib/provider-config.ts", "lib/providers/openai.ts",
+    "app/ViralAnalyzerApp.tsx", "lib/provider-config.ts",
     "lib/providers/qwen.ts", "lib/providers/tokscript.ts", "README.md",
   ];
   const text = (await Promise.all(files.map((file) => readFile(new URL(file, root), "utf8")))).join("\n");
@@ -133,17 +136,16 @@ test("local dashboard API exposes business data without leaking provider secrets
   assert.ok(payload.providers.every((provider) => !("encryptedApiKey" in provider) && !("apiKey" in provider)));
 });
 
-test("OpenAI uses the macOS proxy and model calls cannot hang forever", async () => {
-  const [network, openai, qwen] = await Promise.all([
+test("Qwen uses bounded requests and outbound dependencies can use the macOS proxy", async () => {
+  const [network, qwen] = await Promise.all([
     readFile(new URL("lib/network.ts", root), "utf8"),
-    readFile(new URL("lib/providers/openai.ts", root), "utf8"),
     readFile(new URL("lib/providers/qwen.ts", root), "utf8"),
   ]);
   assert.match(network, /scutil/);
   assert.match(network, /ProxyAgent/);
-  assert.match(openai, /fetchOpenAI/);
-  assert.match(openai, /AbortSignal\.timeout/);
+  assert.match(network, /fetchWithProxy/);
   assert.match(qwen, /AbortSignal\.timeout/);
+  assert.doesNotMatch(qwen, /OpenAI/);
 });
 
 test("queue polling cannot enqueue the currently active video twice", async () => {
@@ -228,7 +230,12 @@ test("product cards use verified TikTok evidence and resync reused documents", a
   assert.match(parser, /SKU 不得填写 PID 或商品ID/);
   assert.match(parser, /skuWithoutLabel !== clean\(productId\)/);
   assert.match(parser, /type: "image_url"/);
-  assert.match(parser, /MAX_PRODUCT_IMAGES = 4/);
+  assert.match(parser, /MAX_PRODUCT_IMAGES = 8/);
+  assert.match(parser, /playwright-core/);
+  assert.match(parser, /查看更多\|View more\|See more/);
+  assert.match(parser, /NON_PRODUCT_SECTION/);
+  assert.match(parser, /Coupon center\|优惠券/);
+  assert.match(parser, /About this shop\|关于店铺/);
   assert.match(parser, /max_pixels: MAX_IMAGE_PIXELS/);
   assert.match(parser, /visualEvidence/);
   assert.match(parser, /hasReliableVisualEvidence/);

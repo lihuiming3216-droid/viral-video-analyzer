@@ -188,16 +188,29 @@ test("analysis page can quickly create a product with an optional PID", async ()
   assert.match(types, /pid: string/);
 });
 
-test("Feishu automation can return fields without requiring Base write permission", async () => {
+test("Feishu automation supports direct Base write-back", async () => {
   const [automation, route] = await Promise.all([
     readFile(new URL("lib/feishu/automation.ts", root), "utf8"),
     readFile(new URL("app/api/feishu/automation/route.ts", root), "utf8"),
   ]);
   assert.match(automation, /writeBack\s*=\s*input\.writeBack === true/);
   assert.match(automation, /if \(writeBack && Object\.keys\(patch\)\.length\)/);
-  assert.match(route, /fields: result\.patch/);
+  assert.match(route, /writeBack: true/);
   assert.match(route, /productDocument/);
   assert.match(route, /writeBackError/);
+});
+
+test("Feishu button automation acknowledges immediately and writes back in the background", async () => {
+  const [automation, route] = await Promise.all([
+    readFile(new URL("lib/feishu/automation.ts", root), "utf8"),
+    readFile(new URL("app/api/feishu/automation/route.ts", root), "utf8"),
+  ]);
+  assert.match(route, /after\(async \(\) =>/);
+  assert.match(route, /writeBack: true/);
+  assert.match(route, /\{ status: 202 \}/);
+  assert.match(route, /activeProductJobs/);
+  assert.match(automation, /refresh failure must never erase a previously verified product/);
+  assert.match(automation, /patch\[resolved\.map\.productDocument\] = product\.documentUrl/);
 });
 
 test("product cards use verified TikTok evidence and resync reused documents", async () => {

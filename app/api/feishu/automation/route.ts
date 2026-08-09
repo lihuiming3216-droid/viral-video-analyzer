@@ -1,9 +1,11 @@
-import { NextRequest, NextResponse } from "next/server";
+import { after, NextRequest, NextResponse } from "next/server";
 import { ensureFeishuConnection, getConnectedFeishuChannel } from "@/lib/feishu/runtime";
 import { handleFeishuAutomation, type FeishuAutomationFieldMap } from "@/lib/feishu/automation";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+
+const activeProductJobs = new Set<string>();
 
 function automationAuth(request: NextRequest, body: Record<string, unknown>) {
   const expected = process.env.FEISHU_AUTOMATION_WEBHOOK_SECRET?.trim();
@@ -33,10 +35,6 @@ function payloadFields(body: Record<string, unknown>) {
   return directFields;
 }
 
-function booleanInput(value: unknown) {
-  return value === true || value === "true" || value === "1" || value === 1;
-}
-
 export async function POST(request: NextRequest) {
   try {
     const contentType = request.headers.get("content-type") || "";
@@ -50,37 +48,57 @@ export async function POST(request: NextRequest) {
     const tableId = String(body.tableId || body.table_id || "").trim();
     const recordId = String(body.recordId || body.record_id || "").trim();
     const fields = payloadFields(body);
-    const writeBack = booleanInput(body.writeBack ?? body.write_back);
     if (!appToken || !tableId || !recordId) return NextResponse.json({ error: "缺少 appToken、tableId 或 recordId" }, { status: 400 });
     if (!Object.keys(fields).length) return NextResponse.json({ error: "没有收到多维表格字段" }, { status: 400 });
-    const channel = getConnectedFeishuChannel() || await ensureFeishuConnection();
-    if (!channel) return NextResponse.json({ error: "飞书应用尚未连接" }, { status: 503 });
-    const result = await handleFeishuAutomation({
-      client: channel.rawClient,
-      appToken,
-      tableId,
-      recordId,
-      fields,
-      fieldMap: (body.fieldMap || body.field_map || {}) as Partial<FeishuAutomationFieldMap>,
-      writeBack,
-    });
-    const productDocument = result.patch[result.map.productDocument] || result.documentUrl || result.productDocument || "";
-    const status = result.patch[result.map.status]
-      || (productDocument ? "已生成产品手卡" : "无任务");
+    const fieldMap = (body.fieldMap || body.field_map || {}) as Partial<FeishuAutomationFieldMap>;
+    const jobKey = `${appToken}:${tableId}:${recordId}`;
+    if (!activeProductJobs.has(jobKey)) {
+      activeProductJobs.add(jobKey);
+      after(async () => {
+        const startedAt = Date.now();
+        try {
+          const channel = getConnectedFeishuChannel() || await ensureFeishuConnection();
+          if (!channel) throw new Error("飞书应用尚未连接");
+          const result = await handleFeishuAutomation({
+            client: channel.rawClient,
+            appToken,
+            tableId,
+            recordId,
+            fields,
+            fieldMap,
+            // Background jobs must write the result themselves. The Feishu
+            // HTTP action has already received its immediate acknowledgement.
+            writeBack: true,
+          });
+          console.info("[feishu-automation] completed", {
+            recordId,
+            pid: result.pid,
+            productName: result.productName,
+            documentUrl: result.documentUrl,
+            durationMs: Date.now() - startedAt,
+            writeBackError: result.writeBackError,
+          });
+        } catch (error) {
+          console.error("[feishu-automation] failed", {
+            recordId,
+            durationMs: Date.now() - startedAt,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        } finally {
+          activeProductJobs.delete(jobKey);
+        }
+      });
+    }
     return NextResponse.json({
       ok: true,
-      status,
-      fields: result.patch,
-      patch: result.patch,
-      productDocument,
-      productUrl: result.patch[result.map.productUrl] || result.productUrl,
-      pid: result.pid,
-      productName: result.productName,
-      analysis: result.patch[result.map.analysis] || "",
-      translation: result.patch[result.map.translation] || "",
-      writeBack,
-      writeBackError: result.writeBackError || "",
-    });
+      accepted: true,
+      status: activeProductJobs.has(jobKey) ? "后台处理中" : "任务已受理",
+      fields: {},
+      patch: {},
+      productDocument: "",
+      writeBack: true,
+      writeBackError: "",
+    }, { status: 202 });
   } catch (error) {
     return NextResponse.json({ error: error instanceof Error ? error.message : "飞书自动化处理失败" }, { status: 500 });
   }

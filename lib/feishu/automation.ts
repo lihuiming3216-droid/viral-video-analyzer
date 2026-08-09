@@ -187,24 +187,20 @@ export async function handleFeishuAutomation(input: {
           pid: effectivePid,
         });
       } catch (error) {
-        product = updateProduct(product.id, {
-          productUrl: resolved.productUrl,
-          sku: "",
-          sellingPoints: "",
-          targetAudience: "",
-          coreFunctions: [],
-          productParameters: "",
-          usageMethod: "",
-          usageScenes: "",
-          sourceTitle: "",
-          sourceDescription: "",
-          sourceImageUrls: [],
-          visualEvidence: "",
-          visualAnalysisStatus: "unavailable",
-          visualAnalyzedAt: null,
-        }) || product;
+        // A refresh failure must never erase a previously verified product.
+        // Existing cards can still be re-linked to the clicked Base record.
         if (product.documentId && product.documentUrl) {
           await ensureProductDocument(input.client, product).catch(() => undefined);
+          patch[resolved.map.productDocument] = product.documentUrl;
+          if (writeBack) {
+            await patchBaseRecord(input.client, {
+              appToken: input.appToken,
+              tableId: input.tableId,
+              recordId: input.recordId,
+              fields: patch,
+            });
+          }
+          return { ...resolved, productName: effectiveName, pid: effectivePid, patch, documentUrl: product.documentUrl, writeBackError };
         }
         throw error;
       }

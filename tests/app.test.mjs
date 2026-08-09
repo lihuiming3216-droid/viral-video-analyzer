@@ -73,7 +73,10 @@ test("product documents auto-sync in lightweight mode and keep the manual prop a
   assert.doesNotMatch(formatter, /原视频链接|复拍口播稿|分镜脚本/);
   assert.match(qwen, /max_tokens: input\.maxTokens \|\| 4_500/);
   assert.match(tokscript, /options\.includeCover !== false/);
+  assert.match(tokscript, /fetchOpenAI\(this\.endpoint/);
+  assert.match(tokscript, /AbortSignal\.timeout/);
   assert.match(processing, /includeAudio\?: boolean/);
+  assert.match(processing, /fetchOpenAI\(url/);
   assert.match(document, /insertProductPropsSection/);
   assert.match(document, /道具列表（员工手动录入）/);
   assert.match(document, /column_size: 3/);

@@ -9,6 +9,7 @@ import { pipeline } from "node:stream/promises";
 import { promisify } from "node:util";
 import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
 import ffprobeStatic from "ffprobe-static";
+import { fetchOpenAI } from "@/lib/network";
 
 const runFile = promisify(execFile);
 const mediaRoot = path.join(process.cwd(), ".data", "media");
@@ -60,7 +61,22 @@ export async function saveProductImage(productId: string, file: File) {
 }
 
 export async function downloadMedia(videoId: string, url: string, kind: "video" | "cover", signal?: AbortSignal) {
-  const response = await fetch(url, { redirect: "follow", headers: { "User-Agent": "Mozilla/5.0 ViralVideoAnalyzer/1.0" }, signal });
+  // TikTok media hosts are not directly reachable from every cloud region.
+  // The shared client honors HTTPS_PROXY without changing local behavior.
+  const timeoutSignal = AbortSignal.timeout(180_000);
+  const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+  let response: Response;
+  try {
+    response = await fetchOpenAI(url, {
+      redirect: "follow",
+      headers: { "User-Agent": "Mozilla/5.0 ViralVideoAnalyzer/1.0" },
+      signal: requestSignal,
+    });
+  } catch (error) {
+    if (signal?.aborted) throw error;
+    if (timeoutSignal.aborted) throw new Error(`${kind === "video" ? "视频" : "封面"}下载超时，请检查云服务器代理或更换海外节点`);
+    throw error;
+  }
   if (!response.ok || !response.body) throw new Error(`${kind === "video" ? "视频" : "封面"}下载失败（${response.status}）`);
   const length = Number(response.headers.get("content-length") || 0);
   if (length > 600 * 1024 * 1024) throw new Error("视频超过 600MB，暂不支持下载");

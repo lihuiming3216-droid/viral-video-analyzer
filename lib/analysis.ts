@@ -200,7 +200,11 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal) {
 
     if (initial.sourceType === "tiktok" && !relativeVideoPath) {
       setStage(videoId, "downloading", "正在通过 TokScript 获取视频和公开数据", 12);
-      const tok = await fetchTikTok(initial.sourceUrl || "", signal, { includeCover: analysisMode !== "product_doc" });
+      const tok = await fetchTikTok(initial.sourceUrl || "", signal, {
+        includeCover: analysisMode !== "product_doc",
+        // One bad/expired document link must never block every later row.
+        timeoutMs: analysisMode === "product_doc" ? 90_000 : 180_000,
+      });
       if (!tok.downloadUrl) throw new Error("TokScript 没有返回可下载的视频地址");
       remoteVideoUrl = tok.downloadUrl;
       relativeVideoPath = await downloadMedia(videoId, tok.downloadUrl, "video", signal);

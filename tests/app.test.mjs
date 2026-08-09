@@ -67,7 +67,6 @@ test("product documents auto-sync in lightweight mode and keep the manual prop a
   assert.match(analysis, /analysisMode === "product_doc" \? 2_000 : 4_500/);
   assert.match(analysis, /learningContext = analysisMode === "product_doc" \? null/);
   assert.match(analysis, /includeCover: analysisMode !== "product_doc"/);
-  assert.match(analysis, /includeAudio: analysisMode !== "product_doc" && !transcript/);
   assert.match(analysis, /translationZh 必须写“无口播”/);
   assert.match(formatter, /分析爆点/);
   assert.doesNotMatch(formatter, /原视频链接|复拍口播稿|分镜脚本/);
@@ -75,8 +74,14 @@ test("product documents auto-sync in lightweight mode and keep the manual prop a
   assert.match(tokscript, /options\.includeCover !== false/);
   assert.match(tokscript, /fetchOpenAI\(this\.endpoint/);
   assert.match(tokscript, /AbortSignal\.timeout/);
+  assert.match(tokscript, /TokScript 口播获取超时，已改用音频转写/);
   assert.match(processing, /includeAudio\?: boolean/);
   assert.match(processing, /fetchOpenAI\(url/);
+  assert.match(processing, /signal: requestSignal/);
+  assert.match(processing, /normalizedDownloadError/);
+  assert.match(analysis, /withOneNetworkRetry/);
+  assert.match(analysis, /原视频下载较慢，正在自动重试/);
+  assert.match(analysis, /includeAudio: !transcript/);
   assert.match(document, /insertProductPropsSection/);
   assert.match(document, /道具列表（员工手动录入）/);
   assert.match(document, /column_size: 3/);

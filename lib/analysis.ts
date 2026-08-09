@@ -151,6 +151,35 @@ function isConfigured(provider: "openai" | "qwen") {
   return config.enabled && Boolean(config.apiKey);
 }
 
+function transientNetworkFailure(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error || "");
+  return /(?:timeout|timed out|aborted due to timeout|fetch failed|econnreset|etimedout|socket|und_err)/i.test(message);
+}
+
+async function withOneNetworkRetry<T>(
+  operation: () => Promise<T>,
+  onRetry: () => void,
+  signal?: AbortSignal,
+) {
+  try {
+    return await operation();
+  } catch (error) {
+    if (signal?.aborted || !transientNetworkFailure(error)) throw error;
+    onRetry();
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    signal?.throwIfAborted();
+    return operation();
+  }
+}
+
+function userFacingAnalysisError(error: unknown) {
+  const message = error instanceof Error ? error.message : "未知错误";
+  if (transientNetworkFailure(error)) {
+    return "获取 TikTok 视频超时，系统已自动重试一次；请稍后在分析状态栏输入“重试”再次处理";
+  }
+  return message;
+}
+
 // Qwen is the default multimodal provider. Set this to false only when an
 // installation wants OpenAI-only analysis.
 function qwenFallbackEnabled() {
@@ -200,23 +229,24 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal) {
 
     if (initial.sourceType === "tiktok" && !relativeVideoPath) {
       setStage(videoId, "downloading", "正在通过 TokScript 获取视频和公开数据", 12);
-      const tok = await fetchTikTok(initial.sourceUrl || "", signal, {
+      const tokOptions = {
         includeCover: analysisMode !== "product_doc",
         // One bad/expired document link must never block every later row.
         timeoutMs: analysisMode === "product_doc" ? 90_000 : 180_000,
-      });
+      };
+      const tok = await withOneNetworkRetry(
+        () => fetchTikTok(initial.sourceUrl || "", signal, tokOptions),
+        () => setStage(videoId, "downloading", "获取视频信息较慢，正在自动重试", 14),
+        signal,
+      );
       if (!tok.downloadUrl) throw new Error("TokScript 没有返回可下载的视频地址");
       remoteVideoUrl = tok.downloadUrl;
-      relativeVideoPath = await downloadMedia(videoId, tok.downloadUrl, "video", signal);
-      const coverPath = tok.coverUrl ? await downloadMedia(videoId, tok.coverUrl, "cover", signal).catch((error) => {
-        if (signal?.aborted) throw error;
-        return null;
-      }) : null;
       transcript = tok.transcript;
       transcriptSegments = tok.segments;
+      // Persist metadata before downloading the media. If the CDN is slow, a
+      // retry keeps the already-fetched transcript and diagnostics instead of
+      // losing the whole TokScript result.
       updateVideo(videoId, {
-        original_path: relativeVideoPath,
-        cover_path: coverPath,
         remote_video_url: remoteVideoUrl,
         transcript_original: transcript,
         transcript_segments_json: JSON.stringify(transcriptSegments),
@@ -235,6 +265,19 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal) {
         provider_payload_json: JSON.stringify(tok.raw),
       });
       trace.push("TokScript：视频、文案与公开数据");
+      setStage(videoId, "downloading", "正在下载 TikTok 原视频", 22);
+      relativeVideoPath = await withOneNetworkRetry(
+        () => downloadMedia(videoId, tok.downloadUrl, "video", signal, {
+          timeoutMs: analysisMode === "product_doc" ? 90_000 : 180_000,
+        }),
+        () => setStage(videoId, "downloading", "原视频下载较慢，正在自动重试", 24),
+        signal,
+      );
+      const coverPath = tok.coverUrl ? await downloadMedia(videoId, tok.coverUrl, "cover", signal).catch((error) => {
+        if (signal?.aborted) throw error;
+        return null;
+      }) : null;
+      updateVideo(videoId, { original_path: relativeVideoPath, cover_path: coverPath });
     } else if (initial.sourceType === "tiktok") {
       trace.push("本地缓存：复用已保存的 TikTok 原片和文案");
     }
@@ -243,7 +286,10 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal) {
     setStage(videoId, "extracting", "正在识别镜头并提取关键画面", 36);
     const assets = await extractVideoAssets(videoId, relativeVideoPath, signal, {
       light: analysisMode === "product_doc",
-      includeAudio: analysisMode !== "product_doc" && !transcript,
+      // TokScript normally supplies the transcript. Audio extraction is only
+      // enabled as a fallback, so successful lightweight jobs spend no extra
+      // transcription tokens.
+      includeAudio: !transcript,
     });
     updateVideo(videoId, {
       duration_seconds: assets.duration,
@@ -251,6 +297,9 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal) {
     });
 
     if (!transcript && assets.audioPath) {
+      if (!isConfigured("openai")) {
+        throw new Error("TokScript 未返回口播，且 OpenAI 语音转写尚未配置");
+      }
       setStage(videoId, "transcribing", "正在识别英语或西语口播", 52);
       transcript = await transcribeAudio(resolveMediaPath(assets.audioPath), signal);
       updateVideo(videoId, { transcript_original: transcript });
@@ -383,7 +432,7 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal) {
     updateVideo(videoId, {
       status: signal?.aborted ? "stopped" : "failed",
       stage: signal?.aborted ? "已停止" : "分析失败",
-      error_message: signal?.aborted ? null : error instanceof Error ? error.message : "未知错误",
+      error_message: signal?.aborted ? null : userFacingAnalysisError(error),
     });
     void import("@/lib/feishu/automation")
       .then(({ completeFeishuAutomation }) => completeFeishuAutomation(videoId))

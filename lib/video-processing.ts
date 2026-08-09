@@ -29,6 +29,20 @@ function safeExtension(fileName: string, fallback = ".mp4") {
   return [".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi"].includes(extension) ? extension : fallback;
 }
 
+function normalizedDownloadError(
+  error: unknown,
+  kind: "video" | "cover",
+  timeoutSignal: AbortSignal,
+  callerSignal?: AbortSignal,
+) {
+  if (callerSignal?.aborted) return error instanceof Error ? error : new Error("下载已停止");
+  const message = error instanceof Error ? error.message : String(error || "");
+  if (timeoutSignal.aborted || /(?:timeout|timed out|aborted due to timeout|etimedout)/i.test(message)) {
+    return new Error(`${kind === "video" ? "视频" : "封面"}下载超时`);
+  }
+  return error instanceof Error ? error : new Error(message || `${kind === "video" ? "视频" : "封面"}下载失败`);
+}
+
 export function resolveMediaPath(relativePath: string) {
   const clean = relativePath.replace(/^\/+/, "");
   const resolved = path.resolve(mediaRoot, clean);
@@ -60,10 +74,16 @@ export async function saveProductImage(productId: string, file: File) {
   return relative;
 }
 
-export async function downloadMedia(videoId: string, url: string, kind: "video" | "cover", signal?: AbortSignal) {
+export async function downloadMedia(
+  videoId: string,
+  url: string,
+  kind: "video" | "cover",
+  signal?: AbortSignal,
+  options: { timeoutMs?: number } = {},
+) {
   // TikTok media hosts are not directly reachable from every cloud region.
   // The shared client honors HTTPS_PROXY without changing local behavior.
-  const timeoutSignal = AbortSignal.timeout(180_000);
+  const timeoutSignal = AbortSignal.timeout(Math.max(30_000, options.timeoutMs || 180_000));
   const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
   let response: Response;
   try {
@@ -73,9 +93,7 @@ export async function downloadMedia(videoId: string, url: string, kind: "video" 
       signal: requestSignal,
     });
   } catch (error) {
-    if (signal?.aborted) throw error;
-    if (timeoutSignal.aborted) throw new Error(`${kind === "video" ? "视频" : "封面"}下载超时，请检查云服务器代理或更换海外节点`);
-    throw error;
+    throw normalizedDownloadError(error, kind, timeoutSignal, signal);
   }
   if (!response.ok || !response.body) throw new Error(`${kind === "video" ? "视频" : "封面"}下载失败（${response.status}）`);
   const length = Number(response.headers.get("content-length") || 0);
@@ -87,7 +105,15 @@ export async function downloadMedia(videoId: string, url: string, kind: "video" 
   const relative = path.join(videoId, kind === "video" ? `original${extension}` : `cover${extension}`);
   const target = resolveMediaPath(relative);
   mkdirSync(path.dirname(target), { recursive: true });
-  await pipeline(Readable.fromWeb(response.body as never), createWriteStream(target), { signal });
+  try {
+    // Keep the timeout active while streaming the response body. Previously it
+    // only covered response headers, so a stalled body escaped as the raw
+    // English error "The operation was aborted due to timeout".
+    await pipeline(Readable.fromWeb(response.body as never), createWriteStream(target), { signal: requestSignal });
+  } catch (error) {
+    rmSync(target, { force: true });
+    throw normalizedDownloadError(error, kind, timeoutSignal, signal);
+  }
   return relative;
 }
 

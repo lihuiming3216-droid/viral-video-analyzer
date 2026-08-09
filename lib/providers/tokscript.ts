@@ -212,6 +212,11 @@ function textValue(root: unknown, keys: string[]) {
   return typeof value === "string" ? value : "";
 }
 
+function timeoutLike(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error || "");
+  return /(?:timeout|timed out|aborted due to timeout|etimedout)/i.test(message);
+}
+
 export async function testTokScriptConnection() {
   const config = requireProvider("tokscript");
   const client = new TokScriptClient(config.baseUrl, config.apiKey);
@@ -239,9 +244,20 @@ export async function fetchTikTok(
     if (!transcriptTool || !downloadTool) {
       throw new Error("TokScript 当前账号没有返回转写或下载工具，请检查套餐权限");
     }
-    const transcriptRaw = parseToolPayload(await client.callTool(transcriptTool, url));
+    // Obtain the downloadable media first. A slow transcript service should
+    // not discard a perfectly usable video; analysis can fall back to audio
+    // transcription only for that exceptional case.
     const downloadRaw = parseToolPayload(await client.callTool(downloadTool, url));
-    const coverRaw = options.includeCover !== false && coverTool
+    let transcriptRaw: unknown = {};
+    let transcriptError = "";
+    try {
+      transcriptRaw = parseToolPayload(await client.callTool(transcriptTool, url));
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      if (!timeoutSignal.aborted && !timeoutLike(error)) throw error;
+      transcriptError = "TokScript 口播获取超时，已改用音频转写";
+    }
+    const coverRaw = options.includeCover !== false && coverTool && !timeoutSignal.aborted
       ? parseToolPayload(await client.callTool(coverTool, url))
       : null;
     const transcript = textValue(transcriptRaw, ["transcript", "full_transcript", "fullTranscript", "text", "content"]);
@@ -264,11 +280,13 @@ export async function fetchTikTok(
         favorites: numeric(transcriptRaw, ["favorite_count", "favoriteCount", "collect_count", "collectCount"]),
         followers: numeric(transcriptRaw, ["follower_count", "followerCount", "followers"]),
       },
-      raw: { transcript: transcriptRaw, download: downloadRaw, cover: coverRaw },
+      raw: { transcript: transcriptRaw, transcriptError, download: downloadRaw, cover: coverRaw },
     };
   } catch (error) {
     if (signal?.aborted) throw error;
-    if (timeoutSignal.aborted) throw new Error("TokScript 获取视频超时，请在分析状态栏输入“重试”后重试");
+    if (timeoutSignal.aborted || timeoutLike(error)) {
+      throw new Error("TokScript 获取视频超时");
+    }
     throw error;
   }
 }

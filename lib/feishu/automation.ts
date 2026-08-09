@@ -156,6 +156,10 @@ export async function handleFeishuAutomation(input: {
   let parsed = null;
   const effectivePid = resolved.pid;
   const effectiveName = resolved.productName;
+  // A request without a sample-video URL is the per-row “补录产品手卡”
+  // action. It must refresh product evidence even when this PID is already
+  // cached, then return the existing document to the clicked row.
+  const forceProductRefresh = !resolved.videoUrl;
   let product = effectivePid ? getProductByPid(effectivePid) : null;
   const productUrlChanged = Boolean(product && resolved.productUrl && product.productUrl !== resolved.productUrl);
 
@@ -176,7 +180,7 @@ export async function handleFeishuAutomation(input: {
 
   // Product docs need the PID, the team's Chinese name, and the generated URL.
   if (product && effectiveName && effectivePid && resolved.productUrl) {
-    if ((productUrlChanged || !hasUsableProductInfo(product) || !product.visualAnalyzedAt) && resolved.productUrl) {
+    if ((forceProductRefresh || productUrlChanged || !hasUsableProductInfo(product) || !product.visualAnalyzedAt) && resolved.productUrl) {
       try {
         parsed = parsed || await parsePublicProductPage(resolved.productUrl, {
           productName: effectiveName,
@@ -238,12 +242,10 @@ export async function handleFeishuAutomation(input: {
       propImages: product.propImages,
     });
     documentUrl = result.documentUrl;
-    // Keep the webhook idempotent. Feishu may fire an automation again after
-    // our record update, so writing an unchanged document URL wastes requests
-    // and can create a self-triggering loop in less restrictive workflows.
-    if (cleanUrl(resolved.productDocument) !== result.documentUrl) {
-      patch[resolved.map.productDocument] = result.documentUrl;
-    }
+    // The button workflow consumes returned fields. Always return the URL even
+    // when it is unchanged; otherwise an existing PID produces an empty patch
+    // and the clicked row appears to do nothing.
+    patch[resolved.map.productDocument] = result.documentUrl;
   }
 
   if (resolved.videoUrl) {

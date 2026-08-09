@@ -214,6 +214,7 @@ test("product cards use verified TikTok evidence and resync reused documents", a
   assert.match(parser, /explicitBundleCount/);
   assert.match(parser, /enumeratedBundleFeatures/);
   assert.match(parser, /qwenTranslateBundleFeatures/);
+  assert.match(parser, /productParameters: moreDetailed\(current\.productParameters, candidate\.productParameters\)/);
   assert.match(parser, /numericSpecificationCount/);
   assert.match(parser, /coreFunctions 必须恰好返回 \$\{bundleOutputCount\} 条/);
   assert.match(parser, /temperature: 0/);

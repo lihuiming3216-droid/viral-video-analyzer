@@ -196,7 +196,28 @@ function productInfoScore(info: ParsedProductInfo | null) {
 }
 
 function preferMoreCompleteProductInfo(current: ParsedProductInfo | null, candidate: ParsedProductInfo | null) {
-  return productInfoScore(candidate) > productInfoScore(current) ? candidate : current;
+  if (!current) return candidate;
+  if (!candidate) return current;
+  const preferred = productInfoScore(candidate) > productInfoScore(current) ? candidate : current;
+  const moreDetailed = (left: string, right: string) => {
+    if (!useful(left)) return right;
+    if (!useful(right)) return left;
+    return clean(left).length >= clean(right).length ? left : right;
+  };
+  return {
+    ...preferred,
+    sku: moreDetailed(current.sku, candidate.sku),
+    coreFunctions: current.coreFunctions.length >= candidate.coreFunctions.length
+      ? current.coreFunctions
+      : candidate.coreFunctions,
+    productParameters: moreDetailed(current.productParameters, candidate.productParameters),
+    usageMethod: moreDetailed(current.usageMethod, candidate.usageMethod),
+    audience: moreDetailed(current.audience, candidate.audience),
+    scenes: moreDetailed(current.scenes, candidate.scenes),
+    visualEvidence: hasReliableVisualEvidence(current.visualEvidence)
+      ? current.visualEvidence
+      : candidate.visualEvidence,
+  };
 }
 
 function htmlText(html: string) {

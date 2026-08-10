@@ -645,6 +645,17 @@ async function readProductPage(productUrl: string): Promise<ProductPageResult> {
   return { title: "", description: "", text: "", imageUrls: [], sku: "", error: lastError };
 }
 
+async function readProductPageWithRetry(productUrl: string): Promise<ProductPageResult> {
+  const retryDelays = [0, 1_500, 3_000];
+  let page: ProductPageResult | null = null;
+  for (const delay of retryDelays) {
+    if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+    page = await readProductPage(productUrl);
+    if (page.text || page.error !== "商品页要求安全验证") return page;
+  }
+  return page || { title: "", description: "", text: "", imageUrls: [], sku: "", error: "商品页没有公开资料" };
+}
+
 function extractionPrompt(input: {
   productUrl: string;
   hints: ProductParseHints;
@@ -800,7 +811,10 @@ export async function parsePublicProductPage(
   hints: ProductParseHints = {},
 ): Promise<ParsedProductInfo> {
   const canonicalUrl = canonicalTikTokProductUrl(productUrl, hints.pid);
-  const page = await readProductPage(canonicalUrl);
+  // TikTok occasionally returns a short-lived verification page for a valid
+  // product. Retry only that transient response; permanent errors still fail
+  // immediately so a button click cannot occupy a worker unnecessarily.
+  const page = await readProductPageWithRetry(canonicalUrl);
   const base = baseInfo(page.title, page.description, hints, page.imageUrls, page.sku);
   const searchMode = !page.text;
   const visualMode = searchMode ? "search" : page.imageUrls.length ? "direct" : "none";

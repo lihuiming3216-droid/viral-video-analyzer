@@ -1,6 +1,6 @@
 import { after, NextRequest, NextResponse } from "next/server";
 import { ensureFeishuConnection, getConnectedFeishuChannel } from "@/lib/feishu/runtime";
-import { handleFeishuAutomation, type FeishuAutomationFieldMap } from "@/lib/feishu/automation";
+import { handleFeishuAutomation, updateProductCardStatus, type FeishuAutomationFieldMap } from "@/lib/feishu/automation";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -35,6 +35,19 @@ function payloadFields(body: Record<string, unknown>) {
   return directFields;
 }
 
+function payloadFieldMap(value: unknown): Partial<FeishuAutomationFieldMap> {
+  if (value && typeof value === "object" && !Array.isArray(value)) return value as Partial<FeishuAutomationFieldMap>;
+  if (typeof value !== "string" || !value.trim()) return {};
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Partial<FeishuAutomationFieldMap>
+      : {};
+  } catch {
+    return {};
+  }
+}
+
 export async function POST(request: NextRequest) {
   try {
     const contentType = request.headers.get("content-type") || "";
@@ -50,7 +63,7 @@ export async function POST(request: NextRequest) {
     const fields = payloadFields(body);
     if (!appToken || !tableId || !recordId) return NextResponse.json({ error: "缺少 appToken、tableId 或 recordId" }, { status: 400 });
     if (!Object.keys(fields).length) return NextResponse.json({ error: "没有收到多维表格字段" }, { status: 400 });
-    const fieldMap = (body.fieldMap || body.field_map || {}) as Partial<FeishuAutomationFieldMap>;
+    const fieldMap = payloadFieldMap(body.fieldMap || body.field_map);
     const jobKey = `${appToken}:${tableId}:${recordId}`;
     if (!activeProductJobs.has(jobKey)) {
       activeProductJobs.add(jobKey);
@@ -59,6 +72,10 @@ export async function POST(request: NextRequest) {
         try {
           const channel = getConnectedFeishuChannel() || await ensureFeishuConnection();
           if (!channel) throw new Error("飞书应用尚未连接");
+          const isProductCardJob = !fields[fieldMap.videoUrl || "视频链接"] && !fields["样片链接"];
+          if (isProductCardJob) {
+            await updateProductCardStatus({ client: channel.rawClient, appToken, tableId, recordId, status: "处理中" });
+          }
           const result = await handleFeishuAutomation({
             client: channel.rawClient,
             appToken,
@@ -70,6 +87,9 @@ export async function POST(request: NextRequest) {
             // HTTP action has already received its immediate acknowledgement.
             writeBack: true,
           });
+          if (isProductCardJob) {
+            await updateProductCardStatus({ client: channel.rawClient, appToken, tableId, recordId, status: "已完成" });
+          }
           console.info("[feishu-automation] completed", {
             recordId,
             pid: result.pid,
@@ -79,10 +99,28 @@ export async function POST(request: NextRequest) {
             writeBackError: result.writeBackError,
           });
         } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          try {
+            const channel = getConnectedFeishuChannel() || await ensureFeishuConnection();
+            if (channel && !fields[fieldMap.videoUrl || "视频链接"] && !fields["样片链接"]) {
+              await updateProductCardStatus({
+                client: channel.rawClient,
+                appToken,
+                tableId,
+                recordId,
+                status: `失败：${message}`,
+              });
+            }
+          } catch (writeBackError) {
+            console.error("[feishu-automation] status write-back failed", {
+              recordId,
+              error: writeBackError instanceof Error ? writeBackError.message : String(writeBackError),
+            });
+          }
           console.error("[feishu-automation] failed", {
             recordId,
             durationMs: Date.now() - startedAt,
-            error: error instanceof Error ? error.message : String(error),
+            error: message,
           });
         } finally {
           activeProductJobs.delete(jobKey);

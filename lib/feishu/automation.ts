@@ -108,6 +108,21 @@ async function patchBaseRecord(
   apiError(response, "回写飞书多维表格失败");
 }
 
+export async function updateProductCardStatus(input: {
+  client: Client;
+  appToken: string;
+  tableId: string;
+  recordId: string;
+  status: string;
+}) {
+  await patchBaseRecord(input.client, {
+    appToken: input.appToken,
+    tableId: input.tableId,
+    recordId: input.recordId,
+    fields: { "手卡状态": input.status.slice(0, 500) },
+  });
+}
+
 export async function completeFeishuAutomation(videoId: string) {
   const job = getFeishuAutomationJob(videoId);
   const video = getVideo(videoId);

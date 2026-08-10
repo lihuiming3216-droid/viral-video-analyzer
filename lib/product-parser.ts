@@ -523,17 +523,31 @@ async function readExpandedProductPage(productUrl: string) {
     const executablePath = browserExecutable();
     if (!executablePath) return null;
     const { chromium } = await import("playwright-core");
-    const browser = await chromium.launch({
+    const profileDir = process.env.TIKTOK_CHROMIUM_PROFILE_DIR?.trim()
+      || "/app/.data/tiktok-chromium-interactive";
+    const persistent = existsSync(profileDir)
+      ? await chromium.launchPersistentContext(profileDir, {
+          executablePath,
+          headless: true,
+          locale: "en-US",
+          userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
+          viewport: { width: 1280, height: 900 },
+          args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+        })
+      : null;
+    const browser = persistent ? null : await chromium.launch({
       executablePath,
       headless: true,
       args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
     });
     try {
-      const page = await browser.newPage({
-        locale: "en-US",
-        userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
-        viewport: { width: 1280, height: 900 },
-      });
+      const page = persistent
+        ? persistent.pages()[0] || await persistent.newPage()
+        : await browser!.newPage({
+            locale: "en-US",
+            userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
+            viewport: { width: 1280, height: 900 },
+          });
       await page.goto(productUrl, { waitUntil: "domcontentloaded", timeout: 30_000 });
       const moreText = /^(?:查看更多|View more|See more|Show more|Load more)$/i;
       for (let round = 0; round < 12; round += 1) {
@@ -574,13 +588,42 @@ async function readExpandedProductPage(productUrl: string) {
         .filter((url, index, all) => Boolean(url) && looksLikeProductImage(url) && all.indexOf(url) === index);
       return { html, text: productDetailText(text), imageUrls: normalizedImages };
     } finally {
-      await browser.close();
+      if (persistent) await persistent.close();
+      else await browser?.close();
     }
   } catch {
     return null;
   } finally {
     release();
   }
+}
+
+function expandedProductResult(
+  expanded: NonNullable<Awaited<ReturnType<typeof readExpandedProductPage>>>,
+  productUrl: string,
+): ProductPageResult | null {
+  const structured = structuredProductEvidence(expanded.html, productUrl);
+  if (structured) {
+    return {
+      ...structured,
+      text: [structured.text, expanded.text].filter(Boolean).join("\n").slice(0, 20_000),
+      imageUrls: [...structured.imageUrls, ...expanded.imageUrls]
+        .filter((url, index, all) => all.indexOf(url) === index)
+        .slice(0, MAX_PRODUCT_IMAGES),
+      error: "",
+    };
+  }
+  const title = meta(expanded.html, "og:title") || clean(expanded.html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]);
+  const description = meta(expanded.html, "og:description") || meta(expanded.html, "description");
+  if (!title && !description && expanded.text.length < 300) return null;
+  return {
+    title,
+    description,
+    text: expanded.text.slice(0, 20_000),
+    imageUrls: expanded.imageUrls.slice(0, MAX_PRODUCT_IMAGES),
+    sku: "",
+    error: "",
+  };
 }
 
 async function readProductPage(productUrl: string): Promise<ProductPageResult> {
@@ -606,13 +649,16 @@ async function readProductPage(productUrl: string): Promise<ProductPageResult> {
       const blocked = /captcha|verify to continue|access denied|security check|登录后继续|安全验证/i
         .test(`${title} ${metaDescription} ${visibleText.slice(0, 1_000)}`);
       if (blocked) {
+        const expanded = await readExpandedProductPage(fetchUrl);
+        const browserResult = expanded ? expandedProductResult(expanded, productUrl) : null;
+        if (browserResult) return browserResult;
         lastError = "商品页要求安全验证";
         continue;
       }
       const structured = structuredProductEvidence(html, productUrl);
       const expanded = await readExpandedProductPage(fetchUrl);
-      const renderedStructured = expanded ? structuredProductEvidence(expanded.html, productUrl) : null;
-      const bestStructured = renderedStructured || structured;
+      const expandedResult = expanded ? expandedProductResult(expanded, productUrl) : null;
+      const bestStructured = expandedResult || structured;
       if (bestStructured) {
         const imageUrls = [
           ...bestStructured.imageUrls,

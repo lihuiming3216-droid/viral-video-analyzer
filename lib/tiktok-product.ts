@@ -1,17 +1,23 @@
-const TIKTOK_SHOP_SLUG = "zhenmi-cordless-blender-33oz-bpa-free-usb-rechargeable";
-
 export function normalizeProductPid(pid: string) {
   return String(pid || "").trim().replace(/\D/g, "");
 }
 
-/**
- * Public link shown to employees. TikTok routes by PID, so the fixed slug is
- * intentionally shared by every product.
- */
+export function isTikTokUrl(value: string) {
+  try {
+    const url = new URL(value);
+    const hostname = url.hostname.toLowerCase();
+    return url.protocol === "https:"
+      && (hostname === "tiktok.com" || hostname.endsWith(".tiktok.com"));
+  } catch {
+    return false;
+  }
+}
+
+/** TikTok's stable PID entrypoint redirects to the product's real PDP slug. */
 export function tiktokProductUrlFromPid(pid: string) {
   const normalized = normalizeProductPid(pid);
   return normalized
-    ? `https://shop.tiktok.com/us/pdp/${TIKTOK_SHOP_SLUG}/${normalized}?source=anchor`
+    ? `https://www.tiktok.com/view/product/${normalized}`
     : "";
 }
 
@@ -32,8 +38,11 @@ export function tiktokProductFetchUrls(productUrl: string) {
 }
 
 export function canonicalTikTokProductUrl(productUrl: string, pid = "") {
-  const normalized = normalizeProductPid(pid) || normalizeProductPid(
-    (productUrl.match(/\d{6,}/g) || []).sort((a, b) => b.length - a.length)[0] || "",
+  const candidate = productUrl.trim();
+  const urlPid = normalizeProductPid(
+    (candidate.match(/\d{6,}/g) || []).sort((a, b) => b.length - a.length)[0] || "",
   );
-  return tiktokProductUrlFromPid(normalized) || productUrl.trim();
+  const normalized = normalizeProductPid(pid) || urlPid;
+  if (candidate && isTikTokUrl(candidate) && (!normalized || !urlPid || urlPid === normalized)) return candidate;
+  return tiktokProductUrlFromPid(normalized);
 }

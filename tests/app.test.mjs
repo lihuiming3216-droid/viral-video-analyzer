@@ -124,6 +124,37 @@ test("source tree contains no pasted API keys", async () => {
   assert.doesNotMatch(text, /sk_[a-f0-9]{32,}/i);
 });
 
+test("production routes are protected while health and Feishu webhooks stay independently accessible", async () => {
+  const [proxy, compose, workflow] = await Promise.all([
+    readFile(new URL("proxy.ts", root), "utf8"),
+    readFile(new URL("docker-compose.yml", root), "utf8"),
+    readFile(new URL(".github/workflows/deploy.yml", root), "utf8"),
+  ]);
+  assert.match(proxy, /APP_BASIC_AUTH_USER/);
+  assert.match(proxy, /APP_BASIC_AUTH_PASSWORD/);
+  assert.match(proxy, /NODE_ENV !== "production"/);
+  assert.match(proxy, /\/api\/health/);
+  assert.match(proxy, /\/api\/feishu\/automation/);
+  assert.match(compose, /APP_BASIC_AUTH_USER/);
+  assert.match(compose, /APP_BASIC_AUTH_PASSWORD/);
+  assert.match(compose, /\/api\/health/);
+  assert.match(workflow, /\/api\/health/);
+});
+
+test("TikTok inputs require HTTPS TikTok hosts and PID links do not invent a product slug", async () => {
+  const [links, importRoute, parseRoute] = await Promise.all([
+    readFile(new URL("lib/tiktok-product.ts", root), "utf8"),
+    readFile(new URL("app/api/videos/import/route.ts", root), "utf8"),
+    readFile(new URL("app/api/products/parse-public/route.ts", root), "utf8"),
+  ]);
+  assert.match(links, /url\.protocol === "https:"/);
+  assert.match(links, /hostname\.endsWith\("\.tiktok\.com"\)/);
+  assert.match(links, /www\.tiktok\.com\/view\/product/);
+  assert.doesNotMatch(links, /zhenmi-cordless-blender/);
+  assert.match(importRoute, /isTikTokUrl/);
+  assert.match(parseRoute, /canonicalTikTokProductUrl/);
+});
+
 test("local dashboard API exposes business data without leaking provider secrets", async () => {
   const baseUrl = process.env.TEST_BASE_URL || "http://localhost:3000";
   const response = await fetch(`${baseUrl}/api/dashboard`);
@@ -235,7 +266,8 @@ test("product cards use verified TikTok evidence and resync reused documents", a
     readFile(new URL("app/api/products/ensure-document/route.ts", root), "utf8"),
     readFile(new URL("lib/tiktok-product.ts", root), "utf8"),
   ]);
-  assert.match(tiktokProduct, /https:\/\/shop\.tiktok\.com\/us\/pdp\/\$\{TIKTOK_SHOP_SLUG\}\/\$\{normalized\}\?source=anchor/);
+  assert.match(tiktokProduct, /https:\/\/www\.tiktok\.com\/view\/product\/\$\{normalized\}/);
+  assert.doesNotMatch(tiktokProduct, /TIKTOK_SHOP_SLUG/);
   assert.match(tiktokProduct, /shop\.tiktokw\.us/);
   assert.match(parser, /__MODERN_ROUTER_DATA__/);
   assert.match(parser, /product_model/);

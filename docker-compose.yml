@@ -15,10 +15,12 @@ services:
       PRODUCT_DOC_SYNC_INTERVAL_MS: "12000"
       PRODUCT_DOC_SYNC_BATCH_SIZE: "12"
       FEISHU_AUTOMATION_WEBHOOK_SECRET: ${FEISHU_AUTOMATION_WEBHOOK_SECRET:-}
+      APP_BASIC_AUTH_USER: ${APP_BASIC_AUTH_USER:-}
+      APP_BASIC_AUTH_PASSWORD: ${APP_BASIC_AUTH_PASSWORD:-}
       HTTPS_PROXY: ${HTTPS_PROXY:-}
       HTTP_PROXY: ${HTTP_PROXY:-}
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 30s
       timeout: 10s
       retries: 5

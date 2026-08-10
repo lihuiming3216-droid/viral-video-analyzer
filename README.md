@@ -70,6 +70,8 @@
 
 生产环境必须设置 `FEISHU_AUTOMATION_WEBHOOK_SECRET`，不要把接口裸露给公网。
 
+生产环境还必须设置 `APP_BASIC_AUTH_USER` 和 `APP_BASIC_AUTH_PASSWORD`，用于保护网页后台及业务 API。飞书自动化接口继续使用独立的 Webhook Secret；健康检查仅访问 `/api/health`。
+
 App Secret 只会在本机加密保存，不会显示在设置接口或写进源码。本机关闭时，第一阶段的飞书机器人会暂停接收消息。
 
 ## 数据位置

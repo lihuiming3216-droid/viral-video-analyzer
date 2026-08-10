@@ -9,9 +9,9 @@ import {
 import { ensureFeishuConnection, getConnectedFeishuChannel } from "@/lib/feishu/runtime";
 import { ensureProductDocument } from "@/lib/feishu/document";
 import { enqueueVideos } from "@/lib/queue";
-import { hasUsableProductInfo, parsePublicProductPage } from "@/lib/product-parser";
+import { extractProductIdFromUrl, hasUsableProductInfo, parsePublicProductPage } from "@/lib/product-parser";
 import { conciseProductDocAnalysis } from "@/lib/product-doc-analysis";
-import { tiktokProductUrlFromPid } from "@/lib/tiktok-product";
+import { isTikTokUrl } from "@/lib/tiktok-product";
 
 export interface FeishuAutomationFieldMap {
   productUrl: string;
@@ -35,10 +35,6 @@ export const defaultFeishuAutomationFieldMap: FeishuAutomationFieldMap = {
   status: "分析状态",
 };
 
-export function productUrlFromPid(pid: string) {
-  return tiktokProductUrlFromPid(pid);
-}
-
 function text(value: unknown): string {
   if (value == null) return "";
   if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return String(value).trim();
@@ -50,9 +46,33 @@ function text(value: unknown): string {
   return "";
 }
 
+function urlText(value: unknown): string {
+  if (value == null) return "";
+  if (typeof value === "string") return cleanUrl(value.trim());
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const candidate = urlText(item);
+      if (candidate) return candidate;
+    }
+    return "";
+  }
+  if (typeof value === "object") {
+    const item = value as Record<string, unknown>;
+    return urlText(item.link ?? item.url ?? item.value ?? item.text);
+  }
+  return "";
+}
+
 function field(fields: Record<string, unknown>, name: string, aliases: string[] = []) {
   for (const key of [name, ...aliases]) {
     if (key in fields) return text(fields[key]);
+  }
+  return "";
+}
+
+function urlField(fields: Record<string, unknown>, name: string, aliases: string[] = []) {
+  for (const key of [name, ...aliases]) {
+    if (key in fields) return urlText(fields[key]);
   }
   return "";
 }
@@ -75,18 +95,22 @@ export function resolveAutomationFields(
   inputMap: Partial<FeishuAutomationFieldMap> = {},
 ) {
   const map = { ...defaultFeishuAutomationFieldMap, ...inputMap };
-  const pid = field(fields, map.pid, ["PID", "pid", "商品ID/PID"]);
+  const productUrl = urlField(fields, map.productUrl, ["商品链接", "产品链接"]);
+  const pid = extractProductIdFromUrl(productUrl);
+  const suppliedPid = field(fields, map.pid, ["PID", "pid", "商品ID/PID"]);
   const hasExplicitProductUrl = [map.productUrl, "商品链接", "产品链接"]
-    .some((key) => key in fields && Boolean(text(fields[key])));
+    .some((key) => key in fields && Boolean(urlText(fields[key])));
   const documentField = inputMap.productDocument
-    || ("产品手卡" in fields || (pid && !hasExplicitProductUrl) ? "产品手卡" : map.productDocument);
+    || ("产品手卡" in fields ? "产品手卡" : map.productDocument);
   return {
     map: { ...map, productDocument: documentField },
-    // PID is the source of truth. Always regenerate the public product URL
-    // so the two fields cannot drift apart.
-    productUrl: productUrlFromPid(pid) || cleanUrl(field(fields, map.productUrl, ["商品链接", "产品链接"])),
+    // The exact PDP URL is the source of truth. Generic /view/product links
+    // are less reliable on the production server, so never replace a supplied
+    // product link with a URL reconstructed from PID.
+    productUrl,
     hasProductUrlField: hasExplicitProductUrl,
     pid,
+    suppliedPid,
     productName: field(fields, map.productName, ["商品名称", "产品名", "productName", "product_name"]),
     productDocument: field(fields, documentField, [map.productDocument, "产品手卡", "产品文档"]),
     videoUrl: cleanUrl(field(fields, map.videoUrl, ["样片链接", "视频链接"])),
@@ -165,9 +189,14 @@ export async function handleFeishuAutomation(input: {
   const writeBack = input.writeBack === true;
   let documentUrl = "";
   let writeBackError = "";
-  // PID and the team's Chinese product name are the only trigger fields.
-  // The public product URL is always derived from PID.
-  if (!resolved.pid || !resolved.productName) return { ...resolved, patch, documentUrl, writeBackError };
+  // Product-card automation requires the exact TikTok product link and the
+  // team's Chinese product name. PID is derived from the link, not entered by
+  // users as a separate trigger field.
+  if (!resolved.productUrl || !resolved.productName) {
+    throw new Error("必须同时填写产品链接和产品名称");
+  }
+  if (!isTikTokUrl(resolved.productUrl)) throw new Error("产品链接必须是 TikTok 链接");
+  if (!resolved.pid) throw new Error("产品链接中没有可识别的商品 PID");
   let parsed = null;
   const effectivePid = resolved.pid;
   const effectiveName = resolved.productName;
@@ -190,7 +219,7 @@ export async function handleFeishuAutomation(input: {
     }) || product;
   }
 
-  if (effectivePid && effectivePid !== resolved.pid) patch[resolved.map.pid] = effectivePid;
+  if (effectivePid && effectivePid !== resolved.suppliedPid) patch[resolved.map.pid] = effectivePid;
   if (resolved.hasProductUrlField && resolved.productUrl) patch[resolved.map.productUrl] = resolved.productUrl;
 
   // Product docs need the PID, the team's Chinese name, and the generated URL.

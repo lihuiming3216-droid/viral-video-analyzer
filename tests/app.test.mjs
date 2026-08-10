@@ -304,6 +304,11 @@ test("product cards use verified TikTok evidence and resync reused documents", a
   assert.match(parser, /sourceImageUrls: \[\]/);
   assert.match(automation, /!product\.visualAnalyzedAt/);
   assert.match(automation, /productUrlChanged/);
+  assert.match(automation, /const productUrl = urlField/);
+  assert.match(automation, /const pid = extractProductIdFromUrl\(productUrl\)/);
+  assert.match(automation, /if \(!resolved\.productUrl \|\| !resolved\.productName\)/);
+  assert.match(automation, /产品链接必须是 TikTok 链接/);
+  assert.doesNotMatch(automation, /productUrlFromPid\(pid\)/);
   assert.match(automation, /const forceProductRefresh = !resolved\.videoUrl/);
   assert.match(automation, /patch\[resolved\.map\.productDocument\] = result\.documentUrl/);
   assert.match(automation, /visualAnalyzedAt: new Date\(\)\.toISOString\(\)/);

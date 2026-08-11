@@ -152,7 +152,9 @@ test("TikTok inputs require HTTPS TikTok hosts and PID links do not invent a pro
   assert.match(links, /www\.tiktok\.com\/view\/product/);
   assert.doesNotMatch(links, /zhenmi-cordless-blender/);
   assert.match(importRoute, /isTikTokUrl/);
-  assert.match(parseRoute, /canonicalTikTokProductUrl/);
+  assert.match(parseRoute, /const productUrl = String\(body\.productUrl \|\| ""\)\.trim\(\)/);
+  assert.match(parseRoute, /isExactTikTokProductSource\(productUrl, expectedPid\)/);
+  assert.doesNotMatch(parseRoute, /canonicalTikTokProductUrl/);
 });
 
 test("local dashboard API exposes business data without leaking provider secrets", async () => {
@@ -240,8 +242,9 @@ test("Feishu button automation acknowledges immediately and writes back in the b
   assert.match(route, /writeBack: true/);
   assert.match(route, /\{ status: 202 \}/);
   assert.match(route, /activeProductJobs/);
-  assert.match(automation, /refresh failure must never erase a previously verified product/);
-  assert.match(automation, /patch\[resolved\.map\.productDocument\] = product\.documentUrl/);
+  assert.doesNotMatch(automation, /canRelinkExistingDocument|cachedFallbackEligible|hasVerifiedCache/);
+  assert.match(automation, /parsed = parsed \|\| await parsePublicProductPage/);
+  assert.match(automation, /patch\[resolved\.map\.productDocument\] = result\.documentUrl/);
 });
 
 test("generated Feishu documents grant company editors collaborator management", async () => {
@@ -315,6 +318,10 @@ test("product cards use verified TikTok evidence and resync reused documents", a
   assert.doesNotMatch(automation, /hyperlinkFieldValue/);
   assert.match(automation, /visualAnalyzedAt: new Date\(\)\.toISOString\(\)/);
   assert.match(ensureDocument, /forceProductParse === true/);
+  assert.match(ensureDocument, /const productUrl = String\(body\.productUrl \|\| ""\)\.trim\(\)/);
+  assert.match(ensureDocument, /isExactTikTokProductSource\(productUrl, pid\)/);
+  assert.doesNotMatch(ensureDocument, /canonicalTikTokProductUrl/);
+  assert.doesNotMatch(ensureDocument, /coreFunctions: \[\],[\s\S]*visualAnalyzedAt: null/);
   assert.match(database, /source_image_urls_json/);
   assert.match(database, /visual_analysis_status/);
   assert.match(database, /visual_analyzed_at/);

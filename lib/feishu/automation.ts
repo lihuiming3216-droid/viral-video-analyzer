@@ -9,7 +9,7 @@ import {
 import { ensureFeishuConnection, getConnectedFeishuChannel } from "@/lib/feishu/runtime";
 import { ensureProductDocument } from "@/lib/feishu/document";
 import { enqueueVideos } from "@/lib/queue";
-import { extractProductIdFromUrl, hasUsableProductInfo, parsePublicProductPage } from "@/lib/product-parser";
+import { extractProductIdFromUrl, hasUsableProductInfo, isExactTikTokProductSource, parsePublicProductPage } from "@/lib/product-parser";
 import { conciseProductDocAnalysis } from "@/lib/product-doc-analysis";
 import { isTikTokUrl } from "@/lib/tiktok-product";
 
@@ -194,6 +194,9 @@ export async function handleFeishuAutomation(input: {
   }
   if (!isTikTokUrl(resolved.productUrl)) throw new Error("产品链接必须是 TikTok 链接");
   if (!resolved.pid) throw new Error("产品链接中没有可识别的商品 PID");
+  if (!isExactTikTokProductSource(resolved.productUrl, resolved.pid)) {
+    throw new Error("产品链接必须是 HTTPS TikTok 官方商品详情页，不能使用视频页或其他页面");
+  }
   let parsed = null;
   const effectivePid = resolved.pid;
   const effectiveName = resolved.productName;
@@ -204,49 +207,19 @@ export async function handleFeishuAutomation(input: {
   let product = effectivePid ? getProductByPid(effectivePid) : null;
   const productUrlChanged = Boolean(product && resolved.productUrl && product.productUrl !== resolved.productUrl);
 
-  if (!product && (effectiveName || effectivePid || resolved.productUrl)) {
-    product = createProduct({ name: effectiveName || "未命名产品", pid: effectivePid, productUrl: resolved.productUrl });
-  }
-
-  if (product && (resolved.productUrl && product.productUrl !== resolved.productUrl || effectiveName && product.name !== effectiveName || effectivePid && product.pid !== effectivePid)) {
-    product = updateProduct(product.id, {
-      productUrl: resolved.productUrl || product.productUrl,
-      name: effectiveName || product.name,
-      pid: effectivePid || product.pid,
-    }) || product;
-  }
-
   if (effectivePid && effectivePid !== resolved.suppliedPid) patch[resolved.map.pid] = effectivePid;
   // 产品链接 is already present in Base and is a hyperlink field. Echoing the
   // URL back as plain text causes URLFieldConvFail, so leave it untouched.
 
   // Product docs need the PID, the team's Chinese name, and the generated URL.
-  if (product && effectiveName && effectivePid && resolved.productUrl) {
-    if ((forceProductRefresh || productUrlChanged || !hasUsableProductInfo(product) || !product.visualAnalyzedAt) && resolved.productUrl) {
-      try {
-        parsed = parsed || await parsePublicProductPage(resolved.productUrl, {
-          productName: effectiveName,
-          pid: effectivePid,
-        });
-      } catch (error) {
-        // A refresh failure must never erase a previously verified product.
-        // Existing cards can still be re-linked to the clicked Base record.
-        if (product.documentId && product.documentUrl) {
-          await ensureProductDocument(input.client, product).catch(() => undefined);
-          patch[resolved.map.productDocument] = product.documentUrl;
-          if (writeBack) {
-            await patchBaseRecord(input.client, {
-              appToken: input.appToken,
-              tableId: input.tableId,
-              recordId: input.recordId,
-              fields: patch,
-            });
-          }
-          return { ...resolved, productName: effectiveName, pid: effectivePid, patch, documentUrl: product.documentUrl, writeBackError };
-        }
-        throw error;
-      }
+  if (effectiveName && effectivePid && resolved.productUrl) {
+    if ((forceProductRefresh || !product || productUrlChanged || !hasUsableProductInfo(product) || !product.visualAnalyzedAt) && resolved.productUrl) {
+      parsed = parsed || await parsePublicProductPage(resolved.productUrl, {
+        productName: effectiveName,
+        pid: effectivePid,
+      });
       if (parsed) {
+        product = product || createProduct({ name: effectiveName, pid: effectivePid, productUrl: resolved.productUrl });
         product = updateProduct(product.id, {
           productUrl: resolved.productUrl,
           sku: parsed.sku,
@@ -267,7 +240,16 @@ export async function handleFeishuAutomation(input: {
         }) || product;
       }
     }
-    if (!hasUsableProductInfo(product)) {
+    if (!product) throw new Error("商品资料解析成功但产品档案创建失败");
+    if (resolved.productUrl !== product.productUrl || effectiveName !== product.name || effectivePid !== product.pid) {
+      product = updateProduct(product.id, {
+        productUrl: resolved.productUrl,
+        name: effectiveName,
+        pid: effectivePid,
+      }) || product;
+    }
+    const hasFreshVerifiedProductInfo = Boolean(parsed) && hasUsableProductInfo(product, 1);
+    if (!hasFreshVerifiedProductInfo && !hasUsableProductInfo(product)) {
       throw new Error("商品资料不足，已停止生成空白产品手卡，请稍后重试");
     }
     const result = await ensureProductDocument(input.client, product, {

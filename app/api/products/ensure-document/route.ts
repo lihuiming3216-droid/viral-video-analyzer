@@ -2,8 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { createProduct, getProductByPid, updateProduct } from "@/lib/database";
 import { ensureProductDocument } from "@/lib/feishu/document";
 import { ensureFeishuConnection, getConnectedFeishuChannel } from "@/lib/feishu/runtime";
-import { hasUsableProductInfo, parsePublicProductPage } from "@/lib/product-parser";
-import { canonicalTikTokProductUrl } from "@/lib/tiktok-product";
+import { hasUsableProductInfo, isExactTikTokProductSource, parsePublicProductPage } from "@/lib/product-parser";
 
 export const runtime = "nodejs";
 
@@ -12,47 +11,32 @@ export async function POST(request: NextRequest) {
     const body = await request.json();
     const name = String(body.name || "").trim();
     const pid = String(body.pid || "").trim();
-    const productUrl = canonicalTikTokProductUrl(String(body.productUrl || "").trim(), pid);
+    const productUrl = String(body.productUrl || "").trim();
     if (!name || !pid || !productUrl) {
       return NextResponse.json({ error: "产品名称和商品ID必须同时填写" }, { status: 400 });
     }
-
-    let product = getProductByPid(pid) || createProduct({ name, pid, productUrl });
-    let parsed = null;
-    const hasCachedProductInfo = product.productUrl === productUrl
-      && hasUsableProductInfo(product)
-      && Boolean(product.visualAnalyzedAt);
-    if (body.parseProduct !== false && (body.forceProductParse === true || !hasCachedProductInfo)) {
-      try {
-        parsed = await parsePublicProductPage(productUrl, { productName: name, pid });
-      } catch (error) {
-        product = updateProduct(product.id, {
-          name,
-          pid,
-          productUrl,
-          sku: "",
-          sellingPoints: "",
-          targetAudience: "",
-          coreFunctions: [],
-          productParameters: "",
-          usageMethod: "",
-          usageScenes: "",
-          sourceTitle: "",
-          sourceDescription: "",
-          sourceImageUrls: [],
-          visualEvidence: "",
-          visualAnalysisStatus: "unavailable",
-          visualAnalyzedAt: null,
-        }) || product;
-        if (product.documentId && product.documentUrl) {
-          const cleanupChannel = getConnectedFeishuChannel() || await ensureFeishuConnection();
-          if (cleanupChannel) await ensureProductDocument(cleanupChannel.rawClient, product).catch(() => undefined);
-        }
-        throw error;
-      }
+    if (!isExactTikTokProductSource(productUrl, pid)) {
+      return NextResponse.json({ error: "产品链接必须是 HTTPS TikTok 官方商品详情页，且链接 PID 必须与商品ID一致" }, { status: 400 });
     }
+
+    let product = getProductByPid(pid);
+    let parsed = null;
+    const hasCachedProductInfo = Boolean(product
+      && product.productUrl === productUrl
+      && hasUsableProductInfo(product)
+      && product.visualAnalyzedAt);
+    if (body.parseProduct !== false && (body.forceProductParse === true || !hasCachedProductInfo)) {
+      // Parsing fails closed: invalid links and transient fetch failures must
+      // not replace a verified URL, erase evidence, or rewrite an old document.
+      parsed = await parsePublicProductPage(productUrl, { productName: name, pid });
+    }
+    // Explicit parseProduct:false preserves the manual creation workflow. In
+    // the default path this line is reached only after parsing succeeds.
+    product = product || createProduct({ name, pid, productUrl });
     if (parsed) {
       updateProduct(product.id, {
+        name,
+        pid,
         productUrl,
         sku: parsed.sku,
         sellingPoints: "",

@@ -4,7 +4,7 @@ import { existsSync } from "node:fs";
 import { fetchWithProxy } from "@/lib/network";
 import { getProviderConfig } from "@/lib/provider-config";
 import { parseJsonLoose, readTextFromModelResponse } from "@/lib/json-utils";
-import { canonicalTikTokProductUrl, tiktokProductFetchUrls } from "@/lib/tiktok-product";
+import { tiktokProductFetchUrls } from "@/lib/tiktok-product";
 
 export interface ParsedProductInfo {
   productName: string;
@@ -62,6 +62,67 @@ function clean(value: unknown) {
   return String(value || "").replace(/\s+/g, " ").trim();
 }
 
+const PRODUCT_SECURITY_CHALLENGE = /(?:captcha|verify to continue|verify you are human|human verification|just a moment|access denied|security check|checking your browser|unusual traffic|登录后继续|安全验证|人机验证|请完成验证)/i;
+const PRODUCT_ID_QUERY_KEYS = ["pid", "product_id", "productId", "item_id", "itemId"];
+
+/** A challenge page is transport-successful HTML, but it is not product evidence. */
+export function isProductSecurityChallenge(title: string, description = "", text = "") {
+  return PRODUCT_SECURITY_CHALLENGE.test(`${clean(title)} ${clean(description)} ${clean(text).slice(0, 1_500)}`);
+}
+
+function officialTikTokProductPath(url: URL) {
+  const pathname = url.pathname.replace(/\/+$/, "") || "/";
+  if (url.hostname.toLowerCase() === "shop.tiktok.com") {
+    const match = pathname.match(/^\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?pdp\/([^/]+)\/(\d{6,})$/i);
+    return match ? { slug: match[1], pid: match[2] } : null;
+  }
+  if (url.hostname.toLowerCase() !== "www.tiktok.com") return null;
+  const shopMatch = pathname.match(/^\/shop\/pdp\/([^/]+)\/(\d{6,})$/i);
+  if (shopMatch) return { slug: shopMatch[1], pid: shopMatch[2] };
+  const viewMatch = pathname.match(/^\/view\/product\/(\d{6,})$/i);
+  return viewMatch ? { slug: "", pid: viewMatch[1] } : null;
+}
+
+export function productIdFromOfficialTikTokPath(sourceUrl: string) {
+  try {
+    return officialTikTokProductPath(new URL(sourceUrl))?.pid || "";
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Only an official TikTok product page with the exact requested PID can make
+ * a web-search/model response eligible as product evidence.
+ */
+export function isExactTikTokProductSource(sourceUrl: string, productId: string) {
+  const expectedPid = clean(productId);
+  if (!/^\d{6,}$/.test(expectedPid)) return false;
+  try {
+    const url = new URL(sourceUrl);
+    if (url.protocol !== "https:") return false;
+    const productPath = officialTikTokProductPath(url);
+    if (!productPath || productPath.pid !== expectedPid) return false;
+    return PRODUCT_ID_QUERY_KEYS.every((key) => url.searchParams.getAll(key)
+      .every((queryPid) => clean(queryPid) === expectedPid));
+  } catch {
+    return false;
+  }
+}
+
+/** Decode only the verified PDP slug; query strings and model prose are never evidence. */
+export function trustedProductPathEvidence(sourceUrl: string, productId: string) {
+  if (!isExactTikTokProductSource(sourceUrl, productId)) return "";
+  try {
+    const productPath = officialTikTokProductPath(new URL(sourceUrl));
+    if (!productPath?.slug) return "";
+    const decoded = clean(decodeURIComponent(productPath.slug).replace(/[-_+]+/g, " ")).slice(0, 500);
+    return decoded.length >= 4 && /\p{L}/u.test(decoded) ? decoded : "";
+  } catch {
+    return "";
+  }
+}
+
 function cleanFieldValue(value: unknown): string {
   if (Array.isArray(value)) return value.map(cleanFieldValue).filter(Boolean).join("；");
   if (value && typeof value === "object") {
@@ -102,7 +163,7 @@ export function hasUsableProductInfo(info: {
   scenes?: string;
   targetAudience?: string;
   usageScenes?: string;
-}) {
+}, minimumDescriptiveFields = 2) {
   const functions = (info.coreFunctions || []).map(cleanFunction).filter(useful);
   const descriptiveFields = [
     info.productParameters,
@@ -113,7 +174,7 @@ export function hasUsableProductInfo(info: {
   ]
     .filter(useful);
   const hasSourceEvidence = useful(info.sourceTitle) || useful(info.sourceDescription);
-  return hasSourceEvidence && functions.length >= 1 && descriptiveFields.length >= 2;
+  return hasSourceEvidence && functions.length >= 1 && descriptiveFields.length >= minimumDescriptiveFields;
 }
 
 function explicitBundleCount(evidenceText: string) {
@@ -321,6 +382,38 @@ function baseInfo(
   };
 }
 
+/**
+ * Search fallback is intentionally non-generative. A verified TikTok PDP slug
+ * may contribute only facts whose exact English token/phrase is listed here;
+ * everything else fails closed instead of being translated or inferred by AI.
+ */
+function productInfoFromTrustedSlug(base: ParsedProductInfo, trustedSlug: string): ParsedProductInfo {
+  const evidence = clean(trustedSlug).toLowerCase();
+  const coreFunctions: string[] = [];
+  const parameters: string[] = [];
+
+  if (/\bshockproof\b/.test(evidence)) coreFunctions.push("防震保护");
+  if (/\bsilicone\s+(?:phone\s+)?case\b/.test(evidence)) parameters.push("材质：硅胶");
+
+  // Compatibility is accepted only from an explicit "for <known device>"
+  // phrase. Unlisted words in the slug never become product facts.
+  const compatibilityPhrase = evidence.match(/\bfor\s+((?:iphone|samsung)(?:\s+(?:iphone|samsung))*)\b/)?.[1] || "";
+  const compatibleDevices = [...new Set(compatibilityPhrase.match(/\b(?:iphone|samsung)\b/g) || [])]
+    .map((device) => device === "iphone" ? "iPhone" : "Samsung");
+  if (compatibleDevices.length) parameters.push(`兼容设备：${compatibleDevices.join("、")}`);
+
+  return {
+    ...base,
+    coreFunctions,
+    productParameters: parameters.join("；"),
+    sourceTitle: clean(trustedSlug),
+    sourceDescription: "",
+    sourceImageUrls: [],
+    visualEvidence: "",
+    visualAnalysisStatus: "unavailable",
+  };
+}
+
 function parsedValue(parsed: Partial<ParsedProductInfo>, aliases: string[]) {
   const record = parsed as Record<string, unknown>;
   for (const key of aliases) {
@@ -344,6 +437,7 @@ function normalizeParsed(
   base: ParsedProductInfo,
   productId: string,
   evidenceText: string,
+  options: { allowVisualEvidence?: boolean } = {},
 ): ParsedProductInfo {
   const rawFunctions = parsedValue(parsed, ["coreFunctions", "核心功能", "核心功能（按重要程度）"]);
   const functions = Array.isArray(rawFunctions)
@@ -353,7 +447,9 @@ function normalizeParsed(
   const skuWithoutLabel = rawSku.replace(/^(?:SKU|PID|商品ID|产品ID)\s*[:：#-]?\s*/i, "");
   const sourceTitle = base.sourceTitle || clean(parsedValue(parsed, ["sourceTitle", "title", "页面标题"]));
   const sourceDescription = base.sourceDescription || clean(parsedValue(parsed, ["sourceDescription", "description", "页面描述"]));
-  const visualEvidence = clean(parsedValue(parsed, ["visualEvidence", "图片证据", "视觉证据", "图片分析"]));
+  const visualEvidence = options.allowVisualEvidence === false
+    ? ""
+    : clean(parsedValue(parsed, ["visualEvidence", "图片证据", "视觉证据", "图片分析"]));
   const source = [evidenceText || `${sourceTitle}\n${sourceDescription}`, visualEvidence].filter(Boolean).join("\n");
   const supportedFunctions = functions
     .map((value, index) => ({ value: cleanFunction(value), quote: evidenceList(parsed, "coreFunctions")[index] || "" }))
@@ -457,7 +553,7 @@ function descriptionEvidence(value: unknown) {
 }
 
 function structuredProductEvidence(html: string, productUrl: string) {
-  const productId = extractProductIdFromUrl(productUrl);
+  const productId = productIdFromOfficialTikTokPath(productUrl);
   const model = productModelFromRouterData(embeddedJson(html, "__MODERN_ROUTER_DATA__"), productId);
   if (!model || clean(model.product_id) !== productId || !clean(model.name)) return null;
 
@@ -598,10 +694,13 @@ async function readExpandedProductPage(productUrl: string) {
   }
 }
 
-function expandedProductResult(
+export function expandedProductResult(
   expanded: NonNullable<Awaited<ReturnType<typeof readExpandedProductPage>>>,
   productUrl: string,
 ): ProductPageResult | null {
+  const title = meta(expanded.html, "og:title") || clean(expanded.html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]);
+  const description = meta(expanded.html, "og:description") || meta(expanded.html, "description");
+  if (isProductSecurityChallenge(title, description, expanded.text)) return null;
   const structured = structuredProductEvidence(expanded.html, productUrl);
   if (structured) {
     return {
@@ -613,8 +712,6 @@ function expandedProductResult(
       error: "",
     };
   }
-  const title = meta(expanded.html, "og:title") || clean(expanded.html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]);
-  const description = meta(expanded.html, "og:description") || meta(expanded.html, "description");
   if (!title && !description && expanded.text.length < 300) return null;
   return {
     title,
@@ -646,8 +743,7 @@ async function readProductPage(productUrl: string): Promise<ProductPageResult> {
       const title = meta(html, "og:title") || clean(html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]);
       const metaDescription = meta(html, "og:description") || meta(html, "description");
       const visibleText = htmlText(html).slice(0, 8_000);
-      const blocked = /captcha|verify to continue|access denied|security check|登录后继续|安全验证/i
-        .test(`${title} ${metaDescription} ${visibleText.slice(0, 1_000)}`);
+      const blocked = isProductSecurityChallenge(title, metaDescription, visibleText);
       if (blocked) {
         const expanded = await readExpandedProductPage(fetchUrl);
         const browserResult = expanded ? expandedProductResult(expanded, productUrl) : null;
@@ -708,17 +804,13 @@ function extractionPrompt(input: {
   title: string;
   description: string;
   pageText: string;
-  visualMode: "direct" | "search" | "none";
+  visualMode: "direct" | "none";
 }) {
   const identity = `团队中文名称（仅用于文档标题，不是产品事实证据）：${clean(input.hints.productName) || "未提供"}\n商品 PID：${clean(input.hints.pid) || extractProductIdFromUrl(input.productUrl) || "未提供"}\n商品链接：${input.productUrl}`;
-  const evidence = input.visualMode === "search"
-    ? "请只使用联网搜索中 URL 与上述 TikTok Shop 商品链接完全对应（可忽略查询参数）的结果。其他商品、同品类页面和团队中文名都不是证据。"
-    : `页面标题：${input.title}\n页面描述：${input.description}\n页面正文：${input.pageText}`;
+  const evidence = `页面标题：${input.title}\n页面描述：${input.description}\n页面正文：${input.pageText}`;
   const visualInstruction = input.visualMode === "direct"
     ? "下方会附带商品图片。必须结合图片确认产品外观结构、接口/按键、随附配件、可见文字和使用方式。图片中清晰可见的原文可以作为字段证据，但不得根据外观猜测看不见的性能、材质或参数；引用图片文字时，把逐字可见文字同时放入对应 evidenceQuotes 和 visualEvidence。visualEvidence 必须保留引用到的英文原文，不要只写中文概括。"
-    : input.visualMode === "search"
-      ? "当前没有经过 PID 校验的商品图片，visualEvidence 必须留空，不得用相似商品图片推断。"
-      : "当前没有可靠商品图片，只能根据公开文字资料整理。";
+    : "当前没有可靠商品图片，只能根据公开文字资料整理。";
   const bundleCount = explicitBundleCount(input.pageText);
   const bundleOutputCount = Math.min(5, bundleCount);
   const bundleInstruction = bundleCount
@@ -806,83 +898,127 @@ async function qwenVisualExtract(prompt: string, imageUrls: string[]) {
   return parseJsonLoose<ParsedProductModel>(readTextFromModelResponse(await response.json() as Record<string, unknown>));
 }
 
-async function qwenWebSearchExtract(prompt: string, productUrl: string) {
+async function qwenFindExactProductSources(productUrl: string) {
   const qwen = getProviderConfig("qwen");
-  if (!qwen.enabled || !qwen.apiKey) return null;
-  const response = await fetchWithProxy(`${qwen.baseUrl.replace(/\/$/, "")}/responses`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${qwen.apiKey}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: qwen.model || "qwen3.7-plus",
-      input: prompt,
-      tools: [{ type: "web_search" }],
-      enable_thinking: false,
-      max_output_tokens: 1_200,
-    }),
-    signal: AbortSignal.timeout(60_000),
-  });
-  if (!response.ok) return null;
-  const payload = await response.json() as Record<string, unknown>;
-  const productId = extractProductIdFromUrl(productUrl);
-  let exactSourceMatched = false;
-  for (const item of Array.isArray(payload.output) ? payload.output : []) {
-    if (!item || typeof item !== "object") continue;
-    const record = item as Record<string, unknown>;
-    if (record.type !== "web_search_call" || record.status !== "completed") continue;
-    const action = record.action;
-    if (!action || typeof action !== "object") continue;
-    for (const source of Array.isArray((action as Record<string, unknown>).sources)
-      ? (action as Record<string, unknown>).sources as unknown[]
-      : []) {
-      if (!source || typeof source !== "object") continue;
-      const sourceUrl = clean((source as Record<string, unknown>).url);
-      try {
-        const parsed = new URL(sourceUrl);
-        if (parsed.hostname === "shop.tiktok.com" && extractProductIdFromUrl(sourceUrl) === productId) {
-          exactSourceMatched = true;
-        }
-      } catch {
-        // Ignore malformed search-source URLs.
+  if (!qwen.enabled || !qwen.apiKey) throw new Error("Qwen 联网检索未配置");
+  const productId = productIdFromOfficialTikTokPath(productUrl);
+  const search = async (input: string) => {
+    const response = await fetchWithProxy(`${qwen.baseUrl.replace(/\/$/, "")}/responses`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${qwen.apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: qwen.model || "qwen3.7-plus",
+        input,
+        tools: [{ type: "web_search" }],
+        enable_thinking: false,
+        max_output_tokens: 1_200,
+      }),
+      signal: AbortSignal.timeout(60_000),
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const payload = await response.json() as Record<string, unknown>;
+    const sourceUrls: string[] = [];
+    for (const item of Array.isArray(payload.output) ? payload.output : []) {
+      if (!item || typeof item !== "object") continue;
+      const record = item as Record<string, unknown>;
+      if (record.status !== "completed" || record.type !== "web_search_call") continue;
+      const action = record.action;
+      if (!action || typeof action !== "object") continue;
+      for (const source of Array.isArray((action as Record<string, unknown>).sources)
+        ? (action as Record<string, unknown>).sources as unknown[]
+        : []) {
+        const sourceUrl = source && typeof source === "object" ? clean((source as Record<string, unknown>).url) : "";
+        if (sourceUrl && !sourceUrls.includes(sourceUrl)) sourceUrls.push(sourceUrl);
       }
     }
-  }
-  return {
-    parsed: parseJsonLoose<ParsedProductModel>(readTextFromModelResponse(payload)),
-    exactSourceMatched,
+    return sourceUrls;
   };
+  const sourceUrls = await search(`只查找 PID ${productId} 对应的 TikTok 官方商品详情页。目标链接：${productUrl}。必须寻找带商品名称路径的 /pdp/ 链接，不要只返回 /view/product/，也不要使用同类或相似商品替代。`);
+  const exactSourceUrls = sourceUrls.filter((sourceUrl) => isExactTikTokProductSource(sourceUrl, productId));
+  const trustedSource = exactSourceUrls
+    .map((sourceUrl) => ({ sourceUrl, evidence: trustedProductPathEvidence(sourceUrl, productId) }))
+    .find((source) => Boolean(source.evidence));
+  return {
+    exactSourceMatched: exactSourceUrls.length > 0,
+    trustedEvidence: trustedSource?.evidence || "",
+    trustedSourceTitle: trustedSource?.evidence || "",
+    trustedSourceUrl: trustedSource?.sourceUrl || "",
+  };
+}
+
+export function productParseFailureReason(input: {
+  searchMode: boolean;
+  pageError: string;
+  exactSourceMatched: boolean;
+  trustedEvidenceAvailable?: boolean;
+  searchError?: string;
+}) {
+  if (!input.searchMode) return input.pageError || "AI 没有返回足够的可验证商品资料";
+  if (input.searchError) {
+    return `${input.pageError ? `${input.pageError}；` : ""}联网检索失败：${input.searchError}`;
+  }
+  if (input.exactSourceMatched && !input.trustedEvidenceAvailable) {
+    return "联网检索找到了同 PID 的官方商品页，但链接路径没有可独立验证的商品资料";
+  }
+  if (input.exactSourceMatched) return "联网检索找到了同 PID 的官方商品页，但链接路径没有足够的白名单商品资料";
+  if (input.pageError === "商品页要求安全验证") {
+    return "商品页要求安全验证，联网检索也未找到与该 PID 完全匹配的官方公开商品页";
+  }
+  return input.pageError
+    ? `${input.pageError}；联网检索也未找到与该 PID 完全匹配的官方公开商品页`
+    : "联网检索没有找到与该 PID 完全匹配的官方公开商品页";
 }
 
 export async function parsePublicProductPage(
   productUrl: string,
   hints: ProductParseHints = {},
 ): Promise<ParsedProductInfo> {
-  const canonicalUrl = canonicalTikTokProductUrl(productUrl, hints.pid);
+  const canonicalUrl = productUrl.trim();
+  const pathProductId = productIdFromOfficialTikTokPath(canonicalUrl);
+  const productId = clean(hints.pid) || pathProductId;
+  if (!isExactTikTokProductSource(canonicalUrl, productId)) {
+    throw new Error("商品资料解析失败：产品链接必须是 HTTPS TikTok 官方商品详情页，且链接 PID 必须与商品 PID 一致");
+  }
   // TikTok occasionally returns a short-lived verification page for a valid
   // product. Retry only that transient response; permanent errors still fail
   // immediately so a button click cannot occupy a worker unnecessarily.
   const page = await readProductPageWithRetry(canonicalUrl);
   const base = baseInfo(page.title, page.description, hints, page.imageUrls, page.sku);
   const searchMode = !page.text;
-  const visualMode = searchMode ? "search" : page.imageUrls.length ? "direct" : "none";
-  const productId = hints.pid || extractProductIdFromUrl(canonicalUrl);
-  const prompt = extractionPrompt({
+  let searchResult: Awaited<ReturnType<typeof qwenFindExactProductSources>> | null = null;
+  let searchError = "";
+  if (searchMode) {
+    try {
+      searchResult = await qwenFindExactProductSources(canonicalUrl);
+    } catch (error) {
+      searchError = error instanceof Error ? error.message : String(error);
+    }
+  }
+  const trustedSearchEvidence = searchResult?.trustedEvidence || "";
+  const evidenceBase = searchMode && searchResult?.trustedSourceTitle
+    ? { ...base, sourceTitle: searchResult.trustedSourceTitle, sourceDescription: "" }
+    : base;
+  const prompt = searchMode ? "" : extractionPrompt({
     productUrl: canonicalUrl,
     hints: { ...hints, pid: productId },
-    title: page.title,
-    description: page.description,
+    title: base.sourceTitle,
+    description: base.sourceDescription,
     pageText: page.text,
-    visualMode,
+    visualMode: page.imageUrls.length ? "direct" : "none",
   });
 
   // The exact public page is the primary evidence. On mainland ECS we read
-  // TikTok's own origin host first; web search is only a strict last resort.
-  const searchResult = searchMode ? await qwenWebSearchExtract(prompt, canonicalUrl).catch(() => null) : null;
+  // TikTok's own origin host first. Web search is only a URL-discovery
+  // fallback: Responses prose is ignored and no second chat call may turn a
+  // seller-controlled slug into free-form product claims.
   let parsed = searchMode
-    ? searchResult?.exactSourceMatched ? searchResult.parsed : null
+    ? null
     : page.imageUrls.length
       ? await qwenVisualExtract(prompt, page.imageUrls).catch(() => null)
       : await qwenExtract(prompt).catch(() => null);
-  let normalized = parsed ? normalizeParsed(parsed, base, productId, page.text) : null;
+  let normalized = searchMode
+    ? trustedSearchEvidence ? productInfoFromTrustedSlug(evidenceBase, trustedSearchEvidence) : null
+    : parsed ? normalizeParsed(parsed, base, productId, page.text) : null;
   let visualAnalysisStatus: ParsedProductInfo["visualAnalysisStatus"] = !searchMode
     && normalized
     && hasUsableProductInfo(normalized)
@@ -906,8 +1042,18 @@ export async function parsePublicProductPage(
     if (translated.length === bundleFeatures.length) normalized = { ...normalized, coreFunctions: translated };
   }
 
-  if (!normalized || !hasUsableProductInfo(normalized)) {
-    throw new Error(`商品资料解析失败：${page.error || (searchResult?.exactSourceMatched ? "AI 没有返回足够的可验证资料" : "没有找到与该 PID 完全匹配的公开商品页资料")}`);
+  // The 1+1 threshold is local to this strictly grounded search result. The
+  // public cache predicate keeps its historical two-field threshold so legacy
+  // rows cannot be silently promoted.
+  const minimumDescriptiveFields = searchMode ? 1 : 2;
+  if (!normalized || !hasUsableProductInfo(normalized, minimumDescriptiveFields)) {
+    throw new Error(`商品资料解析失败：${productParseFailureReason({
+      searchMode,
+      pageError: page.error,
+      exactSourceMatched: searchResult?.exactSourceMatched === true,
+      trustedEvidenceAvailable: Boolean(trustedSearchEvidence),
+      searchError,
+    })}`);
   }
   if (searchMode) {
     normalized = { ...normalized, sourceImageUrls: [], visualEvidence: "" };

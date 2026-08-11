@@ -241,7 +241,7 @@ test("Feishu button automation acknowledges immediately and writes back in the b
   assert.match(route, /\{ status: 202 \}/);
   assert.match(route, /activeProductJobs/);
   assert.match(automation, /refresh failure must never erase a previously verified product/);
-  assert.match(automation, /patch\[resolved\.map\.productDocument\] = product\.documentUrl/);
+  assert.match(automation, /hyperlinkFieldValue\(product\.documentUrl/);
 });
 
 test("generated Feishu documents grant company editors collaborator management", async () => {
@@ -310,7 +310,9 @@ test("product cards use verified TikTok evidence and resync reused documents", a
   assert.match(automation, /产品链接必须是 TikTok 链接/);
   assert.doesNotMatch(automation, /productUrlFromPid\(pid\)/);
   assert.match(automation, /const forceProductRefresh = !resolved\.videoUrl/);
-  assert.match(automation, /patch\[resolved\.map\.productDocument\] = result\.documentUrl/);
+  assert.match(automation, /patch\[resolved\.map\.productDocument\] = hyperlinkFieldValue\(result\.documentUrl/);
+  assert.match(automation, /return \{\s*link: url,\s*text: label\?\.trim\(\) \|\| url,\s*\}/);
+  assert.doesNotMatch(automation, /patch\[resolved\.map\.productUrl\]/);
   assert.match(automation, /visualAnalyzedAt: new Date\(\)\.toISOString\(\)/);
   assert.match(ensureDocument, /forceProductParse === true/);
   assert.match(database, /source_image_urls_json/);

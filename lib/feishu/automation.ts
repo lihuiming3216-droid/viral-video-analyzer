@@ -81,6 +81,13 @@ function cleanUrl(value: string) {
   return value.replace(/[，。；;、!！?？)）\]】}]+$/g, "");
 }
 
+function hyperlinkFieldValue(url: string, label?: string) {
+  return {
+    link: url,
+    text: label?.trim() || url,
+  };
+}
+
 function apiError(response: { code?: number; msg?: string } | null | undefined, fallback: string) {
   if (response?.code && response.code !== 0) throw new Error(response.msg || fallback);
 }
@@ -98,8 +105,6 @@ export function resolveAutomationFields(
   const productUrl = urlField(fields, map.productUrl, ["商品链接", "产品链接"]);
   const pid = extractProductIdFromUrl(productUrl);
   const suppliedPid = field(fields, map.pid, ["PID", "pid", "商品ID/PID"]);
-  const hasExplicitProductUrl = [map.productUrl, "商品链接", "产品链接"]
-    .some((key) => key in fields && Boolean(urlText(fields[key])));
   const documentField = inputMap.productDocument
     || ("产品手卡" in fields ? "产品手卡" : map.productDocument);
   return {
@@ -108,7 +113,6 @@ export function resolveAutomationFields(
     // are less reliable on the production server, so never replace a supplied
     // product link with a URL reconstructed from PID.
     productUrl,
-    hasProductUrlField: hasExplicitProductUrl,
     pid,
     suppliedPid,
     productName: field(fields, map.productName, ["商品名称", "产品名", "productName", "product_name"]),
@@ -161,7 +165,9 @@ export async function completeFeishuAutomation(videoId: string) {
   if (video.status === "completed") {
     fields[map.analysis] = conciseProductDocAnalysis(video);
     fields[map.translation] = video.transcriptZh || "暂无中文翻译";
-    if (product?.documentUrl) fields[map.productDocument] = product.documentUrl;
+    if (product?.documentUrl) {
+      fields[map.productDocument] = hyperlinkFieldValue(product.documentUrl, `${product.name} 产品手卡`);
+    }
   } else if (video.errorMessage) {
     fields[map.analysis] = `处理失败：${video.errorMessage}`;
   }
@@ -220,7 +226,6 @@ export async function handleFeishuAutomation(input: {
   }
 
   if (effectivePid && effectivePid !== resolved.suppliedPid) patch[resolved.map.pid] = effectivePid;
-  if (resolved.hasProductUrlField && resolved.productUrl) patch[resolved.map.productUrl] = resolved.productUrl;
 
   // Product docs need the PID, the team's Chinese name, and the generated URL.
   if (product && effectiveName && effectivePid && resolved.productUrl) {
@@ -235,7 +240,7 @@ export async function handleFeishuAutomation(input: {
         // Existing cards can still be re-linked to the clicked Base record.
         if (product.documentId && product.documentUrl) {
           await ensureProductDocument(input.client, product).catch(() => undefined);
-          patch[resolved.map.productDocument] = product.documentUrl;
+          patch[resolved.map.productDocument] = hyperlinkFieldValue(product.documentUrl, `${effectiveName} 产品手卡`);
           if (writeBack) {
             await patchBaseRecord(input.client, {
               appToken: input.appToken,
@@ -285,7 +290,7 @@ export async function handleFeishuAutomation(input: {
     // The button workflow consumes returned fields. Always return the URL even
     // when it is unchanged; otherwise an existing PID produces an empty patch
     // and the clicked row appears to do nothing.
-    patch[resolved.map.productDocument] = result.documentUrl;
+    patch[resolved.map.productDocument] = hyperlinkFieldValue(result.documentUrl, `${effectiveName} 产品手卡`);
   }
 
   if (resolved.videoUrl) {
@@ -317,7 +322,12 @@ export async function handleFeishuAutomation(input: {
       patch[resolved.map.status] = "已完成";
       patch[resolved.map.analysis] = conciseProductDocAnalysis(video);
       patch[resolved.map.translation] = video.transcriptZh || "暂无中文翻译";
-      if (targetProduct.documentUrl) patch[resolved.map.productDocument] = targetProduct.documentUrl;
+      if (targetProduct.documentUrl) {
+        patch[resolved.map.productDocument] = hyperlinkFieldValue(
+          targetProduct.documentUrl,
+          `${targetProduct.name} 产品手卡`,
+        );
+      }
     } else {
       enqueueVideos([video.id]);
       patch[resolved.map.status] = "排队中";

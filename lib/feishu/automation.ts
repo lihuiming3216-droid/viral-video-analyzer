@@ -81,13 +81,6 @@ function cleanUrl(value: string) {
   return value.replace(/[，。；;、!！?？)）\]】}]+$/g, "");
 }
 
-function hyperlinkFieldValue(url: string, label?: string) {
-  return {
-    link: url,
-    text: label?.trim() || url,
-  };
-}
-
 function apiError(response: { code?: number; msg?: string } | null | undefined, fallback: string) {
   if (response?.code && response.code !== 0) throw new Error(response.msg || fallback);
 }
@@ -165,9 +158,7 @@ export async function completeFeishuAutomation(videoId: string) {
   if (video.status === "completed") {
     fields[map.analysis] = conciseProductDocAnalysis(video);
     fields[map.translation] = video.transcriptZh || "暂无中文翻译";
-    if (product?.documentUrl) {
-      fields[map.productDocument] = hyperlinkFieldValue(product.documentUrl, `${product.name} 产品手卡`);
-    }
+    if (product?.documentUrl) fields[map.productDocument] = product.documentUrl;
   } else if (video.errorMessage) {
     fields[map.analysis] = `处理失败：${video.errorMessage}`;
   }
@@ -226,6 +217,8 @@ export async function handleFeishuAutomation(input: {
   }
 
   if (effectivePid && effectivePid !== resolved.suppliedPid) patch[resolved.map.pid] = effectivePid;
+  // 产品链接 is already present in Base and is a hyperlink field. Echoing the
+  // URL back as plain text causes URLFieldConvFail, so leave it untouched.
 
   // Product docs need the PID, the team's Chinese name, and the generated URL.
   if (product && effectiveName && effectivePid && resolved.productUrl) {
@@ -240,7 +233,7 @@ export async function handleFeishuAutomation(input: {
         // Existing cards can still be re-linked to the clicked Base record.
         if (product.documentId && product.documentUrl) {
           await ensureProductDocument(input.client, product).catch(() => undefined);
-          patch[resolved.map.productDocument] = hyperlinkFieldValue(product.documentUrl, `${effectiveName} 产品手卡`);
+          patch[resolved.map.productDocument] = product.documentUrl;
           if (writeBack) {
             await patchBaseRecord(input.client, {
               appToken: input.appToken,
@@ -290,7 +283,8 @@ export async function handleFeishuAutomation(input: {
     // The button workflow consumes returned fields. Always return the URL even
     // when it is unchanged; otherwise an existing PID produces an empty patch
     // and the clicked row appears to do nothing.
-    patch[resolved.map.productDocument] = hyperlinkFieldValue(result.documentUrl, `${effectiveName} 产品手卡`);
+    // 产品手卡 is a text field in the current Base, so write the raw URL.
+    patch[resolved.map.productDocument] = result.documentUrl;
   }
 
   if (resolved.videoUrl) {
@@ -322,12 +316,7 @@ export async function handleFeishuAutomation(input: {
       patch[resolved.map.status] = "已完成";
       patch[resolved.map.analysis] = conciseProductDocAnalysis(video);
       patch[resolved.map.translation] = video.transcriptZh || "暂无中文翻译";
-      if (targetProduct.documentUrl) {
-        patch[resolved.map.productDocument] = hyperlinkFieldValue(
-          targetProduct.documentUrl,
-          `${targetProduct.name} 产品手卡`,
-        );
-      }
+      if (targetProduct.documentUrl) patch[resolved.map.productDocument] = targetProduct.documentUrl;
     } else {
       enqueueVideos([video.id]);
       patch[resolved.map.status] = "排队中";

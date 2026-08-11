@@ -190,12 +190,12 @@ test("a new PID parse failure creates no product or document", async () => {
     createProduct: () => { createCalls += 1; return cachedProduct(); },
     updateProduct: () => { updateCalls += 1; return null; },
     hasUsableProductInfo: () => false,
-    parsePublicProductPage: async () => { throw new Error("商品页要求安全验证"); },
+    parsePublicProductPage: async () => { throw new Error("商品资料解析失败：AI 提取未得到足够的可验证资料（Qwen 请求超时）；官方商品页路径也没有足够的确定性白名单资料"); },
     ensureProductDocument: async () => { documentCalls += 1; },
   };
   await assert.rejects(
     automation.handleFeishuAutomation(automationInput()),
-    /商品页要求安全验证/,
+    /Qwen 请求超时/,
   );
   assert.equal(createCalls, 0);
   assert.equal(updateCalls, 0);

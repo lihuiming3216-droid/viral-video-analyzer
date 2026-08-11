@@ -73,13 +73,13 @@ test("ensure-document creates nothing when a new PID fails parsing", async () =>
     getProductByPid: () => null,
     createProduct: () => { createCalls += 1; return product(); },
     updateProduct: () => { updateCalls += 1; return null; },
-    parsePublicProductPage: async () => { throw new Error("商品页要求安全验证"); },
+    parsePublicProductPage: async () => { throw new Error("商品资料解析失败：AI 提取未得到足够的可验证资料（Qwen 请求超时）；官方商品页路径也没有足够的确定性白名单资料"); },
     ensureProductDocument: async () => { documentCalls += 1; },
   };
 
   const response = await route.POST(request());
   assert.equal(response.status, 500);
-  assert.match(response.body.error, /商品页要求安全验证/);
+  assert.match(response.body.error, /Qwen 请求超时/);
   assert.equal(createCalls, 0);
   assert.equal(updateCalls, 0);
   assert.equal(documentCalls, 0);

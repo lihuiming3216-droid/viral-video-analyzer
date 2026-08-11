@@ -59,6 +59,47 @@ const pid = "1732364299482009895";
 const productSlug = "anime-n-narutos-silicone-case-for-iphone-samsung-shockproof";
 const productTitle = "anime n narutos silicone case for iphone samsung shockproof";
 const productUrl = `https://shop.tiktok.com/us/pdp/${productSlug}/${pid}?source=anchor`;
+const cameraPid = "1731678528327946361";
+const cameraSlug = "cinmoore-2-5k-indoor-security-camera-ai-detection-2-way-audio-night-vision";
+const cameraUrl = `https://shop.tiktok.com/us/pdp/${cameraSlug}/${cameraPid}?source=anchor`;
+const cameraPageTitle = "CINMOORE 2.5K Security Camera Indoor, Non-Subscription AI Person/Pet/Cry Detection, 4MP Pet/Dog/Cat Camera with Phone App, Pan Tilt 2.4GHz WiFi Cameras for Home Security, IR Night Vision, Full Duplex 2-Way Audio";
+
+function structuredCameraPage(options = {}) {
+  const pageTitle = options.pageTitle ?? cameraPageTitle;
+  const metaTitle = options.metaTitle ?? "CINMOORE 2.5K Indoor Security Camera with AI Detection - TikTok Shop";
+  const descriptionTexts = options.descriptionTexts ?? [
+    "2.5K Ultra HD + Night Vision",
+    "Smart AI Detection",
+    "Full Duplex 2-Way Audio",
+  ];
+  const model = {
+    product_id: options.productId ?? cameraPid,
+    name: pageTitle,
+    description: JSON.stringify(descriptionTexts.map((text) => ({ text }))),
+    images: options.images ?? [{
+      url_list: ["https://p16-oec-va.ibyteimg.com/tos-maliva-i-o3syd03w52/camera.webp"],
+    }],
+    product_properties: [
+      { property_name: "Video Capture Resolution", property_values: [{ property_value_name: "2.5K" }] },
+      { property_name: "Special Features", property_values: [
+        { property_value_name: "Night Vision" },
+        { property_value_name: "2-Way Audio" },
+        { property_value_name: "AI Detection" },
+      ] },
+    ],
+    skus: [{ sku_name: "CAM-TEST" }],
+  };
+  return `<html><head><meta property="og:title" content="${metaTitle}"><title>${metaTitle}</title></head><body><script id="__MODERN_ROUTER_DATA__" type="application/json">${JSON.stringify({ loaderData: { product_model: model } })}</script></body></html>`;
+}
+
+function qwenProductResponse(product) {
+  return new Response(JSON.stringify({
+    choices: [{ message: { content: JSON.stringify(product) } }],
+  }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
 
 test("expanded Chromium challenge pages are rejected as product evidence", () => {
   const expanded = {
@@ -97,6 +138,12 @@ test("exact public evidence accepts only official TikTok product paths with the 
   for (const url of rejected) assert.equal(parser.isExactTikTokProductSource(url, pid), false, url);
   assert.equal(parser.trustedProductPathEvidence(accepted[0], pid), productTitle);
   assert.equal(parser.trustedProductPathEvidence(`https://www.tiktok.com/view/product/${pid}`, pid), "");
+  const overlongSlug = `${"camera-".repeat(85)}without-night-vision`;
+  assert.equal(
+    parser.trustedProductPathEvidence(`https://shop.tiktok.com/us/pdp/${overlongSlug}/${pid}`, pid),
+    "",
+    "an overlong slug must be rejected whole instead of truncating a trailing negation",
+  );
 });
 
 test("the parser rejects a TikTok video URL before fetching it", async () => {
@@ -144,6 +191,278 @@ test("the 1+1 threshold is limited to freshly grounded search results", () => {
   assert.equal(parser.hasUsableProductInfo(partial, 1), true);
   assert.equal(parser.hasUsableProductInfo({ ...partial, coreFunctions: [] }, 1), false);
   assert.equal(parser.hasUsableProductInfo({ ...partial, productParameters: "" }, 1), false);
+});
+
+test("a valid direct AI result takes priority over deterministic camera facts", async () => {
+  let chatCalls = 0;
+  globalThis.__productParserTestHooks = {
+    fetchWithProxy: async (url) => {
+      if (String(url).includes("/chat/completions")) {
+        chatCalls += 1;
+        return qwenProductResponse({
+          sourceTitle: "",
+          sourceDescription: "",
+          sku: "",
+          coreFunctions: ["宠物看护"],
+          productParameters: "分辨率：4MP",
+          usageMethod: "通过手机应用查看",
+          audience: "",
+          scenes: "",
+          sellingPoints: "",
+          visualEvidence: "",
+          evidenceQuotes: {
+            sku: [],
+            coreFunctions: ["Pet/Dog/Cat Camera"],
+            productParameters: ["4MP"],
+            usageMethod: ["Phone App"],
+            audience: [],
+            scenes: [],
+          },
+        });
+      }
+      return new Response(structuredCameraPage(), { status: 200 });
+    },
+  };
+
+  const result = await parser.parsePublicProductPage(cameraUrl, { productName: "室内摄像头", pid: cameraPid });
+  assert.equal(chatCalls, 1);
+  assert.deepEqual(result.coreFunctions, ["宠物看护"]);
+  assert.equal(result.productParameters, "分辨率：4MP");
+  assert.equal(result.usageMethod, "通过手机应用查看");
+  assert.doesNotMatch(JSON.stringify(result), /室内安防监控|AI检测|双向语音|夜视/);
+});
+
+test("the production camera URL falls back safely when direct Qwen times out", async () => {
+  const chatModes = [];
+  globalThis.__productParserTestHooks = {
+    fetchWithProxy: async (url, init = {}) => {
+      if (String(url).includes("/chat/completions")) {
+        const request = JSON.parse(String(init.body));
+        chatModes.push(Array.isArray(request.messages?.[0]?.content) ? "visual" : "text");
+        const error = new Error("request timed out");
+        error.name = "TimeoutError";
+        throw error;
+      }
+      return new Response(structuredCameraPage(), { status: 200 });
+    },
+  };
+
+  const result = await parser.parsePublicProductPage(cameraUrl, { productName: "室内摄像头", pid: cameraPid });
+  assert.deepEqual(chatModes, ["visual"], "a usable deterministic candidate must prevent a redundant text retry");
+  assert.deepEqual(result.coreFunctions, ["室内安防监控", "AI检测", "双向语音", "夜视"]);
+  assert.equal(result.productParameters, "分辨率：2.5K");
+  assert.equal(result.scenes, "室内");
+  assert.equal(result.sku, "");
+  assert.equal(result.sourceDescription, "");
+  assert.deepEqual(result.sourceImageUrls, []);
+});
+
+test("a valid but evidence-insufficient Qwen response uses the same camera fallback", async () => {
+  let chatCalls = 0;
+  globalThis.__productParserTestHooks = {
+    fetchWithProxy: async (url) => {
+      if (String(url).includes("/chat/completions")) {
+        chatCalls += 1;
+        return qwenProductResponse({ coreFunctions: [], evidenceQuotes: {} });
+      }
+      return new Response(structuredCameraPage(), { status: 200 });
+    },
+  };
+
+  const result = await parser.parsePublicProductPage(cameraUrl, { productName: "室内摄像头", pid: cameraPid });
+  assert.equal(chatCalls, 2);
+  assert.deepEqual(result.coreFunctions, ["室内安防监控", "AI检测", "双向语音", "夜视"]);
+  assert.equal(result.productParameters, "分辨率：2.5K");
+  assert.equal(result.scenes, "室内");
+});
+
+test("camera fallback respects scoped negations without suppressing no-subscription features", async () => {
+  globalThis.__productParserTestHooks = {
+    fetchWithProxy: async (url) => {
+      if (String(url).includes("/chat/completions")) return qwenProductResponse({ coreFunctions: [], evidenceQuotes: {} });
+      return new Response(structuredCameraPage(), { status: 200 });
+    },
+  };
+
+  const negatedSlug = "no-shockproof-2-5k-indoor-security-camera-non-ai-detection-not-supported-2-way-audio-without-support-for-night-vision";
+  const negated = await parser.parsePublicProductPage(
+    `https://shop.tiktok.com/us/pdp/${negatedSlug}/${cameraPid}`,
+    { productName: "室内摄像头", pid: cameraPid },
+  );
+  assert.deepEqual(negated.coreFunctions, ["室内安防监控"]);
+  assert.equal(negated.productParameters, "分辨率：2.5K");
+  assert.equal(negated.scenes, "室内");
+
+  const noSubscriptionSlug = "2-5k-indoor-security-camera-no-subscription-night-vision";
+  const noSubscription = await parser.parsePublicProductPage(
+    `https://shop.tiktok.com/us/pdp/${noSubscriptionSlug}/${cameraPid}`,
+    { productName: "室内摄像头", pid: cameraPid },
+  );
+  assert.deepEqual(noSubscription.coreFunctions, ["室内安防监控", "夜视"]);
+
+  for (const suffix of [
+    "not-supported", "not-included", "not-available", "not-enabled",
+    "no-longer-supported", "no-longer-included", "no-longer-available", "no-longer-enabled",
+    "anti", "unsupported", "disabled", "unavailable",
+  ]) {
+    const mixedEvidenceSlug = `2-5k-indoor-security-camera-night-vision-night-vision-${suffix}`;
+    const mixed = await parser.parsePublicProductPage(
+      `https://shop.tiktok.com/us/pdp/${mixedEvidenceSlug}/${cameraPid}`,
+      { productName: "室内摄像头", pid: cameraPid },
+    );
+    assert.deepEqual(
+      mixed.coreFunctions,
+      ["室内安防监控"],
+      `any explicit postfixed negation must reject all night-vision occurrences: ${suffix}`,
+    );
+  }
+
+  for (const prefix of [
+    "not-supported", "not-included", "not-available", "not-enabled",
+    "no-longer-supported", "no-longer-included", "no-longer-available", "no-longer-enabled",
+    "anti", "unsupported", "disabled", "unavailable",
+  ]) {
+    const prefixedNegationSlug = `2-5k-camera-feature-${prefix}-night-vision-indoor-security-camera`;
+    const prefixed = await parser.parsePublicProductPage(
+      `https://shop.tiktok.com/us/pdp/${prefixedNegationSlug}/${cameraPid}`,
+      { productName: "室内摄像头", pid: cameraPid },
+    );
+    assert.deepEqual(
+      prefixed.coreFunctions,
+      ["室内安防监控"],
+      `any explicit prefixed negation must reject night vision: ${prefix}`,
+    );
+  }
+
+  for (const pagePhrase of ["Night Vision - Not Supported", "Not Supported - Night Vision"]) {
+    globalThis.__productParserTestHooks = {
+      fetchWithProxy: async (url) => String(url).includes("/chat/completions")
+        ? qwenProductResponse({ coreFunctions: [], evidenceQuotes: {} })
+        : new Response(structuredCameraPage({
+            pageTitle: cameraPageTitle.replace("IR Night Vision", pagePhrase),
+          }), { status: 200 }),
+    };
+    const pageNegated = await parser.parsePublicProductPage(cameraUrl, { productName: "室内摄像头", pid: cameraPid });
+    assert.doesNotMatch(JSON.stringify(pageNegated.coreFunctions), /夜视/, pagePhrase);
+  }
+
+  for (const pagePhrase of ["Non-AI Detection", "No-AI Detection"]) {
+    globalThis.__productParserTestHooks = {
+      fetchWithProxy: async (url) => String(url).includes("/chat/completions")
+        ? qwenProductResponse({ coreFunctions: [], evidenceQuotes: {} })
+        : new Response(structuredCameraPage({
+            pageTitle: cameraPageTitle.replace("Non-Subscription AI Person/Pet/Cry Detection", pagePhrase),
+          }), { status: 200 }),
+    };
+    const pageNegated = await parser.parsePublicProductPage(cameraUrl, { productName: "室内摄像头", pid: cameraPid });
+    assert.doesNotMatch(JSON.stringify(pageNegated.coreFunctions), /AI检测/, pagePhrase);
+  }
+});
+
+test("a forged direct slug cannot create facts absent from the same structured page", async () => {
+  const forgedSlug = "waterproof-battery-2-5k-indoor-security-camera-ai-detection-2-way-audio-night-vision";
+  const chatModes = [];
+  globalThis.__productParserTestHooks = {
+    fetchWithProxy: async (url, init = {}) => {
+      if (String(url).includes("/chat/completions")) {
+        const request = JSON.parse(String(init.body));
+        chatModes.push(Array.isArray(request.messages?.[0]?.content) ? "visual" : "text");
+        const error = new Error("request timed out");
+        error.name = "TimeoutError";
+        throw error;
+      }
+      return new Response(structuredCameraPage({
+        pageTitle: "Plain Desk Clock",
+        metaTitle: "2.5K Indoor Security Camera with AI Detection, 2-Way Audio and Night Vision",
+        descriptionTexts: ["Simple clock display"],
+      }), { status: 200 });
+    },
+  };
+
+  await assert.rejects(
+    parser.parsePublicProductPage(
+      `https://shop.tiktok.com/us/pdp/${forgedSlug}/${cameraPid}`,
+      { productName: "桌面时钟", pid: cameraPid },
+    ),
+    /Qwen 请求超时.*官方商品页路径也没有足够的确定性白名单资料/,
+  );
+  assert.deepEqual(chatModes, ["visual", "text"], "a product without a usable deterministic candidate keeps the text retry");
+});
+
+test("direct fallback ignores conflicting meta titles and fuzzy 2 5K router text", async () => {
+  const fuzzyTitle = cameraPageTitle.replaceAll("2.5K", "2 5K");
+  globalThis.__productParserTestHooks = {
+    fetchWithProxy: async (url) => {
+      if (String(url).includes("/chat/completions")) {
+        const error = new Error("request timed out");
+        error.name = "TimeoutError";
+        throw error;
+      }
+      return new Response(structuredCameraPage({
+        pageTitle: fuzzyTitle,
+        metaTitle: "CINMOORE 2.5K Indoor Security Camera with AI Detection - TikTok Shop",
+      }), { status: 200 });
+    },
+  };
+
+  await assert.rejects(
+    parser.parsePublicProductPage(cameraUrl, { productName: "室内摄像头", pid: cameraPid }),
+    /官方商品页路径也没有足够的确定性白名单资料/,
+  );
+});
+
+test("direct provider HTTP, invalid JSON, and insufficient failures remain diagnosable", async () => {
+  const unsupportedUrl = `https://shop.tiktok.com/us/pdp/plain-desk-clock/${cameraPid}`;
+  const page = structuredCameraPage({
+    pageTitle: "Plain Desk Clock",
+    metaTitle: "Plain Desk Clock - TikTok Shop",
+    descriptionTexts: ["Simple clock display"],
+  });
+  const scenarios = [
+    {
+      providerResponse: () => new Response("", { status: 503 }),
+      expected: /Qwen HTTP 503/,
+    },
+    {
+      providerResponse: () => new Response("not-json", { status: 200 }),
+      expected: /Qwen 返回的商品资料不是有效 JSON/,
+    },
+    {
+      providerResponse: () => qwenProductResponse({ coreFunctions: [], evidenceQuotes: {} }),
+      expected: /Qwen 返回资料未通过证据引文与字段完整性校验/,
+    },
+    {
+      providerResponse: () => { throw new Error("socket reset at provider-internal.example"); },
+      expected: /Qwen 请求失败/,
+      forbidden: /socket reset|provider-internal/i,
+    },
+    {
+      providerResponse: () => { throw new Error("HTTP 500 Authorization: Bearer secret-token"); },
+      expected: /Qwen HTTP 500/,
+      forbidden: /Authorization|Bearer|secret-token/i,
+    },
+    {
+      providerResponse: () => { throw new Error("valid json Bearer secret-token"); },
+      expected: /Qwen 返回的商品资料不是有效 JSON/,
+      forbidden: /Bearer|secret-token/i,
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    globalThis.__productParserTestHooks = {
+      fetchWithProxy: async (url) => String(url).includes("/chat/completions")
+        ? scenario.providerResponse()
+        : new Response(page, { status: 200 }),
+    };
+    await assert.rejects(
+      parser.parsePublicProductPage(unsupportedUrl, { productName: "桌面时钟", pid: cameraPid }),
+      (error) => {
+        assert.match(error.message, scenario.expected);
+        if (scenario.forbidden) assert.doesNotMatch(error.message, scenario.forbidden);
+        return true;
+      },
+    );
+  }
 });
 
 test("a direct TikTok challenge falls through to exact-source web search", { timeout: 15_000 }, async () => {
@@ -313,8 +632,8 @@ test("an exact view-product URL without a slug fails closed", async () => {
 
 test("web-search HTTP and network errors remain visible", async () => {
   for (const scenario of [
-    { response: new Response("", { status: 503 }), expected: /联网检索失败：HTTP 503/ },
-    { error: new Error("search socket reset"), expected: /联网检索失败：search socket reset/ },
+    { response: new Response("", { status: 503 }), expected: /联网检索失败：Qwen HTTP 503/ },
+    { error: new Error("search socket reset provider-internal.example"), expected: /联网检索失败：Qwen 请求失败/, forbidden: /socket reset|provider-internal/i },
   ]) {
     globalThis.__productParserTestHooks = {
       fetchWithProxy: async (url) => {
@@ -327,7 +646,11 @@ test("web-search HTTP and network errors remain visible", async () => {
     };
     await assert.rejects(
       parser.parsePublicProductPage(productUrl, { productName: "手机壳", pid }),
-      scenario.expected,
+      (error) => {
+        assert.match(error.message, scenario.expected);
+        if (scenario.forbidden) assert.doesNotMatch(error.message, scenario.forbidden);
+        return true;
+      },
     );
   }
 });
@@ -350,8 +673,8 @@ test("product parse failures distinguish security, missing sources, and weak ext
     "联网检索找到了同 PID 的官方商品页，但链接路径没有可独立验证的商品资料",
   );
   assert.equal(
-    parser.productParseFailureReason({ searchMode: true, pageError: "HTTP 404", exactSourceMatched: false, searchError: "HTTP 503" }),
-    "HTTP 404；联网检索失败：HTTP 503",
+    parser.productParseFailureReason({ searchMode: true, pageError: "HTTP 404", exactSourceMatched: false, searchError: "Qwen HTTP 503" }),
+    "HTTP 404；联网检索失败：Qwen HTTP 503",
   );
   assert.equal(
     parser.productParseFailureReason({ searchMode: false, pageError: "", exactSourceMatched: false }),

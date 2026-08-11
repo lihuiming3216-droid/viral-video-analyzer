@@ -116,8 +116,10 @@ export function trustedProductPathEvidence(sourceUrl: string, productId: string)
   try {
     const productPath = officialTikTokProductPath(new URL(sourceUrl));
     if (!productPath?.slug) return "";
-    const decoded = clean(decodeURIComponent(productPath.slug).replace(/[-_+]+/g, " ")).slice(0, 500);
-    return decoded.length >= 4 && /\p{L}/u.test(decoded) ? decoded : "";
+    const decoded = clean(decodeURIComponent(productPath.slug).replace(/[-_+]+/g, " "));
+    // Never truncate a seller-controlled slug: doing so could discard a
+    // trailing negation and turn the remaining prefix into a false claim.
+    return decoded.length >= 4 && decoded.length <= 500 && /\p{L}/u.test(decoded) ? decoded : "";
   } catch {
     return "";
   }
@@ -382,31 +384,82 @@ function baseInfo(
   };
 }
 
+function hasAffirmedSlugPhrase(evidence: string, phrase: RegExp) {
+  const matcher = new RegExp(phrase.source, `${phrase.flags.replace(/g/g, "")}g`);
+  let affirmed = false;
+  for (const match of evidence.matchAll(matcher)) {
+    const prefix = clean(evidence.slice(0, match.index))
+      .toLowerCase()
+      .replace(/[\s,;:()\[\]{}\/|–—-]+$/, "");
+    const suffix = clean(evidence.slice((match.index || 0) + match[0].length))
+      .toLowerCase()
+      .replace(/^[\s,;:()\[\]{}\/|–—-]+/, "");
+    const prefixNegated = /(?:^|\s)(?:no|non|anti|unsupported|disabled|unavailable)\s*$/.test(prefix)
+      || /(?:^|\s)not(?:\s+(?:supported|included|available|enabled)|\s+at\s+all)?\s*$/.test(prefix)
+      || /(?:^|\s)no\s+longer\s+(?:supported|included|available|enabled)\s*$/.test(prefix)
+      || /(?:^|\s)(?:without|no)\s+support\s+for\s*$/.test(prefix)
+      || /(?:^|\s)without(?:\s+support)?\s*$/.test(prefix);
+    const suffixNegated = /^(?:is\s+)?(?:not\s+(?:supported|included|available|enabled)|no\s+longer\s+(?:supported|included|available|enabled)|anti|unsupported|disabled|unavailable)\b/.test(suffix);
+    // If the same evidence contains both a positive occurrence and an
+    // explicit negative occurrence, fail closed for that fact as a whole.
+    if (prefixNegated || suffixNegated) return false;
+    affirmed = true;
+  }
+  return affirmed;
+}
+
 /**
- * Search fallback is intentionally non-generative. A verified TikTok PDP slug
- * may contribute only facts whose exact English token/phrase is listed here;
- * everything else fails closed instead of being translated or inferred by AI.
+ * A strictly verified TikTok PDP slug may contribute only facts whose exact
+ * English token/phrase is listed here. This is deliberately deterministic:
+ * unlisted and directly negated phrases never become product claims.
  */
-function productInfoFromTrustedSlug(base: ParsedProductInfo, trustedSlug: string): ParsedProductInfo {
+function productInfoFromTrustedSlug(
+  base: ParsedProductInfo,
+  trustedSlug: string,
+  options: { sourceTitle?: string; corroboratingEvidence?: string } = {},
+): ParsedProductInfo {
   const evidence = clean(trustedSlug).toLowerCase();
+  const pageEvidence = clean(options.corroboratingEvidence).toLowerCase();
   const coreFunctions: string[] = [];
   const parameters: string[] = [];
+  const scenes: string[] = [];
+  const confirmed = (slugPhrase: RegExp, pagePhrase: RegExp = slugPhrase) => hasAffirmedSlugPhrase(evidence, slugPhrase)
+    && (!options.corroboratingEvidence || hasAffirmedSlugPhrase(pageEvidence, pagePhrase));
 
-  if (/\bshockproof\b/.test(evidence)) coreFunctions.push("防震保护");
-  if (/\bsilicone\s+(?:phone\s+)?case\b/.test(evidence)) parameters.push("材质：硅胶");
+  if (confirmed(/\bshockproof\b/)) coreFunctions.push("防震保护");
+  const isIndoorSecurityCamera = confirmed(
+    /\bindoor\s+security\s+camera\b/,
+    /\b(?:indoor\s+security\s+camera|security\s+camera\s+indoor)\b/,
+  );
+  if (isIndoorSecurityCamera) {
+    coreFunctions.push("室内安防监控");
+    scenes.push("室内");
+    if (confirmed(/\bai\s+detection\b/, /\bai(?:\s+person\/pet\/cry)?\s+detection\b/)) coreFunctions.push("AI检测");
+    if (confirmed(/\b2\s+way\s+audio\b/, /\b2(?:-|\s)+way\s+audio\b/)) coreFunctions.push("双向语音");
+    if (confirmed(/\bnight\s+vision\b/)) coreFunctions.push("夜视");
+    // TikTok slugs replace the decimal point in "2.5K" with a hyphen, which
+    // trustedProductPathEvidence decodes to the exact token pair "2 5k".
+    if (confirmed(/\b2\s+5k\b/, /\b2\.5k\b/)) parameters.push("分辨率：2.5K");
+  }
+  if (confirmed(/\bsilicone\s+(?:phone\s+)?case\b/)) parameters.push("材质：硅胶");
 
   // Compatibility is accepted only from an explicit "for <known device>"
   // phrase. Unlisted words in the slug never become product facts.
-  const compatibilityPhrase = evidence.match(/\bfor\s+((?:iphone|samsung)(?:\s+(?:iphone|samsung))*)\b/)?.[1] || "";
+  const compatibilityPattern = /\bfor\s+((?:iphone|samsung)(?:\s+(?:iphone|samsung))*)\b/;
+  const compatibilityPhrase = confirmed(compatibilityPattern)
+    ? evidence.match(compatibilityPattern)?.[1] || ""
+    : "";
   const compatibleDevices = [...new Set(compatibilityPhrase.match(/\b(?:iphone|samsung)\b/g) || [])]
     .map((device) => device === "iphone" ? "iPhone" : "Samsung");
   if (compatibleDevices.length) parameters.push(`兼容设备：${compatibleDevices.join("、")}`);
 
   return {
     ...base,
+    sku: "",
     coreFunctions,
     productParameters: parameters.join("；"),
-    sourceTitle: clean(trustedSlug),
+    scenes: scenes.join("；"),
+    sourceTitle: clean(options.sourceTitle) || clean(trustedSlug),
     sourceDescription: "",
     sourceImageUrls: [],
     visualEvidence: "",
@@ -482,6 +535,8 @@ type ProductPageResult = {
   imageUrls: string[];
   sku: string;
   error: string;
+  structured: boolean;
+  corroboratingText: string;
 };
 
 function embeddedJson(html: string, id: string) {
@@ -595,6 +650,8 @@ function structuredProductEvidence(html: string, productUrl: string) {
       .slice(0, 11_000),
     imageUrls: imageUrls.slice(0, MAX_PRODUCT_IMAGES),
     sku: skus.join("；"),
+    structured: true,
+    corroboratingText: title,
   };
 }
 
@@ -710,6 +767,7 @@ export function expandedProductResult(
         .filter((url, index, all) => all.indexOf(url) === index)
         .slice(0, MAX_PRODUCT_IMAGES),
       error: "",
+      corroboratingText: structured.corroboratingText,
     };
   }
   if (!title && !description && expanded.text.length < 300) return null;
@@ -720,6 +778,8 @@ export function expandedProductResult(
     imageUrls: expanded.imageUrls.slice(0, MAX_PRODUCT_IMAGES),
     sku: "",
     error: "",
+    structured: false,
+    corroboratingText: "",
   };
 }
 
@@ -754,7 +814,7 @@ async function readProductPage(productUrl: string): Promise<ProductPageResult> {
       const structured = structuredProductEvidence(html, productUrl);
       const expanded = await readExpandedProductPage(fetchUrl);
       const expandedResult = expanded ? expandedProductResult(expanded, productUrl) : null;
-      const bestStructured = expandedResult || structured;
+      const bestStructured = expandedResult?.structured ? expandedResult : structured || expandedResult;
       if (bestStructured) {
         const imageUrls = [
           ...bestStructured.imageUrls,
@@ -765,6 +825,7 @@ async function readProductPage(productUrl: string): Promise<ProductPageResult> {
           text: [bestStructured.text, expanded?.text].filter(Boolean).join("\n").slice(0, 20_000),
           imageUrls,
           error: "",
+          corroboratingText: bestStructured.corroboratingText,
         };
       }
       if (title || metaDescription || visibleText.length >= 300) {
@@ -777,14 +838,20 @@ async function readProductPage(productUrl: string): Promise<ProductPageResult> {
             .slice(0, MAX_PRODUCT_IMAGES),
           sku: "",
           error: "",
+          structured: false,
+          corroboratingText: "",
         };
       }
       lastError = "商品页没有公开资料";
     } catch (error) {
-      lastError = error instanceof Error ? error.message : "fetch failed";
+      const message = error instanceof Error ? error.message : "";
+      const name = error instanceof Error ? error.name : "";
+      lastError = /timeout/i.test(name) || /(?:timed?\s*out|timeout)/i.test(message)
+        ? "商品页请求超时"
+        : "商品页请求失败";
     }
   }
-  return { title: "", description: "", text: "", imageUrls: [], sku: "", error: lastError };
+  return { title: "", description: "", text: "", imageUrls: [], sku: "", error: lastError, structured: false, corroboratingText: "" };
 }
 
 async function readProductPageWithRetry(productUrl: string): Promise<ProductPageResult> {
@@ -795,7 +862,7 @@ async function readProductPageWithRetry(productUrl: string): Promise<ProductPage
     page = await readProductPage(productUrl);
     if (page.text || page.error !== "商品页要求安全验证") return page;
   }
-  return page || { title: "", description: "", text: "", imageUrls: [], sku: "", error: "商品页没有公开资料" };
+  return page || { title: "", description: "", text: "", imageUrls: [], sku: "", error: "商品页没有公开资料", structured: false, corroboratingText: "" };
 }
 
 function extractionPrompt(input: {
@@ -821,9 +888,27 @@ function extractionPrompt(input: {
   return `你在整理 TikTok Shop 产品手卡。\n${identity}\n${evidence}\n${visualInstruction}\n\n只能把上述页面文字和商品图片中明确可读的文字翻译、归纳成中文。不得使用常识补齐，不得根据团队中文名推断，不得把相似商品的功能写进来。某字段没有直接文字或清晰图片文字证据时必须返回空字符串或空数组。请输出：页面原始标题 sourceTitle、页面原始描述 sourceDescription、真实 SKU、1至5条产品主要功能、产品参数、使用方法、适用人群、使用场景，以及简短图片证据 visualEvidence。除 sourceTitle、sourceDescription 和 evidenceQuotes 保留英文原文外，其余所有字段值必须使用中文。产品主要功能按重要程度排序，每项只表达一个有证据的功能，不要写 A/B/C/D/E 前缀；页面有足够证据时应整理3至5项。${bundleInstruction}productParameters、usageMethod、audience、scenes 必须返回字符串，不得返回对象或数组；多项用中文分号分隔。产品参数只保留3至8项与购买或使用直接相关的信息，忽略合规声明、危险品声明和无意义的否定属性。SKU 不得填写 PID 或商品ID。精确尺寸、功率、材质、兼容型号、认证和包装数量必须能在证据中找到；页面文字与图片冲突时省略该字段，不要添加冲突说明。sellingPoints 暂不生成，必须返回空字符串。evidenceQuotes 必须为每个输出字段提供页面或图片中的英文逐字短引文：coreFunctions 与引文数组按下标一一对应，其余字段列出支持其中每个事实的引文；中文值必须只是引文的直接翻译或压缩，不得扩大含义。只返回合法 JSON，不要使用 Markdown 代码块。JSON 键名必须严格使用：{"sourceTitle":"","sourceDescription":"","sku":"","coreFunctions":[""],"productParameters":"","usageMethod":"","audience":"","scenes":"","sellingPoints":"","visualEvidence":"","evidenceQuotes":{"sku":[""],"coreFunctions":[""],"productParameters":[""],"usageMethod":[""],"audience":[""],"scenes":[""]}}。`;
 }
 
+function parsedQwenProductModel(payload: Record<string, unknown>) {
+  try {
+    const parsed = parseJsonLoose<ParsedProductModel>(readTextFromModelResponse(payload));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+  } catch {
+    // The caller records this as invalid_json without logging provider output.
+  }
+  throw new Error("Qwen 返回的商品资料 JSON 不是对象");
+}
+
+async function parsedQwenProductResponse(response: Response) {
+  try {
+    return parsedQwenProductModel(await response.json() as Record<string, unknown>);
+  } catch {
+    throw new Error("Qwen 返回的商品资料不是有效 JSON");
+  }
+}
+
 async function qwenExtract(prompt: string) {
   const qwen = getProviderConfig("qwen");
-  if (!qwen.enabled || !qwen.apiKey) return null;
+  if (!qwen.enabled || !qwen.apiKey) throw new Error("Qwen 商品资料抽取未配置");
   const response = await fetchWithProxy(`${qwen.baseUrl.replace(/\/$/, "")}/chat/completions`, {
     method: "POST",
     headers: { Authorization: `Bearer ${qwen.apiKey}`, "Content-Type": "application/json" },
@@ -837,8 +922,8 @@ async function qwenExtract(prompt: string) {
     }),
     signal: AbortSignal.timeout(60_000),
   });
-  if (!response.ok) return null;
-  return parseJsonLoose<ParsedProductModel>(readTextFromModelResponse(await response.json() as Record<string, unknown>));
+  if (!response.ok) throw new Error(`Qwen HTTP ${response.status}`);
+  return parsedQwenProductResponse(response);
 }
 
 async function qwenTranslateBundleFeatures(features: string[]) {
@@ -870,7 +955,8 @@ async function qwenTranslateBundleFeatures(features: string[]) {
 
 async function qwenVisualExtract(prompt: string, imageUrls: string[]) {
   const qwen = getProviderConfig("qwen");
-  if (!qwen.enabled || !qwen.apiKey || !imageUrls.length) return null;
+  if (!qwen.enabled || !qwen.apiKey) throw new Error("Qwen 商品图片抽取未配置");
+  if (!imageUrls.length) throw new Error("没有可供 Qwen 分析的商品图片");
   const response = await fetchWithProxy(`${qwen.baseUrl.replace(/\/$/, "")}/chat/completions`, {
     method: "POST",
     headers: { Authorization: `Bearer ${qwen.apiKey}`, "Content-Type": "application/json" },
@@ -894,8 +980,8 @@ async function qwenVisualExtract(prompt: string, imageUrls: string[]) {
     }),
     signal: AbortSignal.timeout(90_000),
   });
-  if (!response.ok) return null;
-  return parseJsonLoose<ParsedProductModel>(readTextFromModelResponse(await response.json() as Record<string, unknown>));
+  if (!response.ok) throw new Error(`Qwen HTTP ${response.status}`);
+  return parsedQwenProductResponse(response);
 }
 
 async function qwenFindExactProductSources(productUrl: string) {
@@ -946,14 +1032,50 @@ async function qwenFindExactProductSources(productUrl: string) {
   };
 }
 
+type ProviderFailure = {
+  outcome: "timeout" | "http" | "invalid_json" | "request_error" | "insufficient";
+  detail: string;
+};
+
+function providerFailure(error: unknown): ProviderFailure {
+  const message = error instanceof Error ? clean(error.message) : clean(error);
+  const name = error instanceof Error ? error.name : "";
+  if (/timeout/i.test(name) || /(?:timed?\s*out|timeout)/i.test(message)) {
+    return { outcome: "timeout", detail: "Qwen 请求超时" };
+  }
+  const httpStatus = message.match(/\bHTTP\s+(\d{3})\b/i)?.[1];
+  if (httpStatus) {
+    return { outcome: "http", detail: `Qwen HTTP ${httpStatus}` };
+  }
+  if (/(?:JSON|可读取的文本结果|valid json)/i.test(message)) {
+    return { outcome: "invalid_json", detail: "Qwen 返回的商品资料不是有效 JSON" };
+  }
+  if (/未配置/.test(message)) return { outcome: "request_error", detail: "Qwen 未配置" };
+  return { outcome: "request_error", detail: "Qwen 请求失败" };
+}
+
+function preferredProviderFailure(failures: ProviderFailure[]) {
+  for (const outcome of ["timeout", "http", "invalid_json", "request_error", "insufficient"] as const) {
+    const failure = failures.find((item) => item.outcome === outcome);
+    if (failure) return failure.detail;
+  }
+  return "";
+}
+
 export function productParseFailureReason(input: {
   searchMode: boolean;
   pageError: string;
   exactSourceMatched: boolean;
   trustedEvidenceAvailable?: boolean;
   searchError?: string;
+  providerError?: string;
 }) {
-  if (!input.searchMode) return input.pageError || "AI 没有返回足够的可验证商品资料";
+  if (!input.searchMode) {
+    if (input.providerError) {
+      return `${input.pageError ? `${input.pageError}；` : ""}AI 提取未得到足够的可验证资料（${input.providerError}）；官方商品页路径也没有足够的确定性白名单资料`;
+    }
+    return input.pageError || "AI 没有返回足够的可验证商品资料";
+  }
   if (input.searchError) {
     return `${input.pageError ? `${input.pageError}；` : ""}联网检索失败：${input.searchError}`;
   }
@@ -991,7 +1113,7 @@ export async function parsePublicProductPage(
     try {
       searchResult = await qwenFindExactProductSources(canonicalUrl);
     } catch (error) {
-      searchError = error instanceof Error ? error.message : String(error);
+      searchError = providerFailure(error).detail;
     }
   }
   const trustedSearchEvidence = searchResult?.trustedEvidence || "";
@@ -1006,16 +1128,55 @@ export async function parsePublicProductPage(
     pageText: page.text,
     visualMode: page.imageUrls.length ? "direct" : "none",
   });
+  const trustedDirectSlug = !searchMode && page.structured
+    ? trustedProductPathEvidence(canonicalUrl, productId)
+    : "";
+  const directDeterministicCandidate = trustedDirectSlug
+    ? productInfoFromTrustedSlug(base, trustedDirectSlug, {
+        sourceTitle: base.sourceTitle,
+        corroboratingEvidence: page.corroboratingText,
+      })
+    : null;
+  const directDeterministicUsable = Boolean(
+    directDeterministicCandidate && hasUsableProductInfo(directDeterministicCandidate),
+  );
 
   // The exact public page is the primary evidence. On mainland ECS we read
   // TikTok's own origin host first. Web search is only a URL-discovery
   // fallback: Responses prose is ignored and no second chat call may turn a
   // seller-controlled slug into free-form product claims.
+  const providerFailures: ProviderFailure[] = [];
+  let providerReturnedModel = false;
+  const initialUsedVisualModel = !searchMode && page.imageUrls.length > 0;
+  const attemptProductModel = async (label: string, request: () => Promise<ParsedProductModel>) => {
+    const startedAt = Date.now();
+    try {
+      const result = await request();
+      providerReturnedModel = true;
+      console.info("[product-parser] provider attempt", {
+        pid: productId,
+        stage: label,
+        outcome: "success",
+        durationMs: Date.now() - startedAt,
+      });
+      return result;
+    } catch (error) {
+      const failure = providerFailure(error);
+      providerFailures.push(failure);
+      console.warn("[product-parser] provider attempt", {
+        pid: productId,
+        stage: label,
+        outcome: failure.outcome,
+        durationMs: Date.now() - startedAt,
+      });
+      return null;
+    }
+  };
   let parsed = searchMode
     ? null
     : page.imageUrls.length
-      ? await qwenVisualExtract(prompt, page.imageUrls).catch(() => null)
-      : await qwenExtract(prompt).catch(() => null);
+      ? await attemptProductModel("Qwen 图片抽取", () => qwenVisualExtract(prompt, page.imageUrls))
+      : await attemptProductModel("Qwen 文本抽取", () => qwenExtract(prompt));
   let normalized = searchMode
     ? trustedSearchEvidence ? productInfoFromTrustedSlug(evidenceBase, trustedSearchEvidence) : null
     : parsed ? normalizeParsed(parsed, base, productId, page.text) : null;
@@ -1027,8 +1188,10 @@ export async function parsePublicProductPage(
     ? "completed"
     : "unavailable";
 
-  if (!searchMode && needsCompletenessRetry(normalized, page.text)) {
-    parsed = await qwenExtract(prompt).catch(() => null);
+  if (!searchMode
+    && needsCompletenessRetry(normalized, page.text)
+    && (providerReturnedModel || (initialUsedVisualModel && !directDeterministicUsable))) {
+    parsed = await attemptProductModel("Qwen 文本重试", () => qwenExtract(prompt));
     const candidate = parsed ? normalizeParsed(parsed, base, productId, page.text) : null;
     normalized = preferMoreCompleteProductInfo(normalized, candidate);
   }
@@ -1042,6 +1205,30 @@ export async function parsePublicProductPage(
     if (translated.length === bundleFeatures.length) normalized = { ...normalized, coreFunctions: translated };
   }
 
+  // A usable AI result always wins. Only after all direct extraction attempts
+  // fail completeness/evidence checks may a strictly verified router-data
+  // page use the deterministic slug allowlist. Every mapped fact must also be
+  // present (and not directly negated) in that same page's structured text.
+  if (!searchMode && (!normalized || !hasUsableProductInfo(normalized))) {
+    if (providerReturnedModel) {
+      providerFailures.push({ outcome: "insufficient", detail: "Qwen 返回资料未通过证据引文与字段完整性校验" });
+      console.warn("[product-parser] provider attempt", {
+        pid: productId,
+        stage: "evidence_validation",
+        outcome: "insufficient",
+        durationMs: 0,
+      });
+    }
+    const fallbackStartedAt = Date.now();
+    console.info("[product-parser] provider attempt", {
+      pid: productId,
+      stage: "direct_deterministic_fallback",
+      outcome: directDeterministicUsable ? "success" : "insufficient",
+      durationMs: Date.now() - fallbackStartedAt,
+    });
+    if (directDeterministicUsable) normalized = directDeterministicCandidate;
+  }
+
   // The 1+1 threshold is local to this strictly grounded search result. The
   // public cache predicate keeps its historical two-field threshold so legacy
   // rows cannot be silently promoted.
@@ -1053,6 +1240,7 @@ export async function parsePublicProductPage(
       exactSourceMatched: searchResult?.exactSourceMatched === true,
       trustedEvidenceAvailable: Boolean(trustedSearchEvidence),
       searchError,
+      providerError: preferredProviderFailure(providerFailures),
     })}`);
   }
   if (searchMode) {

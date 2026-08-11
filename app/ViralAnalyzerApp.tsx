@@ -294,6 +294,7 @@ function FeishuSettingsCard({ toast }: { toast: (message: string, error?: boolea
   const [appId, setAppId] = useState("");
   const [appSecret, setAppSecret] = useState("");
   const [publicBaseUrl, setPublicBaseUrl] = useState("http://localhost:3000");
+  const [productFolderUrl, setProductFolderUrl] = useState("");
   const [enabled, setEnabled] = useState(false);
   const [busy, setBusy] = useState(false);
   const load = useCallback(async () => {
@@ -301,6 +302,7 @@ function FeishuSettingsCard({ toast }: { toast: (message: string, error?: boolea
     setSettings(result.settings);
     setAppId(result.settings.appId);
     setPublicBaseUrl(result.settings.publicBaseUrl);
+    setProductFolderUrl(result.settings.productFolderUrl || result.settings.productFolderToken);
     setEnabled(result.settings.enabled);
   }, []);
   useEffect(() => {
@@ -314,9 +316,10 @@ function FeishuSettingsCard({ toast }: { toast: (message: string, error?: boolea
       const result = await api<{ settings: FeishuSettings }>("/api/feishu/settings", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ appId, appSecret, publicBaseUrl, enabled }),
+        body: JSON.stringify({ appId, appSecret, publicBaseUrl, productFolderUrl, enabled }),
       });
       setSettings(result.settings);
+      setProductFolderUrl(result.settings.productFolderUrl || result.settings.productFolderToken);
       setAppSecret("");
       toast(enabled ? "飞书机器人设置已保存并连接" : "飞书机器人已停用");
     } catch (error) {
@@ -329,13 +332,14 @@ function FeishuSettingsCard({ toast }: { toast: (message: string, error?: boolea
   const test = async () => {
     try {
       setBusy(true);
-      if (appSecret || appId !== settings?.appId || enabled !== settings?.enabled || publicBaseUrl !== settings?.publicBaseUrl) {
+      if (appSecret || appId !== settings?.appId || enabled !== settings?.enabled || publicBaseUrl !== settings?.publicBaseUrl || productFolderUrl !== (settings?.productFolderUrl || settings?.productFolderToken)) {
         const saved = await api<{ settings: FeishuSettings }>("/api/feishu/settings", {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ appId, appSecret, publicBaseUrl, enabled }),
+          body: JSON.stringify({ appId, appSecret, publicBaseUrl, productFolderUrl, enabled }),
         });
         setSettings(saved.settings);
+        setProductFolderUrl(saved.settings.productFolderUrl || saved.settings.productFolderToken);
         setAppSecret("");
       }
       const result = await api<{ message: string }>("/api/feishu/test", { method: "POST" });
@@ -354,7 +358,7 @@ function FeishuSettingsCard({ toast }: { toast: (message: string, error?: boolea
     failed: settings?.lastError || "连接失败",
     disconnected: settings?.hasAppSecret ? "当前未连接" : "尚未配置",
   }[settings?.connectionStatus || "disconnected"];
-  return <section className="feishu-settings-card"><div className="feishu-settings-head"><span className="feishu-logo"><Bot /></span><div><span className="eyebrow">FEISHU BOT</span><h2>飞书双向分析助手</h2><p>网页报告可以发送到飞书；单聊或群聊 @机器人并发送“产品名称 + TikTok 链接”，会自动分析并返回卡片和完整文档。</p></div><label className="switch"><input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} /><span /></label></div><div className={`feishu-live ${settings?.connectionStatus || "disconnected"}`}><Radio /><div><strong>{stateText}</strong><small>{settings?.connectedAt ? `最近连接：${new Date(settings.connectedAt).toLocaleString("zh-CN")}` : "电脑关机或本工具未运行时，机器人将暂停接收消息。"}</small></div></div><div className="feishu-settings-grid"><div className="feishu-form"><label>App ID<input value={appId} onChange={(event) => setAppId(event.target.value)} placeholder="cli_xxxxxxxxxx" /></label><label>App Secret<input type="password" value={appSecret} onChange={(event) => setAppSecret(event.target.value)} autoComplete="off" placeholder={settings?.hasAppSecret ? "已加密保存，留空不修改" : "在这里填写，不要发到聊天中"} /></label><label>网页报告地址<input value={publicBaseUrl} onChange={(event) => setPublicBaseUrl(event.target.value)} placeholder="http://localhost:3000" /><small>目前本机运行可保持默认；迁移服务器后再改成服务器地址。</small></label><div className="provider-actions"><button className="button secondary" disabled={busy || !settings?.hasAppSecret && !appSecret} onClick={() => void test()}>{busy ? <LoaderCircle className="spin" /> : <RefreshCw />}测试连接</button><button className="button primary" disabled={busy || !appId} onClick={() => void save()}><Check />保存飞书设置</button></div></div><div className="feishu-setup"><h3>飞书后台需要完成</h3><ol><li>创建企业自建应用，并启用机器人能力。</li><li>事件订阅选择“使用长连接接收事件”，添加“接收消息”。</li><li>回调配置添加“卡片回传交互”，用于优质/普通/较差和重新分析按钮。</li><li>开通消息、群信息、用户基本信息、新版文档、云空间文件、素材上传和协作者管理权限。</li><li>发布应用，并把机器人加入需要使用的群聊。</li></ol><a href="https://open.feishu.cn/app" target="_blank" rel="noreferrer">打开飞书开放平台 <ExternalLink /></a></div></div>{settings?.rootFolderUrl && <div className="feishu-folder"><FolderArchive /><span>飞书报告已自动归档到“爆片分析报告 / 产品 / 年月”</span><a href={settings.rootFolderUrl} target="_blank" rel="noreferrer">打开文件夹</a></div>}</section>;
+  return <section className="feishu-settings-card"><div className="feishu-settings-head"><span className="feishu-logo"><Bot /></span><div><span className="eyebrow">FEISHU BOT</span><h2>飞书双向分析助手</h2><p>网页报告可以发送到飞书；单聊或群聊 @机器人并发送“产品名称 + TikTok 链接”，会自动分析并返回卡片和完整文档。</p></div><label className="switch"><input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} /><span /></label></div><div className={`feishu-live ${settings?.connectionStatus || "disconnected"}`}><Radio /><div><strong>{stateText}</strong><small>{settings?.connectedAt ? `最近连接：${new Date(settings.connectedAt).toLocaleString("zh-CN")}` : "电脑关机或本工具未运行时，机器人将暂停接收消息。"}</small></div></div><div className="feishu-settings-grid"><div className="feishu-form"><label>App ID<input value={appId} onChange={(event) => setAppId(event.target.value)} placeholder="cli_xxxxxxxxxx" /></label><label>App Secret<input type="password" value={appSecret} onChange={(event) => setAppSecret(event.target.value)} autoComplete="off" placeholder={settings?.hasAppSecret ? "已加密保存，留空不修改" : "在这里填写，不要发到聊天中"} /></label><label>网页报告地址<input value={publicBaseUrl} onChange={(event) => setPublicBaseUrl(event.target.value)} placeholder="http://localhost:3000" /><small>目前本机运行可保持默认；迁移服务器后再改成服务器地址。</small></label><label>产品说明文档文件夹<input value={productFolderUrl} onChange={(event) => setProductFolderUrl(event.target.value)} placeholder="粘贴飞书文件夹完整链接" /><small>新产品手卡会保存到这里；不会改变“爆片分析报告”的归档目录。</small></label><div className="provider-actions"><button className="button secondary" disabled={busy || !settings?.hasAppSecret && !appSecret} onClick={() => void test()}>{busy ? <LoaderCircle className="spin" /> : <RefreshCw />}测试连接</button><button className="button primary" disabled={busy || !appId} onClick={() => void save()}><Check />保存飞书设置</button></div></div><div className="feishu-setup"><h3>飞书后台需要完成</h3><ol><li>创建企业自建应用，并启用机器人能力。</li><li>事件订阅选择“使用长连接接收事件”，添加“接收消息”。</li><li>回调配置添加“卡片回传交互”，用于优质/普通/较差和重新分析按钮。</li><li>开通消息、群信息、用户基本信息、新版文档、云空间文件、素材上传和协作者管理权限。</li><li>发布应用，并把机器人加入需要使用的群聊。</li></ol><a href="https://open.feishu.cn/app" target="_blank" rel="noreferrer">打开飞书开放平台 <ExternalLink /></a></div></div>{settings?.productFolderUrl && <div className="feishu-folder"><FolderArchive /><span>产品手卡保存到“产品说明文档”</span><a href={settings.productFolderUrl} target="_blank" rel="noreferrer">打开文件夹</a></div>}{settings?.rootFolderUrl && <div className="feishu-folder"><FolderArchive /><span>飞书报告已自动归档到“爆片分析报告 / 产品 / 年月”</span><a href={settings.rootFolderUrl} target="_blank" rel="noreferrer">打开文件夹</a></div>}</section>;
 }
 
 function SettingsView({ data, refresh, toast }: { data: DashboardPayload; refresh: () => Promise<void>; toast: (message: string, error?: boolean) => void }) {

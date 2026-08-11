@@ -202,6 +202,8 @@ function initialize(db: DatabaseSync) {
       public_base_url TEXT NOT NULL DEFAULT 'http://localhost:3000',
       root_folder_token TEXT NOT NULL DEFAULT '',
       root_folder_url TEXT NOT NULL DEFAULT '',
+      product_folder_token TEXT NOT NULL DEFAULT '',
+      product_folder_url TEXT NOT NULL DEFAULT '',
       connection_status TEXT NOT NULL DEFAULT 'disconnected',
       last_error TEXT NOT NULL DEFAULT '',
       connected_at TEXT,
@@ -331,6 +333,15 @@ function initialize(db: DatabaseSync) {
   const videoColumns = db.prepare("PRAGMA table_info(videos)").all() as Array<Record<string, unknown>>;
   if (!videoColumns.some((column) => String(column.name) === "analysis_mode")) {
     db.exec("ALTER TABLE videos ADD COLUMN analysis_mode TEXT NOT NULL DEFAULT 'full'");
+  }
+  const feishuSettingsColumns = db.prepare("PRAGMA table_info(feishu_settings)").all() as Array<Record<string, unknown>>;
+  for (const [name, definition] of [
+    ["product_folder_token", "TEXT NOT NULL DEFAULT ''"],
+    ["product_folder_url", "TEXT NOT NULL DEFAULT ''"],
+  ]) {
+    if (!feishuSettingsColumns.some((column) => String(column.name) === name)) {
+      db.exec(`ALTER TABLE feishu_settings ADD COLUMN ${name} ${definition}`);
+    }
   }
   db.exec("CREATE INDEX IF NOT EXISTS idx_products_pid ON products(pid)");
 
@@ -620,6 +631,14 @@ export function updateProduct(id: string, input: Partial<Product>) {
       now(),
       id,
     );
+  return getProduct(id);
+}
+
+/** Explicitly clear a stale Feishu document link; updateProduct's ?? semantics intentionally cannot do this. */
+export function clearProductDocumentLink(id: string) {
+  getDb()
+    .prepare("UPDATE products SET document_id=NULL, document_url=NULL, updated_at=? WHERE id=?")
+    .run(now(), id);
   return getProduct(id);
 }
 

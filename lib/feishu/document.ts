@@ -4,7 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { createReadStream, statSync } from "node:fs";
 import path from "node:path";
 import type { Client } from "@larksuiteoapi/node-sdk";
-import { getProduct, getVideo, updateProduct } from "@/lib/database";
+import { clearProductDocumentLink, getProduct, getVideo, updateProduct } from "@/lib/database";
 import { formatTime } from "@/lib/json-utils";
 import { resolveMediaPath } from "@/lib/video-processing";
 import {
@@ -14,6 +14,27 @@ import {
 import type { Product, SceneRecord, VideoRecord } from "@/lib/types";
 
 const defaultProductTemplateToken = "B3GNdl05HoEdjnx8WPrcwC5Hnlg";
+
+const productDocumentLockState = globalThis as typeof globalThis & {
+  __viralProductDocumentLocks?: Map<string, Promise<void>>;
+};
+const productDocumentLocks = productDocumentLockState.__viralProductDocumentLocks
+  ||= new Map<string, Promise<void>>();
+
+async function withProductDocumentLock<T>(productId: string, operation: () => Promise<T>) {
+  const previous = productDocumentLocks.get(productId) || Promise.resolve();
+  let release: () => void = () => undefined;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const tail = previous.catch(() => undefined).then(() => gate);
+  productDocumentLocks.set(productId, tail);
+  await previous.catch(() => undefined);
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (productDocumentLocks.get(productId) === tail) productDocumentLocks.delete(productId);
+  }
+}
 
 export async function setCompanyManaged(client: Client, documentId: string) {
   const response = await client.drive.v2.permissionPublic.patch({
@@ -44,8 +65,70 @@ function apiError(response: { code?: number; msg?: string } | null | undefined, 
   if (response?.code && response.code !== 0) throw new Error(response.msg || fallback);
 }
 
+function productDocumentApiError(
+  response: { code?: number; msg?: string } | null | undefined,
+  action: string,
+) {
+  if (!response?.code || response.code === 0) return;
+  const detail = response.msg?.trim() || `飞书错误码 ${response.code}`;
+  const error = new Error(`${action}：${detail}`) as Error & { feishuCode?: number };
+  error.feishuCode = response.code;
+  throw error;
+}
+
+function feishuFailureDetails(value: unknown) {
+  const record = value && typeof value === "object" ? value as Record<string, unknown> : {};
+  const response = record.response && typeof record.response === "object"
+    ? record.response as Record<string, unknown>
+    : {};
+  const data = response.data && typeof response.data === "object"
+    ? response.data as Record<string, unknown>
+    : {};
+  const rawCode = data.code ?? record.feishuCode ?? record.code;
+  const numericCode = typeof rawCode === "number" ? rawCode : Number(rawCode);
+  const messages = [data.msg, data.message, record.msg, record.message]
+    .filter((item): item is string => typeof item === "string" && Boolean(item.trim()));
+  return {
+    code: Number.isFinite(numericCode) ? numericCode : undefined,
+    message: messages.join("；"),
+  };
+}
+
+function productDocumentOperationError(action: string, value: unknown) {
+  const failure = feishuFailureDetails(value);
+  const fallback = value instanceof Error ? value.message : String(value);
+  const error = new Error(`${action}：${failure.message || fallback}`) as Error & { feishuCode?: number };
+  error.feishuCode = failure.code;
+  return error;
+}
+
+function isMissingProductDocumentError(value: unknown) {
+  const code = feishuFailureDetails(value).code;
+  return code != null && [1770002, 1770003, 1063005, 1061007].includes(code);
+}
+
+function requiredToken(value: string | null | undefined, label: string) {
+  const token = value?.trim();
+  if (!token) throw new Error(`缺少${label}`);
+  return token;
+}
+
+function sanitizedName(value: string) {
+  return value.replace(/[\\/:*?"<>|]/g, "-").replace(/\s+/g, " ").trim();
+}
+
 function safeName(value: string) {
-  return value.replace(/[\\/:*?"<>|]/g, "-").replace(/\s+/g, " ").trim().slice(0, 90) || "未命名";
+  return sanitizedName(value).slice(0, 90) || "未命名";
+}
+
+/** Keep the PID suffix intact when a long product name must be truncated. */
+export function productDocumentStableTitle(productName: string, pid: string) {
+  const normalizedPid = sanitizedName(pid);
+  if (!normalizedPid) throw new Error("创建产品文档前必须有 PID");
+  const suffix = `_${normalizedPid}`;
+  const normalizedName = sanitizedName(productName) || "未命名";
+  const prefixLength = Math.max(1, 90 - suffix.length);
+  return `${normalizedName.slice(0, prefixLength)}${suffix}`;
 }
 
 function md(value: string | null | undefined) {
@@ -305,6 +388,264 @@ async function documentUrl(client: Client, documentId: string) {
   return meta.data?.metas?.[0]?.url || `https://feishu.cn/docx/${documentId}`;
 }
 
+type ProductFolderOwner = {
+  folderToken: string;
+  folderName: string;
+  ownerId: string;
+  ownerMemberType: "openid";
+  ownerSource: "input" | "environment";
+  folderMetaOwnerId: string;
+};
+
+function resolveProductDocumentOwnerOpenId(inputOwnerOpenId?: string) {
+  const input = inputOwnerOpenId?.trim();
+  const ownerOpenId = input || process.env.FEISHU_PRODUCT_DOCUMENT_OWNER_OPEN_ID?.trim();
+  if (!ownerOpenId) {
+    throw new Error("缺少产品文档所有者 OpenID，请配置 FEISHU_PRODUCT_DOCUMENT_OWNER_OPEN_ID");
+  }
+  if (!/^ou_[A-Za-z0-9_-]+$/.test(ownerOpenId)) {
+    throw new Error("产品文档所有者 OpenID 格式不正确，应以 ou_ 开头");
+  }
+  return { ownerOpenId, ownerSource: input ? "input" as const : "environment" as const };
+}
+
+/** Verify folder access and the exact user/group permissions needed by automation. */
+export async function validateProductDocumentFolder(
+  client: Client,
+  folderTokenValue: string,
+  inputOwnerOpenId?: string,
+): Promise<ProductFolderOwner> {
+  const folderToken = requiredToken(folderTokenValue, "飞书产品文档文件夹 Token");
+  const { ownerOpenId, ownerSource } = resolveProductDocumentOwnerOpenId(inputOwnerOpenId);
+  let response: {
+    code?: number;
+    msg?: string;
+    data?: { id?: string; name?: string; token?: string; ownUid?: string };
+  };
+  try {
+    response = await client.request({
+      url: `/open-apis/drive/explorer/v2/folder/${encodeURIComponent(folderToken)}/meta`,
+      method: "GET",
+    });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`读取飞书产品文档文件夹信息失败：${detail}`);
+  }
+  productDocumentApiError(response, "读取飞书产品文档文件夹信息失败");
+  let membersResponse: Awaited<ReturnType<typeof client.drive.v1.permissionMember.list>>;
+  try {
+    membersResponse = await client.drive.v1.permissionMember.list({
+      path: { token: folderToken },
+      params: { type: "folder", fields: "name,type" },
+    });
+  } catch (error) {
+    throw productDocumentOperationError("读取产品文档文件夹协作者失败", error);
+  }
+  productDocumentApiError(membersResponse, "读取产品文档文件夹协作者失败");
+  const members = membersResponse.data?.items || [];
+  const ownerMember = members.find((member) => member.member_type === "openid"
+    && member.type === "user"
+    && member.member_id === ownerOpenId
+    && member.perm === "full_access");
+  if (!ownerMember) {
+    throw new Error("产品文档所有者 OpenID 不是该文件夹的直接可管理用户，请在飞书分享中将该用户设为“可管理”");
+  }
+  const managingGroup = members.find((member) => member.member_type === "openchat"
+    && member.type === "chat"
+    && member.perm === "full_access");
+  if (!managingGroup) {
+    throw new Error("产品文档文件夹缺少可管理群协作者，请将包含“爆片拆解”机器人的群设为“可管理”");
+  }
+  return {
+    folderToken,
+    folderName: response.data?.name?.trim() || "产品说明文档",
+    ownerId: ownerOpenId,
+    ownerMemberType: "openid",
+    ownerSource,
+    // Kept only for diagnostics. ownUid is not accepted by transfer_owner.
+    folderMetaOwnerId: response.data?.ownUid?.trim() || "",
+  };
+}
+
+async function resolveProductFolderOwner(
+  client: Client,
+  folderToken: string,
+  ownerOpenId?: string,
+): Promise<ProductFolderOwner> {
+  return validateProductDocumentFolder(client, folderToken, ownerOpenId);
+}
+
+async function getProductDocumentOwner(
+  client: Client,
+  documentTokenValue: string,
+) {
+  const documentToken = requiredToken(documentTokenValue, "飞书产品文档 Token");
+  let response: Awaited<ReturnType<typeof client.drive.v1.meta.batchQuery>>;
+  try {
+    response = await client.drive.v1.meta.batchQuery({
+      params: { user_id_type: "open_id" },
+      data: { request_docs: [{ doc_token: documentToken, doc_type: "docx" }] },
+    });
+  } catch (error) {
+    throw productDocumentOperationError("读取飞书产品文档所有者失败", error);
+  }
+  productDocumentApiError(response, "读取飞书产品文档所有者失败");
+  const failed = response.data?.failed_list?.find((item) => item.token === documentToken);
+  if (failed) {
+    throw productDocumentOperationError("读取飞书产品文档所有者失败", {
+      code: failed.code,
+      msg: `文档元数据查询失败（${failed.code}）`,
+    });
+  }
+  const ownerId = response.data?.metas?.find((item) => item.doc_token === documentToken)?.owner_id?.trim();
+  if (!ownerId) throw new Error("飞书产品文档没有返回所有者 ID，无法确认所有权状态");
+  return ownerId;
+}
+
+async function isProductDocumentInFolder(client: Client, documentToken: string, folderToken: string) {
+  let pageToken: string | undefined;
+  do {
+    let response: Awaited<ReturnType<typeof client.drive.v1.file.list>>;
+    try {
+      response = await client.drive.v1.file.list({
+        params: { folder_token: folderToken, page_size: 200, ...(pageToken ? { page_token: pageToken } : {}) },
+      });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(`检查产品文档所在文件夹失败：${detail}`);
+    }
+    productDocumentApiError(response, "检查产品文档所在文件夹失败");
+    if (response.data?.files?.some((file) => file.token === documentToken && file.type === "docx")) return true;
+    if (!response.data?.has_more) return false;
+    pageToken = response.data.next_page_token?.trim();
+    if (!pageToken) throw new Error("检查产品文档所在文件夹失败：飞书分页结果缺少下一页 Token");
+  } while (pageToken);
+  return false;
+}
+
+async function findProductDocumentByTitle(client: Client, folderToken: string, title: string) {
+  let pageToken: string | undefined;
+  do {
+    let response: Awaited<ReturnType<typeof client.drive.v1.file.list>>;
+    try {
+      response = await client.drive.v1.file.list({
+        params: {
+          folder_token: folderToken,
+          page_size: 200,
+          order_by: "EditedTime",
+          direction: "DESC",
+          ...(pageToken ? { page_token: pageToken } : {}),
+        },
+      });
+    } catch (error) {
+      throw productDocumentOperationError("查找已有同名产品文档失败", error);
+    }
+    productDocumentApiError(response, "查找已有同名产品文档失败");
+    const match = response.data?.files?.find((file) => file.type === "docx" && file.name === title);
+    if (match?.token) {
+      return {
+        documentId: match.token,
+        documentUrl: match.url || `https://feishu.cn/docx/${match.token}`,
+        title: match.name || title,
+        type: "docx",
+      };
+    }
+    if (!response.data?.has_more) return null;
+    pageToken = response.data.next_page_token?.trim();
+    if (!pageToken) throw new Error("查找已有同名产品文档失败：飞书分页结果缺少下一页 Token");
+  } while (pageToken);
+  return null;
+}
+
+async function moveProductDocument(client: Client, documentToken: string, folderToken: string) {
+  let response: Awaited<ReturnType<typeof client.drive.v1.file.move>>;
+  try {
+    response = await client.drive.v1.file.move({
+      path: { file_token: documentToken },
+      data: { type: "docx", folder_token: folderToken },
+    });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`移动产品文档到“产品说明文档”文件夹失败：${detail}`);
+  }
+  productDocumentApiError(response, "移动产品文档到“产品说明文档”文件夹失败");
+}
+
+async function transferProductDocumentOwner(
+  client: Client,
+  documentToken: string,
+  owner: ProductFolderOwner,
+) {
+  let response: Awaited<ReturnType<typeof client.drive.v1.permissionMember.transferOwner>>;
+  try {
+    response = await client.drive.v1.permissionMember.transferOwner({
+      path: { token: documentToken },
+      params: {
+        type: "docx",
+        need_notification: false,
+        stay_put: true,
+        remove_old_owner: false,
+        old_owner_perm: "full_access",
+      },
+      data: { member_type: owner.ownerMemberType, member_id: owner.ownerId },
+    });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`将产品文档所有者转为目标文件夹所有者失败：${detail}`);
+  }
+  productDocumentApiError(response, "将产品文档所有者转为目标文件夹所有者失败");
+}
+
+async function ensureProductDocumentOwner(
+  client: Client,
+  documentToken: string,
+  owner: ProductFolderOwner,
+) {
+  const currentOwnerId = await getProductDocumentOwner(client, documentToken);
+  if (currentOwnerId === owner.ownerId) return false;
+  await transferProductDocumentOwner(client, documentToken, owner);
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    if (attempt > 0) await throttle();
+    const verifiedOwnerId = await getProductDocumentOwner(client, documentToken);
+    if (verifiedOwnerId === owner.ownerId) return true;
+  }
+  throw new Error("飞书返回所有权转移成功，但复核时文档所有者仍未变更");
+}
+
+/** Explicit, idempotent migration used by the administrative migration API. */
+export async function migrateProductDocument(
+  client: Client,
+  input: { documentToken: string; folderToken: string; ownerOpenId?: string },
+) {
+  const documentToken = requiredToken(input.documentToken, "飞书产品文档 Token");
+  const folderToken = requiredToken(input.folderToken, "飞书产品文档文件夹 Token");
+  const owner = await resolveProductFolderOwner(client, folderToken, input.ownerOpenId);
+  const alreadyInFolder = await isProductDocumentInFolder(client, documentToken, folderToken);
+  if (!alreadyInFolder) {
+    await moveProductDocument(client, documentToken, folderToken);
+    let moveVerified = false;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      if (attempt > 0) await throttle();
+      if (await isProductDocumentInFolder(client, documentToken, folderToken)) {
+        moveVerified = true;
+        break;
+      }
+    }
+    if (!moveVerified) {
+      throw new Error("飞书返回文档移动成功，但复核时目标文件夹中仍未找到该文档");
+    }
+  }
+  const ownershipTransferred = await ensureProductDocumentOwner(client, documentToken, owner);
+  return {
+    moved: !alreadyInFolder,
+    ownershipTransferred,
+    ownerId: owner.ownerId,
+    ownerMemberType: owner.ownerMemberType,
+    ownerSource: owner.ownerSource,
+    folderName: owner.folderName,
+  };
+}
+
 export async function copyFeishuTemplateDocument(
   client: Client,
   input: { templateToken: string; name: string; folderToken?: string },
@@ -313,20 +654,25 @@ export async function copyFeishuTemplateDocument(
   const name = safeName(input.name);
   if (!templateToken) throw new Error("缺少飞书模板文档 Token");
 
-  const response = await client.request<{
+  let response: {
     code?: number;
     msg?: string;
     data?: { file?: { token?: string; url?: string; name?: string; type?: string } };
-  }>({
-    url: `/open-apis/drive/v1/files/${encodeURIComponent(templateToken)}/copy`,
-    method: "POST",
-    data: {
-      name,
-      type: "docx",
-      folder_token: input.folderToken?.trim() || "",
-    },
-  });
-  apiError(response, "复制飞书产品文档模板失败");
+  };
+  try {
+    response = await client.request({
+      url: `/open-apis/drive/v1/files/${encodeURIComponent(templateToken)}/copy`,
+      method: "POST",
+      data: {
+        name,
+        type: "docx",
+        folder_token: input.folderToken?.trim() || "",
+      },
+    });
+  } catch (error) {
+    throw productDocumentOperationError("复制飞书产品文档模板失败", error);
+  }
+  productDocumentApiError(response, "复制飞书产品文档模板失败");
   const file = response.data?.file;
   if (!file?.token) throw new Error("飞书复制模板成功，但没有返回新文档 Token");
   return {
@@ -580,41 +926,91 @@ function styledProductFieldElements(content: string, productUrl: string): Feishu
   return elements;
 }
 
+type EnsureProductDocumentInput = {
+  templateToken?: string;
+  coreFunctions?: string[];
+  productParameters?: string;
+  usageMethod?: string;
+  audience?: string;
+  scenes?: string;
+  sellingPoints?: string;
+  propImages?: string[];
+  /** Move an already-linked legacy document; normal refreshes never move it. */
+  migrateExisting?: boolean;
+  /** Explicit target owner; otherwise FEISHU_PRODUCT_DOCUMENT_OWNER_OPEN_ID is required. */
+  ownerOpenId?: string;
+};
+
 export async function ensureProductDocument(
   client: Client,
   product: Product,
-  input: {
-    templateToken?: string;
-    coreFunctions?: string[];
-    productParameters?: string;
-    usageMethod?: string;
-    audience?: string;
-    scenes?: string;
-    sellingPoints?: string;
-    propImages?: string[];
-  } = {},
+  input: EnsureProductDocumentInput = {},
+) {
+  return withProductDocumentLock(product.id, () => ensureProductDocumentUnlocked(client, product, input));
+}
+
+async function ensureProductDocumentUnlocked(
+  client: Client,
+  product: Product,
+  input: EnsureProductDocumentInput,
 ) {
   if (!product.pid.trim()) throw new Error("创建产品文档前必须有 PID");
 
+  let currentProduct = product;
   const settings = getFeishuSettings();
-  const reused = Boolean(product.documentId && product.documentUrl);
-  const copied = reused
-    ? { documentId: String(product.documentId), documentUrl: String(product.documentUrl), title: safeName(`${product.name}_${product.pid}`), type: "docx" }
-    : await copyFeishuTemplateDocument(client, {
+  const productFolderToken = requiredToken(
+    settings.productFolderToken,
+    "飞书产品文档文件夹配置，请先配置“产品说明文档”文件夹",
+  );
+  const owner = await resolveProductFolderOwner(client, productFolderToken, input.ownerOpenId);
+  const stableTitle = productDocumentStableTitle(currentProduct.name, currentProduct.pid);
+  let copied: { documentId: string; documentUrl: string; title: string; type: string } | null = null;
+  let reused = false;
+
+  if (currentProduct.documentId && currentProduct.documentUrl) {
+    try {
+      await getProductDocumentOwner(client, currentProduct.documentId);
+      copied = {
+        documentId: currentProduct.documentId,
+        documentUrl: currentProduct.documentUrl,
+        title: stableTitle,
+        type: "docx",
+      };
+      reused = true;
+    } catch (error) {
+      if (!isMissingProductDocumentError(error)) throw error;
+      const cleared = clearProductDocumentLink(currentProduct.id);
+      if (!cleared) throw new Error("清理已删除的飞书产品文档关联失败：产品不存在");
+      currentProduct = cleared;
+    }
+  } else if (currentProduct.documentId || currentProduct.documentUrl) {
+    const cleared = clearProductDocumentLink(currentProduct.id);
+    if (!cleared) throw new Error("清理不完整的飞书产品文档关联失败：产品不存在");
+    currentProduct = cleared;
+  }
+
+  if (!copied) {
+    const existing = await findProductDocumentByTitle(client, productFolderToken, stableTitle);
+    copied = existing || await copyFeishuTemplateDocument(client, {
       templateToken: input.templateToken?.trim() || process.env.FEISHU_PRODUCT_TEMPLATE_TOKEN?.trim() || defaultProductTemplateToken,
-      name: safeName(`${product.name}_${product.pid}`),
-      folderToken: settings.rootFolderToken || undefined,
+      name: stableTitle,
+      folderToken: productFolderToken,
     });
+    reused = Boolean(existing);
+    // Persist an adopted/copy result before any later API call. If the copy
+    // response itself is lost, the next attempt adopts the stable-title file.
+    updateProduct(currentProduct.id, { documentId: copied.documentId, documentUrl: copied.documentUrl });
+  }
   let permissionWarning = "";
   try { await setCompanyManaged(client, copied.documentId); }
   catch (error) { permissionWarning = error instanceof Error ? error.message : "设置公司内管理权限失败"; }
   const blocks = await listFeishuDocumentBlocks(client, copied.documentId);
   const functions = [...(input.coreFunctions || [])].slice(0, 5);
   const values: Record<string, string> = {
-    商品名称: product.name,
-    产品链接: product.productUrl,
-    商品ID: product.pid,
-    SKU: product.sku,
+    商品名称: currentProduct.name,
+    产品链接: currentProduct.productUrl,
+    商品ID: currentProduct.pid,
+    SKU: currentProduct.sku,
     核心功能: functions.join("；"),
     // “产品主要功能”已经展示同一组信息，A-E 暂时统一留空。
     核心功能A: "",
@@ -624,13 +1020,13 @@ export async function ensureProductDocument(
     核心功能E: "",
     产品参数: input.productParameters || "",
     使用方法: input.usageMethod || "",
-    适用人群: input.audience || product.targetAudience,
+    适用人群: input.audience || currentProduct.targetAudience,
     使用场景: input.scenes || "",
     产品卖点: "",
     道具列表: "图片1：员工手动录入\n图片2：员工手动录入\n图片3：员工手动录入",
-    图片1: input.propImages?.[0] || product.propImages?.[0] || "",
-    图片2: input.propImages?.[1] || product.propImages?.[1] || "",
-    图片3: input.propImages?.[2] || product.propImages?.[2] || "",
+    图片1: input.propImages?.[0] || currentProduct.propImages?.[0] || "",
+    图片2: input.propImages?.[1] || currentProduct.propImages?.[1] || "",
+    图片3: input.propImages?.[2] || currentProduct.propImages?.[2] || "",
   };
   for (const block of blocks) {
     const text = block.text as { elements?: Array<{ text_run?: { content?: string; text_element_style?: { link?: { url?: string } } } }> } | undefined;
@@ -639,19 +1035,42 @@ export async function ensureProductDocument(
     // the field name used by all future tables.
     if (!content) continue;
     const next = syncProductFieldText(content, values);
-    const isProductLink = next.includes("产品链接") && next.includes(product.productUrl);
-    const hasExpectedLink = text?.elements?.some((element) => element.text_run?.text_element_style?.link?.url === product.productUrl);
+    const isProductLink = next.includes("产品链接") && next.includes(currentProduct.productUrl);
+    const hasExpectedLink = text?.elements?.some((element) => element.text_run?.text_element_style?.link?.url === currentProduct.productUrl);
     if ((next !== content || isProductLink && !hasExpectedLink) && block.block_id) {
       await updateFeishuTextBlockElements(
         client,
         copied.documentId,
         String(block.block_id),
-        styledProductFieldElements(next, product.productUrl),
+        styledProductFieldElements(next, currentProduct.productUrl),
       );
     }
   }
-  updateProduct(product.id, { documentId: copied.documentId, documentUrl: copied.documentUrl });
-  return { ...copied, reused, permissionWarning };
+  // Ownership changes happen only after every template field has been written.
+  // A reused legacy document may be moved only through the explicit migration
+  // switch/API, while an ordinary refresh merely repairs ownership if needed.
+  let migration: Awaited<ReturnType<typeof migrateProductDocument>> | undefined;
+  if (reused && input.migrateExisting) {
+    migration = await migrateProductDocument(client, {
+      documentToken: copied.documentId,
+      folderToken: productFolderToken,
+      ownerOpenId: input.ownerOpenId,
+    });
+  } else {
+    const ownershipTransferred = await ensureProductDocumentOwner(client, copied.documentId, owner);
+    migration = {
+      moved: false,
+      ownershipTransferred,
+      ownerId: owner.ownerId,
+      ownerMemberType: owner.ownerMemberType,
+      ownerSource: owner.ownerSource,
+      folderName: owner.folderName,
+    };
+  }
+  if (reused) {
+    updateProduct(currentProduct.id, { documentId: copied.documentId, documentUrl: copied.documentUrl });
+  }
+  return { ...copied, reused, permissionWarning, migration };
 }
 
 export async function insertFeishuTextBlocks(

@@ -261,6 +261,8 @@ export interface FeishuSettings {
   publicBaseUrl: string;
   rootFolderToken: string;
   rootFolderUrl: string;
+  productFolderToken: string;
+  productFolderUrl: string;
   connectionStatus: FeishuConnectionState;
   lastError: string;
   connectedAt: string | null;

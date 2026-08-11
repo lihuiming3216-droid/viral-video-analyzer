@@ -24,6 +24,8 @@ function settingsFromRow(row: Record<string, unknown>): FeishuSettings {
     publicBaseUrl: text(row.public_base_url) || "http://localhost:3000",
     rootFolderToken: text(row.root_folder_token),
     rootFolderUrl: text(row.root_folder_url),
+    productFolderToken: text(row.product_folder_token),
+    productFolderUrl: text(row.product_folder_url),
     connectionStatus: text(row.connection_status || "disconnected") as FeishuConnectionState,
     lastError: text(row.last_error),
     connectedAt: nullable(row.connected_at),
@@ -78,23 +80,33 @@ export function saveFeishuSettings(input: {
   publicBaseUrl: string;
   rootFolderToken?: string;
   rootFolderUrl?: string;
-}) {
+  productFolderToken?: string;
+  productFolderUrl?: string;
+}, options: { clearReportFolderCache?: boolean } = {}) {
   const current = getRawFeishuSettings();
   const secret = input.encryptedAppSecret === undefined
     ? current.encrypted_app_secret ? String(current.encrypted_app_secret) : null
     : input.encryptedAppSecret;
   const previousRoot = text(current.root_folder_token);
   const nextRoot = input.rootFolderToken?.trim() ?? previousRoot;
+  const nextProductFolder = input.productFolderToken?.trim() ?? text(current.product_folder_token);
+  const nextProductFolderUrl = input.productFolderUrl?.trim() ?? text(current.product_folder_url);
   getDb().prepare(`UPDATE feishu_settings SET
     app_id=?, encrypted_app_secret=?, enabled=?, public_base_url=?, root_folder_token=?, root_folder_url=?,
+    product_folder_token=?, product_folder_url=?,
     connection_status='disconnected', last_error='', connected_at=NULL, updated_at=? WHERE id=1`)
     .run(
       input.appId.trim(), secret, input.enabled ? 1 : 0,
       input.publicBaseUrl.trim().replace(/\/+$/, "") || "http://localhost:3000",
-      nextRoot, input.rootFolderUrl?.trim() ?? text(current.root_folder_url), now(),
+      nextRoot, input.rootFolderUrl?.trim() ?? text(current.root_folder_url),
+      nextProductFolder, nextProductFolderUrl, now(),
     );
-  if (previousRoot !== nextRoot) getDb().prepare("DELETE FROM feishu_folders").run();
+  if (previousRoot !== nextRoot && options.clearReportFolderCache !== false) clearFeishuFolderCache();
   return getFeishuSettings();
+}
+
+export function clearFeishuFolderCache() {
+  getDb().prepare("DELETE FROM feishu_folders").run();
 }
 
 export function setFeishuConnectionStatus(status: FeishuConnectionState, error = "") {
@@ -106,6 +118,12 @@ export function setFeishuConnectionStatus(status: FeishuConnectionState, error =
 export function setFeishuRootFolder(folderToken: string, folderUrl = "") {
   getDb().prepare("UPDATE feishu_settings SET root_folder_token=?, root_folder_url=?, updated_at=? WHERE id=1")
     .run(folderToken, folderUrl, now());
+  return getFeishuSettings();
+}
+
+export function setFeishuProductFolder(folderToken: string, folderUrl = "") {
+  getDb().prepare("UPDATE feishu_settings SET product_folder_token=?, product_folder_url=?, updated_at=? WHERE id=1")
+    .run(folderToken.trim(), folderUrl.trim(), now());
   return getFeishuSettings();
 }
 

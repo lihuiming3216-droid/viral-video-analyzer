@@ -328,7 +328,10 @@ test("product cards use verified TikTok evidence and resync reused documents", a
   assert.match(document, /核心功能: functions\.join\("；"\)/);
   assert.match(document, /values\[`核心功能\$\{ranked\[2\]\.toUpperCase\(\)\}`\] \|\| ""/);
   assert.match(document, /next = `\$\{ranked\[1\]\}\$\{value\}`/);
-  assert.match(document, /const reused = Boolean\(product\.documentId && product\.documentUrl\)/);
+  assert.match(document, /let reused = false/);
+  assert.match(document, /findProductDocumentByTitle/);
+  assert.match(document, /clearProductDocumentLink/);
+  assert.match(document, /withProductDocumentLock/);
 });
 
 test("long-term learning is visible and used by future analysis", async () => {

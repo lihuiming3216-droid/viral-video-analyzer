@@ -2286,6 +2286,57 @@ export function createProductPageCollectionDriver(page: Page): ProductPageCollec
 
 let browserQueue: Promise<void> = Promise.resolve();
 
+export function shouldRetryProductPageCapture(result: ProductPageCollectionResult | null) {
+  return !result || result.errorCode === "page_unavailable";
+}
+
+type ChromiumModule = typeof import("playwright-core");
+
+async function runProductPageBrowserAttempt(
+  chromium: ChromiumModule["chromium"],
+  executablePath: string,
+  productUrl: string,
+  profileDir = "",
+): Promise<ProductPageCollectionResult | null> {
+  let persistent: Awaited<ReturnType<ChromiumModule["chromium"]["launchPersistentContext"]>> | null = null;
+  let browser: Awaited<ReturnType<ChromiumModule["chromium"]["launch"]>> | null = null;
+  try {
+    persistent = profileDir
+      ? await chromium.launchPersistentContext(profileDir, {
+          executablePath,
+          headless: true,
+          locale: "en-US",
+          userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
+          viewport: { width: 1280, height: 900 },
+          args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+        })
+      : null;
+    browser = persistent ? null : await chromium.launch({
+      executablePath,
+      headless: true,
+      args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+    });
+    const page = persistent
+      ? persistent.pages()[0] || await persistent.newPage()
+      : await browser!.newPage({
+          locale: "en-US",
+          userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
+          viewport: { width: 1280, height: 900 },
+        });
+    return await collectProductPageWithDriver(createProductPageCollectionDriver(page), productUrl);
+  } catch {
+    return null;
+  } finally {
+    try {
+      if (persistent) await persistent.close();
+      else await browser?.close();
+    } catch {
+      // Closing a failed browser attempt must not hide a successful capture or
+      // prevent the one permitted fresh-context recovery attempt.
+    }
+  }
+}
+
 async function readExpandedProductPage(productUrl: string): Promise<ProductPageCollectionResult | null> {
   const previous = browserQueue;
   let release!: () => void;
@@ -2297,34 +2348,28 @@ async function readExpandedProductPage(productUrl: string): Promise<ProductPageC
     const { chromium } = await import("playwright-core");
     const profileDir = process.env.TIKTOK_CHROMIUM_PROFILE_DIR?.trim()
       || "/app/.data/tiktok-chromium-interactive";
-    const persistent = existsSync(profileDir)
-      ? await chromium.launchPersistentContext(profileDir, {
-          executablePath,
-          headless: true,
-          locale: "en-US",
-          userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
-          viewport: { width: 1280, height: 900 },
-          args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
-        })
-      : null;
-    const browser = persistent ? null : await chromium.launch({
+    const hasPersistentProfile = existsSync(profileDir);
+    const primary = await runProductPageBrowserAttempt(
+      chromium,
       executablePath,
-      headless: true,
-      args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+      productUrl,
+      hasPersistentProfile ? profileDir : "",
+    );
+    if (!hasPersistentProfile || !shouldRetryProductPageCapture(primary)) return primary;
+
+    const pid = productIdFromOfficialTikTokPath(productUrl);
+    console.warn("[product-parser] retrying page capture in a fresh browser context", {
+      pid,
+      firstAttempt: primary?.errorCode || "browser_error",
     });
-    try {
-      const page = persistent
-        ? persistent.pages()[0] || await persistent.newPage()
-        : await browser!.newPage({
-            locale: "en-US",
-            userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
-            viewport: { width: 1280, height: 900 },
-          });
-      return collectProductPageWithDriver(createProductPageCollectionDriver(page), productUrl);
-    } finally {
-      if (persistent) await persistent.close();
-      else await browser?.close();
+    const recovered = await runProductPageBrowserAttempt(chromium, executablePath, productUrl);
+    if (shouldRetryProductPageCapture(recovered)) {
+      console.warn("[product-parser] fresh browser page capture unavailable", {
+        pid,
+        result: recovered?.errorCode || "browser_error",
+      });
     }
+    return recovered || primary;
   } catch {
     return null;
   } finally {

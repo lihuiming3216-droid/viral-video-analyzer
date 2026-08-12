@@ -285,7 +285,7 @@ test("product cards use verified TikTok evidence and resync reused documents", a
   assert.match(parser, /explicitBundleCount/);
   assert.match(parser, /enumeratedBundleFeatures/);
   assert.match(parser, /qwenTranslateBundleFeatures/);
-  assert.match(parser, /productParameters: moreDetailed\(current\.productParameters, candidate\.productParameters\)/);
+  assert.match(parser, /productParameters: mergeAtomicText\(current\.productParameters, candidate\.productParameters\)/);
   assert.match(parser, /numericSpecificationCount/);
   assert.match(parser, /coreFunctions 必须恰好返回 \$\{bundleOutputCount\} 条/);
   assert.match(parser, /temperature: 0/);
@@ -319,7 +319,8 @@ test("product cards use verified TikTok evidence and resync reused documents", a
   assert.doesNotMatch(automation, /productUrlFromPid\(pid\)/);
   assert.doesNotMatch(automation, /patch\[resolved\.map\.productUrl\]/);
   assert.doesNotMatch(automation, /hyperlinkFieldValue/);
-  assert.match(automation, /visualAnalyzedAt: new Date\(\)\.toISOString\(\)/);
+  assert.match(automation, /mergeVerifiedProductFacts/);
+  assert.match(automation, /verifiedAt: new Date\(\)\.toISOString\(\)/);
   assert.match(ensureDocument, /forceProductParse === true/);
   assert.match(ensureDocument, /const productUrl = String\(body\.productUrl \|\| ""\)\.trim\(\)/);
   assert.match(ensureDocument, /isExactTikTokProductSource\(productUrl, pid\)/);

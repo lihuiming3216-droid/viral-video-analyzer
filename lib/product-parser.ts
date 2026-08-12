@@ -20,6 +20,15 @@ export interface ParsedProductInfo {
   sourceImageUrls: string[];
   visualEvidence: string;
   visualAnalysisStatus: "completed" | "unavailable";
+  verification?: {
+    status: "complete" | "partial";
+    verifiedFactCount: number;
+    rejectedFactCount: number;
+    verifiedFields: string[];
+    missingFields: string[];
+    sourceUrl: string;
+    evidenceVersion: string;
+  };
 }
 
 export interface ProductParseHints {
@@ -57,6 +66,10 @@ export function extractProductIdFromUrl(productUrl: string) {
 
 const MAX_PRODUCT_IMAGES = 8;
 const MAX_IMAGE_PIXELS = 768 * 768;
+const PRODUCT_EVIDENCE_VERSION = "exact-pdp-atomic-v1";
+const VERIFIED_PRODUCT_FIELDS = [
+  "sku", "coreFunctions", "productParameters", "usageMethod", "audience", "scenes",
+] as const;
 
 function clean(value: unknown) {
   return String(value || "").replace(/\s+/g, " ").trim();
@@ -179,6 +192,55 @@ export function hasUsableProductInfo(info: {
   return hasSourceEvidence && functions.length >= 1 && descriptiveFields.length >= minimumDescriptiveFields;
 }
 
+function productFactGroups(info: Pick<ParsedProductInfo,
+  "sku" | "coreFunctions" | "productParameters" | "usageMethod" | "audience" | "scenes"
+>) {
+  return {
+    sku: fieldClaims(info.sku),
+    coreFunctions: (info.coreFunctions || []).map(cleanFunction).filter(Boolean),
+    productParameters: fieldClaims(info.productParameters),
+    usageMethod: fieldClaims(info.usageMethod),
+    audience: fieldClaims(info.audience),
+    scenes: fieldClaims(info.scenes),
+  };
+}
+
+function withProductVerification(
+  info: ParsedProductInfo,
+  sourceUrl: string,
+  rejectedFactCount = 0,
+) {
+  const groups = productFactGroups(info);
+  const verifiedFields = VERIFIED_PRODUCT_FIELDS.filter((field) => groups[field].length > 0);
+  const missingFields = VERIFIED_PRODUCT_FIELDS.filter((field) => groups[field].length === 0);
+  const verifiedFactCount = VERIFIED_PRODUCT_FIELDS.reduce((total, field) => total + groups[field].length, 0);
+  const sourcePid = productIdFromOfficialTikTokPath(sourceUrl);
+  const exactSourceUrl = sourcePid && isExactTikTokProductSource(sourceUrl, sourcePid) ? sourceUrl : "";
+  return {
+    ...info,
+    verification: {
+      status: missingFields.length === 0 && rejectedFactCount === 0 ? "complete" as const : "partial" as const,
+      verifiedFactCount,
+      rejectedFactCount: Math.max(0, rejectedFactCount),
+      verifiedFields: [...verifiedFields],
+      missingFields: [...missingFields],
+      sourceUrl: exactSourceUrl,
+      evidenceVersion: PRODUCT_EVIDENCE_VERSION,
+    },
+  };
+}
+
+function hasVerifiedProductFacts(info: ParsedProductInfo | null | undefined) {
+  if (!info) return false;
+  if (info.verification) return info.verification.verifiedFactCount > 0;
+  const groups = productFactGroups(info);
+  return VERIFIED_PRODUCT_FIELDS.reduce((total, field) => total + groups[field].length, 0) > 0;
+}
+
+function mergeAtomicText(left: string, right: string) {
+  return [...new Set([...fieldClaims(left), ...fieldClaims(right)])].join("；");
+}
+
 function explicitBundleCount(evidenceText: string) {
   const matches = [
     ...evidenceText.matchAll(/\b([2-9])\s*[-‑–]?in[-‑–]?1\b/gi),
@@ -232,25 +294,27 @@ function preferMoreCompleteProductInfo(current: ParsedProductInfo | null, candid
   if (!current) return candidate;
   if (!candidate) return current;
   const preferred = productInfoScore(candidate) > productInfoScore(current) ? candidate : current;
-  const moreDetailed = (left: string, right: string) => {
-    if (!useful(left)) return right;
-    if (!useful(right)) return left;
-    return clean(left).length >= clean(right).length ? left : right;
-  };
-  return {
+  const merged = {
     ...preferred,
-    sku: moreDetailed(current.sku, candidate.sku),
-    coreFunctions: current.coreFunctions.length >= candidate.coreFunctions.length
-      ? current.coreFunctions
-      : candidate.coreFunctions,
-    productParameters: moreDetailed(current.productParameters, candidate.productParameters),
-    usageMethod: moreDetailed(current.usageMethod, candidate.usageMethod),
-    audience: moreDetailed(current.audience, candidate.audience),
-    scenes: moreDetailed(current.scenes, candidate.scenes),
+    sku: mergeAtomicText(current.sku, candidate.sku),
+    coreFunctions: [...new Set([...current.coreFunctions, ...candidate.coreFunctions])].slice(0, 5),
+    productParameters: mergeAtomicText(current.productParameters, candidate.productParameters),
+    usageMethod: mergeAtomicText(current.usageMethod, candidate.usageMethod),
+    audience: mergeAtomicText(current.audience, candidate.audience),
+    scenes: mergeAtomicText(current.scenes, candidate.scenes),
     visualEvidence: hasReliableVisualEvidence(current.visualEvidence)
       ? current.visualEvidence
       : candidate.visualEvidence,
   };
+  const sourceUrl = current.verification?.sourceUrl || candidate.verification?.sourceUrl || "";
+  // A completeness retry re-evaluates the same requested facts. Counting both
+  // passes would inflate rejection telemetry rather than describe distinct
+  // rejected claims, so retain the larger independently observed count.
+  const rejectedFactCount = Math.max(
+    current.verification?.rejectedFactCount || 0,
+    candidate.verification?.rejectedFactCount || 0,
+  );
+  return withProductVerification(merged, sourceUrl, rejectedFactCount);
 }
 
 function htmlText(html: string) {
@@ -409,6 +473,87 @@ function hasAffirmedSlugPhrase(evidence: string, phrase: RegExp) {
   return affirmed;
 }
 
+const ACCESSORY_NOUNS: Array<{ key: string; pattern: RegExp }> = [
+  { key: "accessory", pattern: /\baccessor(?:y|ies)\b/i },
+  { key: "pouch", pattern: /\b(?:travel\s+)?pouch(?:es)?\b/i },
+  { key: "sleeve", pattern: /\bsleeves?\b/i },
+  { key: "cover", pattern: /\bcovers?\b/i },
+  { key: "holster", pattern: /\bholsters?\b/i },
+  { key: "mount", pattern: /\bmounts?\b/i },
+  { key: "stand", pattern: /\bstands?\b/i },
+  { key: "cable", pattern: /\bcables?\b/i },
+  { key: "charger", pattern: /\bchargers?\b/i },
+  { key: "dock", pattern: /\bdocks?\b/i },
+  { key: "strap", pattern: /\bstraps?\b/i },
+  { key: "holder", pattern: /\bholders?\b/i },
+  { key: "bracket", pattern: /\bbrackets?\b/i },
+  { key: "case", pattern: /\b(?:carry(?:ing)?\s+|travel\s+)?cases?\b/i },
+  { key: "bag", pattern: /\b(?:carry(?:ing)?\s+|travel\s+)?bags?\b/i },
+  { key: "adapter", pattern: /\badapters?\b/i },
+  { key: "remote", pattern: /\bremote(?:\s+controls?)?\b/i },
+];
+
+function accessoryNouns(value: string) {
+  return new Set(ACCESSORY_NOUNS
+    .filter(({ pattern }) => pattern.test(clean(value)))
+    .map(({ key }) => key));
+}
+
+function mainProductAccessoryNouns(sourceText: string) {
+  const explicitTitle = String(sourceText || "").match(/(?:^|\n)商品标题[：:]\s*([^\n]+)/i)?.[1];
+  const title = clean(explicitTitle || sourceText);
+  // Nouns after a bundle relation describe secondary objects, not the main
+  // product category (for example, "camera with travel pouch").
+  const head = title.split(/\b(?:with|includes?|included|comes?\s+with|bundled\s+with|supplied\s+with)\b/i)[0];
+  return accessoryNouns(head);
+}
+
+/**
+ * Product cards describe the purchased main product, not an included/optional
+ * accessory. Until accessory facts have their own modeled subject, any claim
+ * whose local evidence assigns the capability to a bag, carrying case,
+ * adapter, remote, or separately sold accessory must fail closed.
+ */
+function hasAccessorySubjectContext(value: string, sourceText = value) {
+  const context = clean(value);
+  const nouns = accessoryNouns(context);
+  if (!nouns.size) return /\b(?:sold\s+separately|for\s+accessor(?:y|ies))\b/i.test(context);
+  const mainNouns = mainProductAccessoryNouns(sourceText);
+  const secondaryNouns = [...nouns].filter((noun) => !mainNouns.has(noun));
+  if (secondaryNouns.length) return true;
+  // Even a noun that matches the main category is secondary when a sentence
+  // explicitly introduces another instance as bundled/optional equipment.
+  return /\b(?:includes?|included|comes?\s+with|bundled\s+with|supplied\s+with|sold\s+separately|for)\b[^.!?;\n]{0,80}\b(?:accessor(?:y|ies)|pouch(?:es)?|sleeves?|covers?|holsters?|mounts?|stands?|cables?|chargers?|docks?|straps?|holders?|brackets?|cases?|bags?|adapters?|remote(?:\s+controls?)?)\b/i.test(context)
+    || /\b(?:accessor(?:y|ies)|pouch(?:es)?|sleeves?|covers?|holsters?|mounts?|stands?|cables?|chargers?|docks?|straps?|holders?|brackets?|cases?|bags?|adapters?|remote(?:\s+controls?)?)\b[^.!?;\n]{0,40}\b(?:included|bundled|supplied|sold\s+separately)\b/i.test(context);
+}
+
+function sourceContextsForQuote(quote: string, sourceText: string) {
+  const needle = normalizedEvidence(quote);
+  if (!needle) return [];
+  const segments = String(sourceText || quote)
+    .split(/[\r\n]+|(?<=[.!?;。！？；])\s*/)
+    .map((segment) => clean(segment))
+    .filter((segment) => normalizedEvidence(segment).includes(needle));
+  if (segments.length) return segments;
+
+  // Structured text normally preserves line/sentence boundaries. Keep this
+  // bounded fallback for an exact quote that crosses formatting whitespace.
+  const source = normalizedEvidence(sourceText);
+  const contexts: string[] = [];
+  let index = source.indexOf(needle);
+  while (index >= 0) {
+    contexts.push(source.slice(Math.max(0, index - 96), index + needle.length + 96));
+    index = source.indexOf(needle, index + 1);
+  }
+  return contexts;
+}
+
+function quoteHasAccessorySubjectContext(quote: string, sourceText: string) {
+  if (hasAccessorySubjectContext(quote, sourceText)) return true;
+  return sourceContextsForQuote(quote, sourceText)
+    .some((context) => hasAccessorySubjectContext(context, sourceText));
+}
+
 /**
  * A strictly verified TikTok PDP slug may contribute only facts whose exact
  * English token/phrase is listed here. This is deliberately deterministic:
@@ -417,17 +562,27 @@ function hasAffirmedSlugPhrase(evidence: string, phrase: RegExp) {
 function productInfoFromTrustedSlug(
   base: ParsedProductInfo,
   trustedSlug: string,
-  options: { sourceTitle?: string; corroboratingEvidence?: string } = {},
+  options: { sourceTitle?: string; corroboratingEvidence?: string; sourceUrl?: string } = {},
 ): ParsedProductInfo {
   const evidence = clean(trustedSlug).toLowerCase();
   const pageEvidence = clean(options.corroboratingEvidence).toLowerCase();
   const coreFunctions: string[] = [];
   const parameters: string[] = [];
   const scenes: string[] = [];
-  const confirmed = (slugPhrase: RegExp, pagePhrase: RegExp = slugPhrase) => hasAffirmedSlugPhrase(evidence, slugPhrase)
+  const subjectSource = options.corroboratingEvidence || evidence;
+  const accessoryContext = hasAccessorySubjectContext(evidence, subjectSource)
+    || Boolean(options.corroboratingEvidence && hasAccessorySubjectContext(pageEvidence, pageEvidence));
+  const confirmed = (slugPhrase: RegExp, pagePhrase: RegExp = slugPhrase) => !accessoryContext
+    && hasAffirmedSlugPhrase(evidence, slugPhrase)
     && (!options.corroboratingEvidence || hasAffirmedSlugPhrase(pageEvidence, pagePhrase));
 
-  if (confirmed(/\bshockproof\b/)) coreFunctions.push("防震保护");
+  // Shock resistance is mapped only when the slug independently identifies
+  // the main product as a case. A camera "with shockproof carrying case" is
+  // an accessory statement and can never make the camera itself shockproof.
+  const isMainCaseProduct = confirmed(
+    /\b(?:phone\s+case|silicone\s+(?:phone\s+)?case|protective\s+(?:phone\s+)?case|case\s+for\s+(?:iphone|samsung))\b/,
+  );
+  if (isMainCaseProduct && confirmed(/\bshockproof\b/)) coreFunctions.push("防震保护");
   const isIndoorSecurityCamera = confirmed(
     /\bindoor\s+security\s+camera\b/,
     /\b(?:indoor\s+security\s+camera|security\s+camera\s+indoor)\b/,
@@ -454,7 +609,7 @@ function productInfoFromTrustedSlug(
     .map((device) => device === "iphone" ? "iPhone" : "Samsung");
   if (compatibleDevices.length) parameters.push(`兼容设备：${compatibleDevices.join("、")}`);
 
-  return {
+  return withProductVerification({
     ...base,
     sku: "",
     coreFunctions,
@@ -465,7 +620,7 @@ function productInfoFromTrustedSlug(
     sourceImageUrls: [],
     visualEvidence: "",
     visualAnalysisStatus: "unavailable",
-  };
+  }, options.sourceUrl || "");
 }
 
 function parsedValue(parsed: Partial<ParsedProductInfo>, aliases: string[]) {
@@ -579,6 +734,75 @@ const CLAIM_EVIDENCE_RULES: Array<{ claim: RegExp; evidence: RegExp }> = [
   { claim: /无线/, evidence: /\bwireless\b/i },
 ];
 
+function regexMatches(regex: RegExp, value: string) {
+  regex.lastIndex = 0;
+  return regex.test(value);
+}
+
+function occurrenceContext(source: string, index: number, length: number) {
+  const boundary = /[\r\n.!?;。！？；]/;
+  let start = Math.max(0, index - 160);
+  for (let cursor = index - 1; cursor >= start; cursor -= 1) {
+    if (boundary.test(source[cursor])) {
+      start = cursor + 1;
+      break;
+    }
+  }
+  let end = Math.min(source.length, index + length + 160);
+  for (let cursor = index + length; cursor < end; cursor += 1) {
+    if (boundary.test(source[cursor])) {
+      end = cursor;
+      break;
+    }
+  }
+  return {
+    context: clean(source.slice(start, end)),
+    prefix: clean(source.slice(start, index)).toLowerCase(),
+    suffix: clean(source.slice(index + length, end)).toLowerCase(),
+  };
+}
+
+function occurrenceIsExplicitlyNegated(source: string, index: number, length: number) {
+  const { prefix, suffix } = occurrenceContext(source, index, length);
+  const prefixNegated = /(?:^|\b)(?:no|without|lacks?|lacking)(?:\s+(?:any|the|a|an))?\s*$/i.test(prefix)
+    || /(?:^|\b)(?:not|never)(?:\s+(?:support(?:s|ed|ing)?|offer(?:s|ed|ing)?|include(?:s|d|ing)?|provide(?:s|d|ing)?|feature(?:s|d|ing)?))?\s*$/i.test(prefix)
+    || /(?:^|\b)(?:does|do|did|can|could|will|would|is|are|was|were|has|have)\s+(?:not|never)(?:\s+(?:support|offer|include|provide|feature))?\s*$/i.test(prefix)
+    || /(?:^|\b)(?:doesn't|don't|didn't|can't|cannot|couldn't|won't|wouldn't|isn't|aren't|wasn't|weren't|hasn't|haven't)(?:\s+(?:support|offer|include|provide|feature))?\s*$/i.test(prefix)
+    || /(?:^|\b)(?:unsupported|disabled|unavailable|incompatible)\s*$/i.test(prefix);
+  const suffixNegated = /^(?:[a-z0-9-]+\s+){0,4}(?:(?:is|are|was|were|remains?)\s+)?(?:not\s+(?:supported|available|enabled|included|offered|provided)|unsupported|disabled|unavailable|absent|not\s+included)\b/i.test(suffix)
+    || /^\s*(?:isn't|aren't|wasn't|weren't)\s+(?:supported|available|enabled|included|offered|provided)\b/i.test(suffix);
+  return prefixNegated || suffixNegated;
+}
+
+/**
+ * A short model quote such as "waterproof" cannot hide the sentence around
+ * it. Inspect every occurrence of the quoted fact in the exact router model:
+ * any explicit contradiction fails closed, while accessory ownership is
+ * evaluated only for the actual quoted occurrence so an unrelated accessory
+ * elsewhere cannot taint a fully bound main-product sentence.
+ */
+function claimSourceContextIsSafe(
+  claim: string,
+  quote: string,
+  sourceText: string,
+  field: keyof ProductEvidenceQuotes,
+) {
+  const relevantRules = CLAIM_EVIDENCE_RULES.filter((rule) => regexMatches(rule.claim, claim)
+    && regexMatches(rule.evidence, quote));
+  if (!relevantRules.length) return false;
+
+  if (field !== "sku" && quoteHasAccessorySubjectContext(quote, sourceText)) return false;
+
+  for (const rule of relevantRules) {
+    const flags = [...new Set(`${rule.evidence.flags.replace(/[gy]/g, "")}g`)].join("");
+    const matcher = new RegExp(rule.evidence.source, flags);
+    for (const match of sourceText.matchAll(matcher)) {
+      if (occurrenceIsExplicitlyNegated(sourceText, match.index || 0, match[0].length)) return false;
+    }
+  }
+  return true;
+}
+
 function numericFactsMatch(claim: string, quote: string) {
   const normalizedClaim = normalizedEvidence(claim).replace(/度/g, "°");
   const evidence = normalizedEvidence(quote).replace(/degrees?/g, "°");
@@ -635,6 +859,7 @@ function claimMeaningIsSupported(
   claim: string,
   quote: string,
   field: keyof ProductEvidenceQuotes,
+  sourceText = quote,
 ) {
   if (!numericFactsMatch(claim, quote)) return false;
   if (!quoteAffirmsClaim(claim, quote)) return false;
@@ -649,6 +874,7 @@ function claimMeaningIsSupported(
   // Unknown model-authored concepts are rejected instead of being accepted
   // merely because the model supplied some unrelated real page quote.
   if (!matchedRule) return false;
+  if (!claimSourceContextIsSafe(claim, quote, sourceText, field)) return false;
   if (!claimHasOnlyMappedMeaning(claim, quote)) return false;
   if (field === "usageMethod") {
     if (!/(?:连接|点击|轻触|按|开启|关闭|安装|使用|放置|设置|选择|插入|移除|充电|保存|查看|通话|呼叫|佩戴|涂抹|拉|推|旋转|调节)/.test(claim)) return false;
@@ -675,20 +901,29 @@ function supportedClaimField(
   field: keyof ProductEvidenceQuotes,
 ) {
   const claims = fieldClaims(value);
-  if (!claims.length || claims.length !== quotes.length) return "";
-  const valid = claims.every((claim, index) => {
-    const quote = quotes[index];
-    return quoteExistsInSource(quote, sourceText)
-      && claimMeaningIsSupported(claim, quote, field);
-  });
-  return valid ? claims.join("；") : "";
+  const verifiedClaims: string[] = [];
+  let rejectedFactCount = 0;
+  for (const [index, claim] of claims.entries()) {
+    const quote = quotes[index] || "";
+    if (quoteExistsInSource(quote, sourceText)
+      && claimMeaningIsSupported(claim, quote, field, sourceText)) {
+      if (!verifiedClaims.includes(claim)) verifiedClaims.push(claim);
+    } else {
+      rejectedFactCount += 1;
+    }
+  }
+  return {
+    value: verifiedClaims.join("；"),
+    verifiedClaims,
+    rejectedFactCount,
+  };
 }
 
 function normalizeParsed(
   parsed: ParsedProductModel,
   base: ParsedProductInfo,
   evidenceText: string,
-  options: { allowVisualEvidence?: boolean } = {},
+  options: { allowVisualEvidence?: boolean; sourceUrl?: string } = {},
 ): ParsedProductInfo {
   const rawFunctions = parsedValue(parsed, ["coreFunctions", "核心功能", "核心功能（按重要程度）"]);
   const functions = Array.isArray(rawFunctions)
@@ -705,17 +940,24 @@ function normalizeParsed(
   const source = evidenceText || `${sourceTitle}\n${sourceDescription}`;
   const functionQuotes = evidenceList(parsed, "coreFunctions");
   const normalizedFunctions = functions.map(cleanFunction).filter(Boolean);
-  const supportedFunctions = normalizedFunctions.length === functionQuotes.length
-    && normalizedFunctions.every((value, index) => /[\u3400-\u9fff]/.test(value)
-      && quoteExistsInSource(functionQuotes[index], source)
-      && claimMeaningIsSupported(value, functionQuotes[index], "coreFunctions"))
-    ? normalizedFunctions
-    : [];
+  const supportedFunctions: string[] = [];
+  let rejectedFactCount = 0;
+  for (const [index, value] of normalizedFunctions.entries()) {
+    const quote = functionQuotes[index] || "";
+    if (/[\u3400-\u9fff]/.test(value)
+      && quoteExistsInSource(quote, source)
+      && claimMeaningIsSupported(value, quote, "coreFunctions", source)) {
+      if (!supportedFunctions.includes(value)) supportedFunctions.push(value);
+    } else {
+      rejectedFactCount += 1;
+    }
+  }
   const supportedString = (value: unknown, field: keyof ProductEvidenceQuotes) => {
-    const normalized = supportedClaimField(value, evidenceList(parsed, field), source, field);
-    return /[\u3400-\u9fff]/.test(normalized) ? normalized : "";
+    const result = supportedClaimField(value, evidenceList(parsed, field), source, field);
+    rejectedFactCount += result.rejectedFactCount;
+    return /[\u3400-\u9fff]/.test(result.value) ? result.value : "";
   };
-  return {
+  const normalized = {
     ...base,
     sourceTitle,
     sourceDescription,
@@ -734,6 +976,7 @@ function normalizeParsed(
     sellingPoints: "",
     visualEvidence,
   };
+  return withProductVerification(normalized, options.sourceUrl || "", rejectedFactCount);
 }
 
 type ProductPageResult = {
@@ -1012,10 +1255,11 @@ export function expandedProductResult(
   if (structured) {
     return {
       ...structured,
-      text: [structured.text, expanded.text].filter(Boolean).join("\n").slice(0, 20_000),
-      imageUrls: [...structured.imageUrls, ...expanded.imageUrls]
-        .filter((url, index, all) => all.indexOf(url) === index)
-        .slice(0, MAX_PRODUCT_IMAGES),
+      // Once an exact-PID router model exists, its own fields are the entire
+      // trust boundary. Body/meta text and DOM images can belong to a
+      // recommendation, stale hydration block, or different product.
+      text: structured.text,
+      imageUrls: structured.imageUrls,
       error: "",
       corroboratingText: structured.corroboratingText,
     };
@@ -1066,14 +1310,12 @@ async function readProductPage(productUrl: string): Promise<ProductPageResult> {
       const expandedResult = expanded ? expandedProductResult(expanded, productUrl) : null;
       const bestStructured = expandedResult?.structured ? expandedResult : structured || expandedResult;
       if (bestStructured) {
-        const imageUrls = [
-          ...bestStructured.imageUrls,
-          ...(expanded?.imageUrls || []),
-        ].filter((url, imageIndex, all) => all.indexOf(url) === imageIndex).slice(0, MAX_PRODUCT_IMAGES);
         return {
           ...bestStructured,
-          text: [bestStructured.text, expanded?.text].filter(Boolean).join("\n").slice(0, 20_000),
-          imageUrls,
+          // Do not append expanded body text/images to an exact structured
+          // product. `expandedProductResult` already isolates its router model.
+          text: bestStructured.text,
+          imageUrls: bestStructured.imageUrls,
           error: "",
           corroboratingText: bestStructured.corroboratingText,
         };
@@ -1312,6 +1554,18 @@ function preferredProviderFailure(failures: ProviderFailure[]) {
   return "";
 }
 
+function safeProductParserError(error: unknown) {
+  const raw = error instanceof Error ? error.message : String(error || "商品页恢复失败");
+  return raw
+    .replace(/^商品资料解析失败[：:]\s*/i, "")
+    .replace(/\bauthorization\s*:\s*(?:bearer|basic)?\s*\S+/gi, "[已隐藏]")
+    .replace(/\bbearer\s+\S+/gi, "[已隐藏]")
+    .replace(/(?:api[_ -]?key|app[_ -]?secret|webhook[_ -]?secret)\s*[:=]?\s*\S+/gi, "[已隐藏]")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 320) || "商品页恢复失败";
+}
+
 export function productParseFailureReason(input: {
   searchMode: boolean;
   pageError: string;
@@ -1326,24 +1580,30 @@ export function productParseFailureReason(input: {
     }
     return input.pageError || "AI 没有返回足够的可验证商品资料";
   }
+  const directFailure = input.providerError
+    ? `${input.pageError ? `${input.pageError}；` : ""}AI 提取未得到足够的可验证资料（${input.providerError}）`
+    : input.pageError;
   if (input.searchError) {
-    return `${input.pageError ? `${input.pageError}；` : ""}联网检索失败：${input.searchError}`;
+    return `${directFailure ? `${directFailure}；` : ""}联网检索失败：${input.searchError}`;
   }
   if (input.exactSourceMatched && !input.trustedEvidenceAvailable) {
-    return "联网检索找到了同 PID 的官方商品页，但链接路径没有可独立验证的商品资料";
+    return `${directFailure ? `${directFailure}；` : ""}联网检索找到了同 PID 的官方商品页，但链接路径没有可独立验证的商品资料`;
   }
-  if (input.exactSourceMatched) return "联网检索找到了同 PID 的官方商品页，但链接路径没有足够的白名单商品资料";
+  if (input.exactSourceMatched) {
+    return `${directFailure ? `${directFailure}；` : ""}联网检索找到了同 PID 的官方商品页，但链接路径没有足够的白名单商品资料`;
+  }
   if (input.pageError === "商品页要求安全验证") {
     return "商品页要求安全验证，联网检索也未找到与该 PID 完全匹配的官方公开商品页";
   }
-  return input.pageError
-    ? `${input.pageError}；联网检索也未找到与该 PID 完全匹配的官方公开商品页`
+  return directFailure
+    ? `${directFailure}；联网检索也未找到与该 PID 完全匹配的官方公开商品页`
     : "联网检索没有找到与该 PID 完全匹配的官方公开商品页";
 }
 
-export async function parsePublicProductPage(
+async function parsePublicProductPageInternal(
   productUrl: string,
   hints: ProductParseHints = {},
+  options: { allowExactSourceDiscovery: boolean } = { allowExactSourceDiscovery: true },
 ): Promise<ParsedProductInfo> {
   const canonicalUrl = productUrl.trim();
   const pathProductId = productIdFromOfficialTikTokPath(canonicalUrl);
@@ -1356,20 +1616,16 @@ export async function parsePublicProductPage(
   // immediately so a button click cannot occupy a worker unnecessarily.
   const page = await readProductPageWithRetry(canonicalUrl);
   const base = baseInfo(page.title, page.description, hints, page.imageUrls, page.sku, page.productParameters);
-  const searchMode = !page.text;
+  // A successful HTML response is not automatically product evidence. Only
+  // an exact-PID router `product_model` binds facts to the requested product;
+  // body/meta content can be a recommendation carousel or stale page shell.
+  // Unstructured pages are therefore URL-discovery inputs only and never
+  // reach Qwen extraction or deterministic same-page claim mapping.
+  const searchMode = !page.structured || !page.text;
   let searchResult: Awaited<ReturnType<typeof qwenFindExactProductSources>> | null = null;
   let searchError = "";
-  if (searchMode) {
-    try {
-      searchResult = await qwenFindExactProductSources(canonicalUrl);
-    } catch (error) {
-      searchError = providerFailure(error).detail;
-    }
-  }
-  const trustedSearchEvidence = searchResult?.trustedEvidence || "";
-  const evidenceBase = searchMode && searchResult?.trustedSourceTitle
-    ? { ...base, sourceTitle: searchResult.trustedSourceTitle, sourceDescription: "" }
-    : base;
+  let recoveredPageError = "";
+  let exactSourceDiscoveryAttempted = false;
   const prompt = searchMode ? "" : extractionPrompt({
     productUrl: canonicalUrl,
     hints: { ...hints, pid: productId },
@@ -1381,14 +1637,17 @@ export async function parsePublicProductPage(
   const trustedDirectSlug = !searchMode && page.structured
     ? trustedProductPathEvidence(canonicalUrl, productId)
     : "";
-  const directDeterministicCandidate = trustedDirectSlug
-    ? productInfoFromTrustedSlug(base, trustedDirectSlug, {
-        sourceTitle: base.sourceTitle,
-        corroboratingEvidence: page.corroboratingText,
-      })
+  const directDeterministicCandidate = !searchMode && page.structured
+    ? trustedDirectSlug
+      ? productInfoFromTrustedSlug(base, trustedDirectSlug, {
+          sourceTitle: base.sourceTitle,
+          corroboratingEvidence: page.corroboratingText,
+          sourceUrl: canonicalUrl,
+        })
+      : withProductVerification(base, canonicalUrl)
     : null;
   const directDeterministicUsable = Boolean(
-    directDeterministicCandidate && hasUsableProductInfo(directDeterministicCandidate),
+    directDeterministicCandidate && hasVerifiedProductFacts(directDeterministicCandidate),
   );
 
   // The exact public page is the primary evidence. On mainland ECS we read
@@ -1430,15 +1689,15 @@ export async function parsePublicProductPage(
       ? await attemptProductModel("Qwen 图片抽取", () => qwenVisualExtract(prompt, page.imageUrls))
       : await attemptProductModel("Qwen 文本抽取", () => qwenExtract(prompt));
   let normalized = searchMode
-    ? trustedSearchEvidence ? productInfoFromTrustedSlug(evidenceBase, trustedSearchEvidence) : null
-    : parsed ? normalizeParsed(parsed, base, page.text) : null;
+    ? null
+    : parsed ? normalizeParsed(parsed, base, page.text, { sourceUrl: canonicalUrl }) : null;
   let visualAnalysisStatus: ParsedProductInfo["visualAnalysisStatus"] = "unavailable";
 
   if (!searchMode
     && needsCompletenessRetry(normalized, page.text)
     && (providerReturnedModel || (initialUsedVisualModel && !directDeterministicUsable))) {
     parsed = await attemptProductModel("Qwen 文本重试", () => qwenExtract(prompt));
-    const candidate = parsed ? normalizeParsed(parsed, base, page.text) : null;
+    const candidate = parsed ? normalizeParsed(parsed, base, page.text, { sourceUrl: canonicalUrl }) : null;
     normalized = preferMoreCompleteProductInfo(normalized, candidate);
   }
 
@@ -1448,14 +1707,32 @@ export async function parsePublicProductPage(
   const bundleFeatures = searchMode ? [] : enumeratedBundleFeatures(page.text);
   if (normalized && bundleFeatures.length && normalized.coreFunctions.length < bundleFeatures.length) {
     const translated = await qwenTranslateBundleFeatures(bundleFeatures).catch(() => []);
-    if (translated.length === bundleFeatures.length) normalized = { ...normalized, coreFunctions: translated };
+    const verifiedTranslations = translated.length === bundleFeatures.length
+      ? translated.filter((claim, index) => claimMeaningIsSupported(claim, bundleFeatures[index], "coreFunctions"))
+      : [];
+    if (verifiedTranslations.length) {
+      normalized = withProductVerification({
+        ...normalized,
+        coreFunctions: [...new Set([...normalized.coreFunctions, ...verifiedTranslations])].slice(0, 5),
+      }, canonicalUrl, normalized.verification?.rejectedFactCount || 0);
+    }
+  }
+
+  // A model response with verified facts keeps priority. When it contains no
+  // verified function, the deterministic same-page slug allowlist may fill
+  // that missing field without replacing any model-grounded atomic fact.
+  if (!searchMode
+    && normalized
+    && normalized.coreFunctions.length === 0
+    && directDeterministicUsable) {
+    normalized = preferMoreCompleteProductInfo(normalized, directDeterministicCandidate);
   }
 
   // A usable AI result always wins. Only after all direct extraction attempts
   // fail completeness/evidence checks may a strictly verified router-data
   // page use the deterministic slug allowlist. Every mapped fact must also be
   // present (and not directly negated) in that same page's structured text.
-  if (!searchMode && (!normalized || !hasUsableProductInfo(normalized))) {
+  if (!searchMode && (!normalized || !hasVerifiedProductFacts(normalized))) {
     if (providerReturnedModel) {
       providerFailures.push({ outcome: "insufficient", detail: "Qwen 返回资料未通过证据引文与字段完整性校验" });
       console.warn("[product-parser] provider attempt", {
@@ -1475,22 +1752,49 @@ export async function parsePublicProductPage(
     if (directDeterministicUsable) normalized = directDeterministicCandidate;
   }
 
-  // The 1+1 threshold is local to this strictly grounded search result. The
-  // public cache predicate keeps its historical two-field threshold so legacy
-  // rows cannot be silently promoted.
-  const minimumDescriptiveFields = searchMode ? 1 : 2;
-  if (!normalized || !hasUsableProductInfo(normalized, minimumDescriptiveFields)) {
+  // Discovery is URL-only. When the supplied endpoint is blocked or direct
+  // extraction retains no facts, fetch the discovered same-PID PDP and run the
+  // exact same strict parser over its actual page. Search prose is never read.
+  if (!hasVerifiedProductFacts(normalized) && options.allowExactSourceDiscovery) {
+    exactSourceDiscoveryAttempted = true;
+    try {
+      searchResult = await qwenFindExactProductSources(canonicalUrl);
+      const recoveredUrl = searchResult.trustedSourceUrl;
+      if (recoveredUrl && recoveredUrl !== canonicalUrl) {
+        try {
+          return await parsePublicProductPageInternal(recoveredUrl, { ...hints, pid: productId }, {
+            allowExactSourceDiscovery: false,
+          });
+        } catch (error) {
+          recoveredPageError = safeProductParserError(error);
+        }
+      }
+      // If the recovered exact-PID PDP is still blocked, retain only the tiny
+      // deterministic allowlist derivable from that official URL's slug. The
+      // Responses prose, source title, and similar products remain untrusted.
+      if (!hasVerifiedProductFacts(normalized)
+        && searchResult.trustedEvidence
+        && searchResult.trustedSourceUrl) {
+        const slugCandidate = productInfoFromTrustedSlug(base, searchResult.trustedEvidence, {
+          sourceTitle: searchResult.trustedEvidence,
+          sourceUrl: searchResult.trustedSourceUrl,
+        });
+        if (hasVerifiedProductFacts(slugCandidate)) normalized = slugCandidate;
+      }
+    } catch (error) {
+      searchError = providerFailure(error).detail;
+    }
+  }
+
+  if (!normalized || !hasVerifiedProductFacts(normalized)) {
     throw new Error(`商品资料解析失败：${productParseFailureReason({
-      searchMode,
-      pageError: page.error,
+      searchMode: exactSourceDiscoveryAttempted,
+      pageError: recoveredPageError || page.error,
       exactSourceMatched: searchResult?.exactSourceMatched === true,
-      trustedEvidenceAvailable: Boolean(trustedSearchEvidence),
+      trustedEvidenceAvailable: Boolean(searchResult?.trustedEvidence),
       searchError,
       providerError: preferredProviderFailure(providerFailures),
     })}`);
-  }
-  if (searchMode) {
-    normalized = { ...normalized, sourceImageUrls: [], visualEvidence: "" };
   }
   // Recompute after the optional text retry and deterministic fallback. A
   // completed status means an actual visual request succeeded and its final
@@ -1502,5 +1806,16 @@ export async function parsePublicProductPage(
     && normalized.sourceImageUrls.length > 0
     ? "completed"
     : "unavailable";
-  return { ...normalized, sellingPoints: "", visualAnalysisStatus };
+  return withProductVerification(
+    { ...normalized, sellingPoints: "", visualAnalysisStatus },
+    normalized.verification?.sourceUrl || canonicalUrl,
+    normalized.verification?.rejectedFactCount || 0,
+  );
+}
+
+export async function parsePublicProductPage(
+  productUrl: string,
+  hints: ProductParseHints = {},
+) {
+  return parsePublicProductPageInternal(productUrl, hints, { allowExactSourceDiscovery: true });
 }

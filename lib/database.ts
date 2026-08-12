@@ -14,6 +14,7 @@ import type {
   ProviderName,
   ProviderSetting,
   SceneRecord,
+  VerifiedProductFactsMergeInput,
   VideoRecord,
   VideoStatus,
 } from "@/lib/types";
@@ -79,6 +80,10 @@ function initialize(db: DatabaseSync) {
       visual_evidence TEXT NOT NULL DEFAULT '',
       visual_analysis_status TEXT NOT NULL DEFAULT '',
       visual_analyzed_at TEXT,
+      verified_pid TEXT NOT NULL DEFAULT '',
+      verified_source_url TEXT NOT NULL DEFAULT '',
+      evidence_version TEXT NOT NULL DEFAULT '',
+      facts_verified_at TEXT NOT NULL DEFAULT '',
       banned_terms TEXT NOT NULL DEFAULT '',
       notes TEXT NOT NULL DEFAULT '',
       is_system INTEGER NOT NULL DEFAULT 0,
@@ -345,6 +350,10 @@ function initialize(db: DatabaseSync) {
     ["visual_evidence", "TEXT NOT NULL DEFAULT ''"],
     ["visual_analysis_status", "TEXT NOT NULL DEFAULT ''"],
     ["visual_analyzed_at", "TEXT"],
+    ["verified_pid", "TEXT NOT NULL DEFAULT ''"],
+    ["verified_source_url", "TEXT NOT NULL DEFAULT ''"],
+    ["evidence_version", "TEXT NOT NULL DEFAULT ''"],
+    ["facts_verified_at", "TEXT NOT NULL DEFAULT ''"],
     ["prop_images_json", "TEXT NOT NULL DEFAULT '[]'"],
   ]) {
     if (!productColumns.some((column) => String(column.name) === name)) db.exec(`ALTER TABLE products ADD COLUMN ${name} ${definition}`);
@@ -734,6 +743,10 @@ function productFromRow(row: Record<string, unknown>): Product {
       ? String(row.visual_analysis_status)
       : "") as Product["visualAnalysisStatus"],
     visualAnalyzedAt: row.visual_analyzed_at ? String(row.visual_analyzed_at) : null,
+    verifiedPid: String(row.verified_pid ?? ""),
+    verifiedSourceUrl: String(row.verified_source_url ?? ""),
+    evidenceVersion: String(row.evidence_version ?? ""),
+    factsVerifiedAt: String(row.facts_verified_at ?? ""),
     bannedTerms: String(row.banned_terms ?? ""),
     notes: String(row.notes ?? ""),
     isSystem: Boolean(row.is_system),
@@ -887,15 +900,24 @@ export function getProductByPid(pid: string) {
 export function updateProduct(id: string, input: Partial<Product>) {
   const current = getProduct(id);
   if (!current) return null;
+  const nextPid = input.pid?.trim() ?? current.pid;
+  const pidChanged = nextPid !== current.pid;
+  const verifiedFactWasWritten = [
+    "sku", "coreFunctions", "productParameters", "usageMethod", "targetAudience",
+    "usageScenes", "sourceTitle", "sourceDescription", "sourceImageUrls",
+    "visualEvidence", "visualAnalysisStatus", "visualAnalyzedAt",
+  ].some((key) => input[key as keyof Product] !== undefined);
+  const keepVerifiedState = !pidChanged && !verifiedFactWasWritten;
   getDb()
     .prepare(`UPDATE products SET name=?, pid=?, sku=?, document_id=?, document_url=?, image_path=?, prop_images_json=?, category=?, market=?, price=?, selling_points=?,
       target_audience=?, pain_points=?, competitors=?, product_url=?, banned_terms=?, notes=?,
       core_functions_json=?, product_parameters=?, usage_method=?, usage_scenes=?, source_title=?, source_description=?,
-      source_image_urls_json=?, visual_evidence=?, visual_analysis_status=?, visual_analyzed_at=?, updated_at=? WHERE id=?`)
+      source_image_urls_json=?, visual_evidence=?, visual_analysis_status=?, visual_analyzed_at=?,
+      verified_pid=?, verified_source_url=?, evidence_version=?, facts_verified_at=?, updated_at=? WHERE id=?`)
     .run(
       input.name ?? current.name,
-      input.pid?.trim() ?? current.pid,
-      input.sku ?? current.sku,
+      nextPid,
+      input.sku ?? (pidChanged ? "" : current.sku),
       input.documentId ?? current.documentId,
       input.documentUrl ?? current.documentUrl,
       input.imagePath ?? current.imagePath,
@@ -904,26 +926,153 @@ export function updateProduct(id: string, input: Partial<Product>) {
       input.market ?? current.market,
       input.price ?? current.price,
       input.sellingPoints ?? current.sellingPoints,
-      input.targetAudience ?? current.targetAudience,
+      input.targetAudience ?? (pidChanged ? "" : current.targetAudience),
       input.painPoints ?? current.painPoints,
       input.competitors ?? current.competitors,
       input.productUrl ?? current.productUrl,
       input.bannedTerms ?? current.bannedTerms,
       input.notes ?? current.notes,
-      JSON.stringify(input.coreFunctions ?? current.coreFunctions),
-      input.productParameters ?? current.productParameters,
-      input.usageMethod ?? current.usageMethod,
-      input.usageScenes ?? current.usageScenes,
-      input.sourceTitle ?? current.sourceTitle,
-      input.sourceDescription ?? current.sourceDescription,
-      JSON.stringify(input.sourceImageUrls ?? current.sourceImageUrls),
-      input.visualEvidence ?? current.visualEvidence,
-      input.visualAnalysisStatus ?? current.visualAnalysisStatus,
-      input.visualAnalyzedAt === undefined ? current.visualAnalyzedAt : input.visualAnalyzedAt,
+      JSON.stringify(input.coreFunctions ?? (pidChanged ? [] : current.coreFunctions)),
+      input.productParameters ?? (pidChanged ? "" : current.productParameters),
+      input.usageMethod ?? (pidChanged ? "" : current.usageMethod),
+      input.usageScenes ?? (pidChanged ? "" : current.usageScenes),
+      input.sourceTitle ?? (pidChanged ? "" : current.sourceTitle),
+      input.sourceDescription ?? (pidChanged ? "" : current.sourceDescription),
+      JSON.stringify(input.sourceImageUrls ?? (pidChanged ? [] : current.sourceImageUrls)),
+      input.visualEvidence ?? (pidChanged ? "" : current.visualEvidence),
+      input.visualAnalysisStatus ?? (pidChanged ? "" : current.visualAnalysisStatus),
+      input.visualAnalyzedAt === undefined ? (pidChanged ? null : current.visualAnalyzedAt) : input.visualAnalyzedAt,
+      keepVerifiedState ? current.verifiedPid : "",
+      keepVerifiedState ? current.verifiedSourceUrl : "",
+      keepVerifiedState ? current.evidenceVersion : "",
+      keepVerifiedState ? current.factsVerifiedAt : "",
       now(),
       id,
     );
   return getProduct(id);
+}
+
+function requiredVerifiedText(value: unknown, label: string) {
+  const normalized = typeof value === "string" ? value.trim() : "";
+  if (!normalized) throw new Error(`缺少已验证商品资料${label}`);
+  return normalized;
+}
+
+function verifiedString(value: string | undefined, current: string, sameEvidence: boolean) {
+  return value === undefined ? (sameEvidence ? current : "") : value.trim();
+}
+
+function verifiedList(value: string[] | undefined, current: string[], sameEvidence: boolean) {
+  if (value === undefined) return sameEvidence ? current : [];
+  return value.map((item) => String(item).trim()).filter(Boolean);
+}
+
+function hasIncomingVerifiedFacts(input: VerifiedProductFactsMergeInput) {
+  return Boolean(
+    input.sku?.trim()
+    || input.coreFunctions?.some((item) => String(item).trim())
+    || input.productParameters?.trim()
+    || input.usageMethod?.trim()
+    || input.targetAudience?.trim()
+    || input.usageScenes?.trim()
+    || input.visualEvidence?.trim(),
+  );
+}
+
+/**
+ * Atomically merge parser-certified facts into one evidence snapshot.
+ *
+ * Omitted fields are preserved only for the same PID/evidence version. A new
+ * exact source URL for that same validation policy advances provenance without
+ * dropping previously certified partial facts. A new version resets omissions,
+ * and an unverified legacy row can never be silently re-certified.
+ */
+export function mergeVerifiedProductFacts(id: string, input: VerifiedProductFactsMergeInput) {
+  const productId = id.trim();
+  if (!productId) throw new Error("缺少待合并的产品 ID");
+  const pid = requiredVerifiedText(input.pid, " PID");
+  const sourceUrl = requiredVerifiedText(input.sourceUrl, "来源链接");
+  try {
+    if (new URL(sourceUrl).protocol !== "https:") throw new Error("invalid protocol");
+  } catch {
+    throw new Error("已验证商品资料来源链接必须是 HTTPS 绝对链接");
+  }
+  const evidenceVersion = requiredVerifiedText(input.evidenceVersion, "证据版本");
+  const verifiedAt = requiredVerifiedText(input.verifiedAt, "验证时间");
+  if (!Number.isFinite(Date.parse(verifiedAt))) throw new Error("已验证商品资料验证时间无效");
+  if (input.visualAnalysisStatus !== undefined
+    && !["", "completed", "unavailable"].includes(input.visualAnalysisStatus)) {
+    throw new Error("已验证商品资料视觉状态无效");
+  }
+  if (!hasIncomingVerifiedFacts(input)) {
+    throw new Error("已验证商品资料本次至少需要一项非空事实");
+  }
+
+  const db = getDb();
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const row = db.prepare("SELECT * FROM products WHERE id=?").get(productId) as Record<string, unknown> | undefined;
+    if (!row) throw new Error("产品不存在");
+    const current = productFromRow({ ...row, video_count: 0 });
+    if (pid !== current.pid) throw new Error("已验证商品资料 PID 与产品 PID 不一致");
+    const sameEvidence = current.verifiedPid === pid
+      && current.evidenceVersion === evidenceVersion;
+    const next = {
+      sku: verifiedString(input.sku, current.sku, sameEvidence),
+      coreFunctions: verifiedList(input.coreFunctions, current.coreFunctions, sameEvidence),
+      productParameters: verifiedString(input.productParameters, current.productParameters, sameEvidence),
+      usageMethod: verifiedString(input.usageMethod, current.usageMethod, sameEvidence),
+      targetAudience: verifiedString(input.targetAudience, current.targetAudience, sameEvidence),
+      usageScenes: verifiedString(input.usageScenes, current.usageScenes, sameEvidence),
+      sourceTitle: verifiedString(input.sourceTitle, current.sourceTitle, sameEvidence),
+      sourceDescription: verifiedString(input.sourceDescription, current.sourceDescription, sameEvidence),
+      sourceImageUrls: verifiedList(input.sourceImageUrls, current.sourceImageUrls, sameEvidence),
+      visualEvidence: verifiedString(input.visualEvidence, current.visualEvidence, sameEvidence),
+      visualAnalysisStatus: input.visualAnalysisStatus === undefined
+        ? (sameEvidence ? current.visualAnalysisStatus : "")
+        : input.visualAnalysisStatus,
+    } satisfies Pick<Product,
+      "sku" | "coreFunctions" | "productParameters" | "usageMethod" | "targetAudience"
+      | "usageScenes" | "sourceTitle" | "sourceDescription" | "sourceImageUrls"
+      | "visualEvidence" | "visualAnalysisStatus">;
+    const visualAnalyzedAt = next.visualAnalysisStatus === "completed"
+      ? verifiedAt
+      : next.visualAnalysisStatus === "unavailable"
+        ? null
+        : sameEvidence ? current.visualAnalyzedAt : null;
+    db.prepare(`UPDATE products SET
+      sku=?, core_functions_json=?, product_parameters=?, usage_method=?, target_audience=?, usage_scenes=?,
+      source_title=?, source_description=?, source_image_urls_json=?, visual_evidence=?,
+      visual_analysis_status=?, visual_analyzed_at=?, verified_pid=?, verified_source_url=?,
+      evidence_version=?, facts_verified_at=?, updated_at=?
+      WHERE id=? AND pid=?`)
+      .run(
+        next.sku,
+        JSON.stringify(next.coreFunctions),
+        next.productParameters,
+        next.usageMethod,
+        next.targetAudience,
+        next.usageScenes,
+        next.sourceTitle,
+        next.sourceDescription,
+        JSON.stringify(next.sourceImageUrls),
+        next.visualEvidence,
+        next.visualAnalysisStatus,
+        visualAnalyzedAt,
+        pid,
+        sourceUrl,
+        evidenceVersion,
+        verifiedAt,
+        now(),
+        productId,
+        pid,
+      );
+    db.exec("COMMIT");
+  } catch (error) {
+    try { db.exec("ROLLBACK"); } catch { /* the transaction has already ended */ }
+    throw error;
+  }
+  return getProduct(productId)!;
 }
 
 /** Explicitly clear a stale Feishu document link; updateProduct's ?? semantics intentionally cannot do this. */

@@ -44,6 +44,7 @@ async function loadAutomationModule() {
     export const getFeishuProductCardMapping = (...args) => hooks().getFeishuProductCardMapping?.(...args) || null;
     export const getProduct = (...args) => hooks().getProduct?.(...args) || null;
     export const getProductByPid = () => null;
+    export const mergeVerifiedProductFacts = () => null;
     export const getVideo = (...args) => hooks().getVideo?.(...args) || null;
     export const getVideoBySourceUrl = () => null;
     export const saveFeishuAutomationJob = () => undefined;

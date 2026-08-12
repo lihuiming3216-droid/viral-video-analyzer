@@ -921,17 +921,33 @@ export async function copyFeishuTemplateDocument(
 }
 
 export async function listFeishuDocumentBlocks(client: Client, documentId: string) {
-  const response = await client.request<{
-    code?: number;
-    msg?: string;
-    data?: { items?: Array<Record<string, unknown>>; page_token?: string; has_more?: boolean };
-  }>({
-    url: `/open-apis/docx/v1/documents/${encodeURIComponent(documentId)}/blocks`,
-    method: "GET",
-    params: { page_size: "500", document_revision_id: "-1" },
-  });
-  apiError(response, "读取飞书文档结构失败");
-  return response.data?.items || [];
+  const blocks: Array<Record<string, unknown>> = [];
+  const seenPageTokens = new Set<string>();
+  let pageToken = "";
+  do {
+    const response = await client.request<{
+      code?: number;
+      msg?: string;
+      data?: { items?: Array<Record<string, unknown>>; page_token?: string; has_more?: boolean };
+    }>({
+      url: `/open-apis/docx/v1/documents/${encodeURIComponent(documentId)}/blocks`,
+      method: "GET",
+      params: {
+        page_size: "500",
+        document_revision_id: "-1",
+        ...(pageToken ? { page_token: pageToken } : {}),
+      },
+    });
+    apiError(response, "读取飞书文档结构失败");
+    blocks.push(...(response.data?.items || []));
+    if (!response.data?.has_more) break;
+    const nextPageToken = response.data.page_token?.trim();
+    if (!nextPageToken) throw new Error("读取飞书文档结构失败：分页结果缺少下一页 Token");
+    if (seenPageTokens.has(nextPageToken)) throw new Error("读取飞书文档结构失败：分页 Token 重复");
+    seenPageTokens.add(nextPageToken);
+    pageToken = nextPageToken;
+  } while (pageToken);
+  return blocks;
 }
 
 /** Normalize the legacy product-template header in place. */
@@ -1129,6 +1145,8 @@ export type ProductCardManagedFieldsInput = {
   clearDerived?: boolean;
   /** Restrict a preflight clear to derived labels; identity is handled next. */
   derivedOnly?: boolean;
+  /** Validate the complete managed template structure without patching blocks. */
+  preflightOnly?: boolean;
 };
 
 const PRODUCT_FIELD_LEADING_DECORATION = String.raw`[ \t\p{Extended_Pictographic}\uFE0F\u200D•·▪▫◦●○★☆]*`;
@@ -1163,7 +1181,7 @@ function productCardManagedValues(input: Omit<ProductCardManagedFieldsInput, "do
   const values = new Map<ProductCardManagedLabel, string>();
   if (hasOwn(input, "name")) {
     const displayName = String(input.name || "").replace(/\s+/g, " ").trim();
-    values.set("商品名称", displayName || "待补产品");
+    values.set("商品名称", displayName);
   }
   if (hasOwn(input, "productUrl")) values.set("产品链接", String(input.productUrl || "").trim());
   if (hasOwn(input, "pid")) values.set("商品ID", String(input.pid || "").trim());
@@ -1268,9 +1286,25 @@ export async function syncProductCardManagedFields(
   const documentId = requiredToken(input.documentId, "飞书产品文档 Token");
   const blocks = await listFeishuDocumentBlocks(client, documentId);
   const values = productCardManagedValues(input);
-  const matchedLabels = new Set<ProductCardManagedLabel>();
-  let updated = 0;
-  const managedBlocks = blocks.flatMap((block) => {
+  const expectedLabels = input.preflightOnly && input.mode === "verified-basic"
+    ? [...PRODUCT_CARD_MANAGED_LABELS]
+    : [...values.keys()].filter((label) => !input.derivedOnly
+      || PRODUCT_CARD_DERIVED_LABELS.includes(label as typeof PRODUCT_CARD_DERIVED_LABELS[number]));
+  type ManagedBlock = {
+    block: Record<string, unknown>;
+    elements: Array<{
+      text_run?: {
+        content?: string;
+        text_element_style?: { link?: { url?: string } };
+      };
+    }>;
+    content: string;
+    matched: NonNullable<ReturnType<typeof matchedManagedProductField>>;
+  };
+  const occurrences = new Map<ProductCardManagedLabel, ManagedBlock[]>(
+    expectedLabels.map((label) => [label, []]),
+  );
+  for (const block of blocks) {
     const text = block.text as {
       elements?: Array<{
         text_run?: {
@@ -1282,10 +1316,52 @@ export async function syncProductCardManagedFields(
     const elements = text?.elements || [];
     const content = elements.map((element) => element.text_run?.content || "").join("");
     const matched = matchedManagedProductField(content);
-    return matched && values.has(matched.label) && block.block_id
-      ? [{ block, elements, content, matched }]
+    if (!matched || !occurrences.has(matched.label)) continue;
+    occurrences.get(matched.label)!.push({ block, elements, content, matched });
+  }
+  const matchedLabels = expectedLabels.filter((label) => (occurrences.get(label)?.length || 0) > 0);
+  const missingLabels = expectedLabels.filter((label) => {
+    const matches = occurrences.get(label) || [];
+    return matches.length === 0 || (matches.length === 1 && !matches[0].block.block_id);
+  });
+  const duplicateLabels = expectedLabels.filter((label) => (occurrences.get(label)?.length || 0) > 1);
+  const currentValues = Object.fromEntries(expectedLabels.flatMap((label) => {
+    const matches = occurrences.get(label) || [];
+    return matches.length === 1
+      ? [[label, matches[0].matched.value.trim()]]
       : [];
-  }).sort((left, right) => {
+  })) as Partial<Record<ProductCardManagedLabel, string>>;
+
+  // Structural validation is deliberately completed before the first patch.
+  // A partial update would be worse than a visible, retryable template error.
+  if (input.preflightOnly) {
+    return {
+      scanned: blocks.length,
+      updated: 0,
+      matchedLabels,
+      missingLabels,
+      duplicateLabels,
+      currentValues,
+    };
+  }
+  if (duplicateLabels.length) {
+    throw new Error(`产品手卡模板基础字段重复：${duplicateLabels.join("、")}`);
+  }
+  if (missingLabels.length) {
+    return {
+      scanned: blocks.length,
+      updated: 0,
+      matchedLabels,
+      missingLabels,
+      duplicateLabels,
+      currentValues,
+    };
+  }
+
+  let updated = 0;
+  const managedBlocks = expectedLabels
+    .flatMap((label) => occurrences.get(label) || [])
+    .sort((left, right) => {
     // Identity is always committed before derived facts regardless of the
     // physical block order in an old/rearranged template.
     const leftDerived = PRODUCT_CARD_DERIVED_LABELS.includes(left.matched.label as typeof PRODUCT_CARD_DERIVED_LABELS[number]);
@@ -1293,9 +1369,6 @@ export async function syncProductCardManagedFields(
     return Number(leftDerived) - Number(rightDerived);
   });
   for (const { block, elements, content, matched } of managedBlocks) {
-    const isDerived = PRODUCT_CARD_DERIVED_LABELS.includes(matched.label as typeof PRODUCT_CARD_DERIVED_LABELS[number]);
-    if (input.derivedOnly && !isDerived) continue;
-    matchedLabels.add(matched.label);
     const next = syncProductCardManagedBlockText(content, input);
     const expectedProductUrl = matched.label === "产品链接" ? values.get("产品链接") || "" : "";
     const expectedLink = /^https:\/\//i.test(expectedProductUrl) ? expectedProductUrl : "";
@@ -1314,13 +1387,13 @@ export async function syncProductCardManagedFields(
     );
     updated += 1;
   }
-  const expectedLabels = [...values.keys()].filter((label) => !input.derivedOnly
-    || PRODUCT_CARD_DERIVED_LABELS.includes(label as typeof PRODUCT_CARD_DERIVED_LABELS[number]));
   return {
     scanned: blocks.length,
     updated,
-    matchedLabels: [...matchedLabels],
-    missingLabels: expectedLabels.filter((label) => !matchedLabels.has(label)),
+    matchedLabels,
+    missingLabels,
+    duplicateLabels,
+    currentValues,
   };
 }
 

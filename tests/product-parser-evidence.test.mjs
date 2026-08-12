@@ -96,7 +96,22 @@ function structuredCameraPage(options = {}) {
     ],
     skus: options.skus ?? [{ sku_name: "CAM-TEST" }],
   };
-  return `<html><head><meta property="og:title" content="${metaTitle}"><title>${metaTitle}</title></head><body><script id="__MODERN_ROUTER_DATA__" type="application/json">${JSON.stringify({ loaderData: { product_model: model } })}</script></body></html>`;
+  return `<html><head><meta property="og:title" content="${metaTitle}"><title>${metaTitle}</title></head><body><script id="__MODERN_ROUTER_DATA__" type="application/json">${JSON.stringify({ loaderData: { product_model: model, ...(options.routerExtras || {}) } })}</script></body></html>`;
+}
+
+function structuredPhoneCasePage() {
+  const model = {
+    product_id: pid,
+    name: productTitle,
+    description: JSON.stringify([{ text: "Shockproof silicone case for iPhone and Samsung" }]),
+    images: [],
+    product_properties: [
+      { property_name: "Material", property_values: [{ property_value_name: "Silicone" }] },
+      { property_name: "Compatible Devices", property_values: [{ property_value_name: "iPhone Samsung" }] },
+    ],
+    skus: [],
+  };
+  return `<html><head><title>Untrusted meta printer listing</title></head><body><script id="__MODERN_ROUTER_DATA__" type="application/json">${JSON.stringify({ loaderData: { product_model: model } })}</script></body></html>`;
 }
 
 function qwenProductResponse(product) {
@@ -246,16 +261,19 @@ test("AI fields require one trusted page quote per atomic claim and cannot self-
       usageMethod: "通过手机App连接2.4GHz Wi-Fi；自定义检测区域",
       usageQuotes: ["Quickly connect to your 2.4GHz WiFi with the Phone App"],
       visualEvidence: "",
+      expectedUsage: "通过手机App连接2.4GHz Wi-Fi",
     },
     {
       usageMethod: "自定义检测区域",
       usageQuotes: ["Custom Detection Zones"],
       visualEvidence: "Custom Detection Zones",
+      expectedUsage: "",
     },
     {
       usageMethod: "通过手机App连接2.4GHz Wi-Fi",
       usageQuotes: ["", "Quickly connect to your 2.4GHz WiFi with the Phone App"],
       visualEvidence: "",
+      expectedUsage: "",
     },
   ];
   for (const scenario of scenarios) {
@@ -292,9 +310,39 @@ test("AI fields require one trusted page quote per atomic claim and cannot self-
     assert.match(result.productParameters, /视频捕捉分辨率：2\.5K/);
     assert.doesNotMatch(result.productParameters, /4MP/);
     assert.equal(result.scenes, "室内家庭安防");
-    assert.equal(result.usageMethod, "", "a mismatched or self-authored quote must clear the whole field");
+    assert.equal(result.usageMethod, scenario.expectedUsage, "only the independently grounded atomic claim is retained");
     assert.equal(result.audience, "", "remote access cannot imply a person living alone");
+    assert.equal(result.verification.status, "partial");
+    assert.ok(result.verification.rejectedFactCount >= 1);
+    assert.equal(result.verification.sourceUrl, cameraUrl);
   }
+});
+
+test("partial verification keeps a grounded core fact while rejecting an extra invented fact", async () => {
+  globalThis.__productParserTestHooks = {
+    fetchWithProxy: async (url) => {
+      if (String(url).includes("/chat/completions")) {
+        return qwenProductResponse({
+          coreFunctions: ["宠物看护", "防火"],
+          usageMethod: "通过手机App连接2.4GHz Wi-Fi",
+          evidenceQuotes: {
+            coreFunctions: ["Pet/Dog/Cat Camera", cameraPageTitle],
+            usageMethod: ["Quickly connect to your 2.4GHz WiFi with the Phone App"],
+          },
+        });
+      }
+      return new Response(structuredCameraPage(), { status: 200 });
+    },
+  };
+
+  const result = await parser.parsePublicProductPage(cameraUrl, { productName: "室内摄像头", pid: cameraPid });
+  assert.deepEqual(result.coreFunctions, ["宠物看护"]);
+  assert.equal(result.usageMethod, "通过手机App连接2.4GHz Wi-Fi");
+  assert.equal(result.verification.status, "partial");
+  assert.ok(result.verification.verifiedFactCount >= 2);
+  assert.ok(result.verification.rejectedFactCount >= 1);
+  assert.deepEqual(result.verification.verifiedFields.includes("coreFunctions"), true);
+  assert.equal(result.verification.evidenceVersion, "exact-pdp-atomic-v1");
 });
 
 test("visual completion status is recomputed after a grounded text retry", async () => {
@@ -481,6 +529,316 @@ test("an AI-generated SKU cannot borrow an unrelated exact-page quote", async ()
   assert.equal(result.sku, "");
 });
 
+test("polluted router og_info, body text, and DOM images cannot certify facts for the exact product model", async () => {
+  globalThis.__productParserTestHooks = {
+    fetchWithProxy: async (url, init = {}) => {
+      if (String(url).includes("/chat/completions")) {
+        const request = JSON.parse(String(init.body));
+        assert.doesNotMatch(JSON.stringify(request.messages), /Waterproof battery solar camera/);
+        assert.doesNotMatch(JSON.stringify(request.messages), /wrong-product\.webp/);
+        return qwenProductResponse({
+          coreFunctions: ["防水保护", "宠物看护"],
+          usageMethod: "通过手机App连接2.4GHz Wi-Fi",
+          evidenceQuotes: {
+            coreFunctions: ["Waterproof battery solar camera", "Pet/Dog/Cat Camera"],
+            usageMethod: ["Quickly connect to your 2.4GHz WiFi with the Phone App"],
+          },
+        });
+      }
+      const exactModelPage = structuredCameraPage({
+        images: [],
+        routerExtras: {
+          og_info: {
+            product_id: "1739999999999999999",
+            title: "Waterproof battery solar camera",
+          },
+        },
+      }).replace(
+        "</body>",
+        '<div>Waterproof battery solar camera</div><img src="https://example.test/wrong-product.webp"></body>',
+      );
+      return new Response(exactModelPage, { status: 200 });
+    },
+  };
+
+  const result = await parser.parsePublicProductPage(cameraUrl, { productName: "室内摄像头", pid: cameraPid });
+  assert.deepEqual(result.coreFunctions, ["宠物看护"]);
+  assert.doesNotMatch(JSON.stringify(result), /防水|solar|battery/i);
+  assert.deepEqual(result.sourceImageUrls, []);
+  assert.ok(result.verification.rejectedFactCount >= 1);
+});
+
+test("main-product core facts cannot borrow carrying-bag, travel-pouch, adapter, or remote evidence", async () => {
+  for (const scenario of [
+    {
+      claim: "防水",
+      quote: "waterproof",
+      sourceLine: "Includes a waterproof carrying bag",
+    },
+    {
+      claim: "防水",
+      quote: "waterproof",
+      sourceLine: "Includes a waterproof travel pouch",
+    },
+    {
+      claim: "快充",
+      quote: "Fast charging adapter included",
+      sourceLine: "Fast charging adapter included",
+    },
+    {
+      claim: "电池",
+      quote: "Battery",
+      sourceLine: "Battery for remote",
+    },
+  ]) {
+    globalThis.__productParserTestHooks = {
+      fetchWithProxy: async (url) => {
+        if (String(url).includes("/chat/completions")) {
+          return qwenProductResponse({
+            coreFunctions: ["宠物看护", scenario.claim],
+            evidenceQuotes: {
+              coreFunctions: ["Pet/Dog/Cat Camera", scenario.quote],
+            },
+          });
+        }
+        return new Response(structuredCameraPage({
+          descriptionTexts: [
+            "Pet/Dog/Cat Camera",
+            scenario.sourceLine,
+          ],
+        }), { status: 200 });
+      },
+    };
+
+    const result = await parser.parsePublicProductPage(cameraUrl, { productName: "室内摄像头", pid: cameraPid });
+    assert.deepEqual(result.coreFunctions, ["宠物看护"], scenario.sourceLine);
+    assert.ok(result.verification.rejectedFactCount >= 1, scenario.sourceLine);
+  }
+});
+
+test("accessory-category products may keep their own positively bound facts", async () => {
+  const mainProductNames = [
+    "Waterproof Travel Pouch",
+    "Waterproof Protective Sleeve",
+    "Waterproof Phone Cover",
+    "Waterproof Holster",
+    "Waterproof Camera Mount",
+    "Waterproof Phone Stand",
+    "Waterproof USB Cable",
+    "Waterproof Wall Charger",
+    "Waterproof Charging Dock",
+    "Waterproof Wrist Strap",
+    "Waterproof Phone Holder",
+    "Waterproof Mounting Bracket",
+  ];
+  for (const pageTitle of mainProductNames) {
+    globalThis.__productParserTestHooks = {
+      fetchWithProxy: async (url) => {
+        if (String(url).includes("/chat/completions")) {
+          return qwenProductResponse({
+            coreFunctions: ["防水"],
+            evidenceQuotes: { coreFunctions: ["Waterproof"] },
+          });
+        }
+        return new Response(structuredCameraPage({
+          pageTitle,
+          descriptionTexts: [`${pageTitle} for daily use`],
+          images: [],
+          productProperties: [],
+          skus: [],
+        }), { status: 200 });
+      },
+    };
+
+    const result = await parser.parsePublicProductPage(cameraUrl, { productName: pageTitle, pid: cameraPid });
+    assert.deepEqual(result.coreFunctions, ["防水"], pageTitle);
+  }
+});
+
+test("short quotes cannot hide negated or contradictory exact-router sentences", async () => {
+  const scenarios = [
+    {
+      lines: ["Pet/Dog/Cat Camera", "This camera is not waterproof."],
+      claims: ["宠物看护", "防水"],
+      quotes: ["Pet/Dog/Cat Camera", "waterproof"],
+      expected: ["宠物看护"],
+    },
+    {
+      lines: ["Pet/Dog/Cat Camera", "This camera does not support night vision."],
+      claims: ["宠物看护", "夜视"],
+      quotes: ["Pet/Dog/Cat Camera", "night vision"],
+      expected: ["宠物看护"],
+    },
+    {
+      lines: [
+        "Pet/Dog/Cat Camera",
+        "This camera supports night vision.",
+        "This camera does not support night vision.",
+      ],
+      claims: ["宠物看护", "夜视"],
+      quotes: ["Pet/Dog/Cat Camera", "night vision"],
+      expected: ["宠物看护"],
+    },
+    {
+      lines: ["This camera is waterproof and supports night vision."],
+      claims: ["防水", "夜视"],
+      quotes: ["waterproof", "night vision"],
+      expected: ["防水", "夜视"],
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    globalThis.__productParserTestHooks = {
+      fetchWithProxy: async (url) => {
+        if (String(url).includes("/chat/completions")) {
+          return qwenProductResponse({
+            coreFunctions: scenario.claims,
+            evidenceQuotes: { coreFunctions: scenario.quotes },
+          });
+        }
+        return new Response(structuredCameraPage({
+          pageTitle: "Plain Indoor Camera",
+          descriptionTexts: scenario.lines,
+          images: [],
+          productProperties: [],
+          skus: [],
+        }), { status: 200 });
+      },
+    };
+
+    const result = await parser.parsePublicProductPage(cameraUrl, { productName: "室内摄像头", pid: cameraPid });
+    assert.deepEqual(result.coreFunctions, scenario.expected, scenario.lines.join(" "));
+  }
+});
+
+test("no-subscription benefits still require an affirmed source context", async () => {
+  const scenarios = [
+    {
+      line: "Non-subscription mode is not supported.",
+      quote: "Non-subscription",
+      expected: ["宠物看护"],
+    },
+    {
+      line: "No monthly fee option unavailable.",
+      quote: "No monthly fee",
+      expected: ["宠物看护"],
+    },
+    {
+      line: "Non-Subscription AI Camera.",
+      quote: "Non-Subscription",
+      expected: ["宠物看护", "无需订阅"],
+    },
+  ];
+  for (const scenario of scenarios) {
+    globalThis.__productParserTestHooks = {
+      fetchWithProxy: async (url) => {
+        if (String(url).includes("/chat/completions")) {
+          return qwenProductResponse({
+            coreFunctions: ["宠物看护", "无需订阅"],
+            evidenceQuotes: {
+              coreFunctions: ["Pet/Dog/Cat Camera", scenario.quote],
+            },
+          });
+        }
+        return new Response(structuredCameraPage({
+          pageTitle: "Plain Indoor Camera",
+          descriptionTexts: ["Pet/Dog/Cat Camera", scenario.line],
+          images: [],
+          productProperties: [],
+          skus: [],
+        }), { status: 200 });
+      },
+    };
+
+    const result = await parser.parsePublicProductPage(cameraUrl, { productName: "室内摄像头", pid: cameraPid });
+    assert.deepEqual(result.coreFunctions, scenario.expected, scenario.line);
+  }
+});
+
+test("an exact-PID URL without a bound router model cannot use recommendation prose as evidence", async () => {
+  const unstructuredUrl = `https://www.tiktok.com/shop/pdp/plain-camera/${cameraPid}`;
+  let chatCalls = 0;
+  globalThis.__productParserTestHooks = {
+    fetchWithProxy: async (url) => {
+      if (String(url).includes("/chat/completions")) {
+        chatCalls += 1;
+        return qwenProductResponse({
+          coreFunctions: ["防水"],
+          evidenceQuotes: { coreFunctions: ["Waterproof"] },
+        });
+      }
+      if (String(url).includes("/responses")) {
+        return new Response(JSON.stringify({ output: [] }), { status: 200 });
+      }
+      return new Response(`<html><head><title>Plain Camera - TikTok Shop</title></head><body>
+        <main>Product information is temporarily unavailable. ${"ordinary listing text ".repeat(20)}</main>
+        <aside>Customers also liked: Waterproof outdoor camera with night vision.</aside>
+      </body></html>`, { status: 200 });
+    },
+  };
+
+  await assert.rejects(
+    parser.parsePublicProductPage(unstructuredUrl, { productName: "室内摄像头", pid: cameraPid }),
+    /联网检索.*同 PID|联网检索没有找到/,
+  );
+  assert.equal(chatCalls, 0, "unstructured body/meta prose must never reach direct AI extraction");
+});
+
+test("usage, audience, and scenes reject facts whose quoted subject is an accessory", async () => {
+  globalThis.__productParserTestHooks = {
+    fetchWithProxy: async (url) => {
+      if (String(url).includes("/chat/completions")) {
+        return qwenProductResponse({
+          coreFunctions: ["宠物看护"],
+          usageMethod: "使用充电",
+          audience: "家庭用户",
+          scenes: "家庭",
+          evidenceQuotes: {
+            coreFunctions: ["Pet/Dog/Cat Camera"],
+            usageMethod: ["Use the included charging adapter"],
+            audience: ["Remote control for home users"],
+            scenes: ["Remote control for home users"],
+          },
+        });
+      }
+      return new Response(structuredCameraPage({
+        descriptionTexts: [
+          "Pet/Dog/Cat Camera",
+          "Use the included charging adapter",
+          "Remote control for home users",
+        ],
+      }), { status: 200 });
+    },
+  };
+
+  const result = await parser.parsePublicProductPage(cameraUrl, { productName: "室内摄像头", pid: cameraPid });
+  assert.deepEqual(result.coreFunctions, ["宠物看护"]);
+  assert.equal(result.usageMethod, "");
+  assert.equal(result.audience, "");
+  assert.equal(result.scenes, "");
+  assert.ok(result.verification.rejectedFactCount >= 3);
+});
+
+test("deterministic slug facts reject a shockproof carrying case as the camera's capability", async () => {
+  const accessorySlug = "pet-camera-with-shockproof-carrying-case";
+  const accessoryUrl = `https://shop.tiktok.com/us/pdp/${accessorySlug}/${cameraPid}`;
+  globalThis.__productParserTestHooks = {
+    fetchWithProxy: async (url) => {
+      if (String(url).includes("/chat/completions")) {
+        return qwenProductResponse({ coreFunctions: [], evidenceQuotes: {} });
+      }
+      return new Response(structuredCameraPage({
+        pageTitle: "Pet Camera with Shockproof Carrying Case",
+        descriptionTexts: ["Pet Camera with Shockproof Carrying Case"],
+      }), { status: 200 });
+    },
+  };
+
+  const result = await parser.parsePublicProductPage(accessoryUrl, { productName: "宠物摄像头", pid: cameraPid });
+  assert.doesNotMatch(JSON.stringify(result.coreFunctions), /防震/);
+  assert.equal(result.verification.status, "partial");
+});
+
 test("the production camera URL falls back safely when direct Qwen times out", async () => {
   const chatModes = [];
   globalThis.__productParserTestHooks = {
@@ -620,10 +978,15 @@ test("a forged direct slug cannot create facts absent from the same structured p
         error.name = "TimeoutError";
         throw error;
       }
+      if (String(url).includes("/responses")) {
+        return new Response(JSON.stringify({ output: [] }), { status: 200 });
+      }
       return new Response(structuredCameraPage({
         pageTitle: "Plain Desk Clock",
         metaTitle: "2.5K Indoor Security Camera with AI Detection, 2-Way Audio and Night Vision",
         descriptionTexts: ["Simple clock display"],
+        productProperties: [],
+        skus: [],
       }), { status: 200 });
     },
   };
@@ -633,7 +996,7 @@ test("a forged direct slug cannot create facts absent from the same structured p
       `https://shop.tiktok.com/us/pdp/${forgedSlug}/${cameraPid}`,
       { productName: "桌面时钟", pid: cameraPid },
     ),
-    /Qwen 请求超时.*官方商品页路径也没有足够的确定性白名单资料/,
+    /Qwen 请求超时.*联网检索/,
   );
   assert.deepEqual(chatModes, ["visual", "text"], "a product without a usable deterministic candidate keeps the text retry");
 });
@@ -647,18 +1010,22 @@ test("direct fallback ignores conflicting meta titles and fuzzy 2 5K router text
         error.name = "TimeoutError";
         throw error;
       }
+      if (String(url).includes("/responses")) {
+        return new Response(JSON.stringify({ output: [] }), { status: 200 });
+      }
       return new Response(structuredCameraPage({
         pageTitle: fuzzyTitle,
         metaTitle: "CINMOORE 2.5K Indoor Security Camera with AI Detection - TikTok Shop",
         productProperties: [],
+        skus: [],
       }), { status: 200 });
     },
   };
 
-  await assert.rejects(
-    parser.parsePublicProductPage(cameraUrl, { productName: "室内摄像头", pid: cameraPid }),
-    /官方商品页路径也没有足够的确定性白名单资料/,
-  );
+  const result = await parser.parsePublicProductPage(cameraUrl, { productName: "室内摄像头", pid: cameraPid });
+  assert.deepEqual(result.coreFunctions, ["室内安防监控", "AI检测", "双向语音", "夜视"]);
+  assert.equal(result.productParameters, "", "meta 2.5K and fuzzy router 2 5K cannot certify exact 2.5K");
+  assert.equal(result.verification.status, "partial");
 });
 
 test("direct provider HTTP, invalid JSON, and insufficient failures remain diagnosable", async () => {
@@ -667,6 +1034,9 @@ test("direct provider HTTP, invalid JSON, and insufficient failures remain diagn
     pageTitle: "Plain Desk Clock",
     metaTitle: "Plain Desk Clock - TikTok Shop",
     descriptionTexts: ["Simple clock display"],
+    images: [],
+    productProperties: [],
+    skus: [],
   });
   const scenarios = [
     {
@@ -700,9 +1070,13 @@ test("direct provider HTTP, invalid JSON, and insufficient failures remain diagn
 
   for (const scenario of scenarios) {
     globalThis.__productParserTestHooks = {
-      fetchWithProxy: async (url) => String(url).includes("/chat/completions")
-        ? scenario.providerResponse()
-        : new Response(page, { status: 200 }),
+      fetchWithProxy: async (url) => {
+        if (String(url).includes("/chat/completions")) return scenario.providerResponse();
+        if (String(url).includes("/responses")) {
+          return new Response(JSON.stringify({ output: [] }), { status: 200 });
+        }
+        return new Response(page, { status: 200 });
+      },
     };
     await assert.rejects(
       parser.parsePublicProductPage(unsupportedUrl, { productName: "桌面时钟", pid: cameraPid }),
@@ -759,7 +1133,7 @@ test("a direct TikTok challenge falls through to exact-source web search", { tim
   };
 
   const result = await parser.parsePublicProductPage(productUrl, { productName: "手机壳", pid });
-  assert.equal(directCalls, 6, "both TikTok hosts should be retried before web search");
+  assert.equal(directCalls, 9, "the original page and recovered exact PDP each follow the bounded retry schedule");
   assert.equal(searchCalls, 1);
   assert.equal(chatCalls, 0);
   assert.equal(result.productName, "手机壳");
@@ -769,7 +1143,47 @@ test("a direct TikTok challenge falls through to exact-source web search", { tim
   assert.equal(result.sourceDescription, "");
   assert.equal(result.visualAnalysisStatus, "unavailable");
   assert.deepEqual(result.sourceImageUrls, []);
+  assert.equal(result.verification.status, "partial");
+  assert.equal(result.verification.sourceUrl, `https://www.tiktok.com/shop/pdp/${productSlug}/${pid}?source=301`);
   assert.doesNotMatch(JSON.stringify(result), /waterproof|battery/i);
+});
+
+test("a view-product endpoint recovers an exact same-PID PDP and parses that fetched router model", async () => {
+  const viewUrl = `https://www.tiktok.com/view/product/${pid}`;
+  const recoveredUrl = `https://www.tiktok.com/shop/pdp/${productSlug}/${pid}?source=301`;
+  let recoveredFetches = 0;
+  let searchCalls = 0;
+  globalThis.__productParserTestHooks = {
+    fetchWithProxy: async (url) => {
+      const requestUrl = String(url);
+      if (requestUrl.includes("/responses")) {
+        searchCalls += 1;
+        return new Response(JSON.stringify({
+          output: [{
+            type: "web_search_call",
+            status: "completed",
+            action: { sources: [{ url: recoveredUrl }] },
+          }],
+        }), { status: 200 });
+      }
+      if (requestUrl.includes("/chat/completions")) {
+        return qwenProductResponse({ coreFunctions: [], evidenceQuotes: {} });
+      }
+      if (requestUrl.includes(`/shop/pdp/${productSlug}/${pid}`)) {
+        recoveredFetches += 1;
+        return new Response(structuredPhoneCasePage(), { status: 200 });
+      }
+      return new Response("", { status: 404 });
+    },
+  };
+
+  const result = await parser.parsePublicProductPage(viewUrl, { productName: "手机壳", pid });
+  assert.equal(searchCalls, 1);
+  assert.equal(recoveredFetches, 1, "the discovered exact PDP must actually be fetched");
+  assert.deepEqual(result.coreFunctions, ["防震保护"]);
+  assert.match(result.productParameters, /材质：硅胶/);
+  assert.equal(result.verification.sourceUrl, recoveredUrl);
+  assert.doesNotMatch(JSON.stringify(result), /printer/i);
 });
 
 test("grounded-looking model output is rejected when search found only another PID", async () => {

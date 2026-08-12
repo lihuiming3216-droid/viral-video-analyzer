@@ -76,6 +76,14 @@ test("identity and verified-basic modes only change exact single-line managed la
     "商品名称：Camera / Baby: 2.5K",
     "document text must not use filename sanitization",
   );
+  assert.equal(
+    documentModule.syncProductCardManagedBlockText("商品名称：旧名称", {
+      mode: "identity",
+      name: "",
+    }),
+    "商品名称：",
+    "an explicit empty field clears its managed value",
+  );
   for (const untouched of [
     "人工说明：商品名称：不要改这里",
     "这里提到商品名称：不要改",
@@ -134,6 +142,90 @@ test("identity and verified-basic modes only change exact single-line managed la
     "使用方法：",
     "clearDerived explicitly clears omitted derived fields",
   );
+});
+
+test("document block listing reads every page beyond the 500-block API limit", async () => {
+  const requests = [];
+  const firstPage = Array.from({ length: 500 }, (_, index) => textBlock(`first-${index}`, `普通内容 ${index}`));
+  const secondPage = [textBlock("second-1", "商品名称：旧名称"), textBlock("second-2", "商品ID：旧PID")];
+  const client = {
+    request: async (request) => {
+      requests.push(request);
+      if (!request.params.page_token) {
+        return { code: 0, data: { items: firstPage, has_more: true, page_token: "next-page" } };
+      }
+      assert.equal(request.params.page_token, "next-page");
+      return { code: 0, data: { items: secondPage, has_more: false } };
+    },
+  };
+
+  const blocks = await documentModule.listFeishuDocumentBlocks(client, "document-token");
+  assert.equal(blocks.length, 502);
+  assert.equal(blocks[500].block_id, "second-1");
+  assert.equal(requests.length, 2);
+  assert.deepEqual(requests.map((request) => request.params.document_revision_id), ["-1", "-1"]);
+  assert.deepEqual(requests.map((request) => request.params.page_size), ["500", "500"]);
+});
+
+test("verified-basic preflight validates all nine unique labels and never patches", async () => {
+  const patches = [];
+  const completeTemplate = [
+    textBlock("name", "商品名称：旧名称"),
+    textBlock("url", "产品链接：https://old.invalid", "https://old.invalid"),
+    textBlock("pid", "商品ID：旧PID"),
+    textBlock("sku", "产品SKU：旧SKU"),
+    textBlock("functions", "产品主要功能：旧功能"),
+    textBlock("parameters", "产品参数：旧参数"),
+    textBlock("method", "使用方法：旧方法"),
+    textBlock("audience", "适用人群：旧人群"),
+    textBlock("scenes", "使用场景：旧场景"),
+  ];
+  let blocks = completeTemplate;
+  const client = {
+    request: async () => ({ code: 0, data: { items: blocks } }),
+    docx: { v1: { documentBlock: { patch: async (request) => {
+      patches.push(request);
+      return { code: 0 };
+    } } } },
+  };
+
+  const valid = await documentModule.syncProductCardManagedFields(client, {
+    documentId: "complete-template",
+    mode: "verified-basic",
+    preflightOnly: true,
+  });
+  assert.equal(valid.updated, 0);
+  assert.equal(valid.matchedLabels.length, 9);
+  assert.deepEqual(valid.missingLabels, []);
+  assert.deepEqual(valid.duplicateLabels, []);
+  assert.deepEqual(valid.currentValues, {
+    商品名称: "旧名称",
+    产品链接: "https://old.invalid",
+    商品ID: "旧PID",
+    产品SKU: "旧SKU",
+    产品主要功能: "旧功能",
+    产品参数: "旧参数",
+    使用方法: "旧方法",
+    适用人群: "旧人群",
+    使用场景: "旧场景",
+  });
+  assert.equal(patches.length, 0);
+
+  blocks = [
+    ...completeTemplate.filter((block) => block.block_id !== "scenes"),
+    textBlock("name-duplicate", "🎈 商品名称：另一个名称"),
+  ];
+  const invalid = await documentModule.syncProductCardManagedFields(client, {
+    documentId: "invalid-template",
+    mode: "verified-basic",
+    preflightOnly: true,
+  });
+  assert.equal(invalid.updated, 0);
+  assert.deepEqual(invalid.missingLabels, ["使用场景"]);
+  assert.deepEqual(invalid.duplicateLabels, ["商品名称"]);
+  assert.equal(Object.hasOwn(invalid.currentValues, "商品名称"), false,
+    "an ambiguous duplicate value must not be exposed as document identity evidence");
+  assert.equal(patches.length, 0, "preflight must report every structural problem without patching");
 });
 
 test("the managed-field API patches only the selected exact blocks and preserves link identity", async () => {
@@ -389,6 +481,107 @@ test("a non-template document reports every missing managed label", async () => 
     "商品名称", "产品链接", "商品ID", "产品SKU", "产品主要功能",
     "产品参数", "使用方法", "适用人群", "使用场景",
   ].sort());
+});
+
+test("a partially missing template performs zero patches", async () => {
+  const patches = [];
+  const client = {
+    request: async () => ({ code: 0, data: { items: [textBlock("name", "商品名称：旧名称")] } }),
+    docx: { v1: { documentBlock: { patch: async (request) => {
+      patches.push(request);
+      return { code: 0 };
+    } } } },
+  };
+  const result = await documentModule.syncProductCardManagedFields(client, {
+    documentId: "partially-missing-template",
+    mode: "identity",
+    name: "新名称",
+    pid: "1731678528327946361",
+  });
+  assert.equal(result.updated, 0);
+  assert.deepEqual(result.matchedLabels, ["商品名称"]);
+  assert.deepEqual(result.missingLabels, ["商品ID"]);
+  assert.deepEqual(result.duplicateLabels, []);
+  assert.equal(patches.length, 0, "a valid earlier block must not be patched before preflight finishes");
+});
+
+test("a duplicate expected label performs zero patches and raises a safe template error", async () => {
+  const patches = [];
+  const client = {
+    request: async () => ({ code: 0, data: { items: [
+      textBlock("name-a", "商品名称：旧名称 A"),
+      textBlock("name-b", "🎈商品名称：旧名称 B"),
+    ] } }),
+    docx: { v1: { documentBlock: { patch: async (request) => {
+      patches.push(request);
+      return { code: 0 };
+    } } } },
+  };
+  await assert.rejects(
+    documentModule.syncProductCardManagedFields(client, {
+      documentId: "duplicate-template",
+      mode: "identity",
+      name: "新名称",
+    }),
+    /产品手卡模板基础字段重复：商品名称/,
+  );
+  assert.equal(patches.length, 0);
+});
+
+test("identical values are no-ops while omitted fields preserve and explicit empty clears", async () => {
+  const url = "https://shop.tiktok.com/us/pdp/camera/1731678528327946361";
+  const identityBlocks = [
+    textBlock("name", "商品名称：摄像头"),
+    textBlock("url", `产品链接：${url}`, url),
+    textBlock("pid", "商品ID：1731678528327946361"),
+  ];
+  const patches = [];
+  let blocks = identityBlocks;
+  const client = {
+    request: async () => ({ code: 0, data: { items: blocks } }),
+    docx: { v1: { documentBlock: { patch: async (request) => {
+      patches.push(request);
+      return { code: 0 };
+    } } } },
+  };
+
+  const unchanged = await documentModule.syncProductCardManagedFields(client, {
+    documentId: "same-values",
+    mode: "identity",
+    name: "摄像头",
+    productUrl: url,
+    pid: "1731678528327946361",
+  });
+  assert.equal(unchanged.updated, 0);
+  assert.equal(patches.length, 0);
+
+  blocks = [
+    textBlock("method", "使用方法：旧方法"),
+    textBlock("audience", "适用人群：人工保留"),
+  ];
+  const cleared = await documentModule.syncProductCardManagedFields(client, {
+    documentId: "partial-clear",
+    mode: "verified-basic",
+    usageMethod: "",
+  });
+  assert.equal(cleared.updated, 1);
+  assert.deepEqual(cleared.matchedLabels, ["使用方法"]);
+  assert.equal(patches.length, 1);
+  assert.equal(patches[0].path.block_id, "method");
+  assert.equal(
+    patches[0].data.update_text_elements.elements.map((element) => element.text_run.content).join(""),
+    "使用方法：",
+  );
+
+  patches.length = 0;
+  const omitted = await documentModule.syncProductCardManagedFields(client, {
+    documentId: "partial-preserve",
+    mode: "verified-basic",
+  });
+  assert.equal(omitted.updated, 0);
+  assert.deepEqual(omitted.matchedLabels, []);
+  assert.deepEqual(omitted.missingLabels, []);
+  assert.equal(patches.length, 0, "omitting every managed field must preserve the document exactly");
 });
 
 test("verified sync writes identity before derived fields in a rearranged template", async () => {

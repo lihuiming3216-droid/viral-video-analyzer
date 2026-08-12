@@ -44,12 +44,44 @@ export interface Product {
   visualAnalysisStatus: "" | "completed" | "unavailable";
   /** Cache marker: a PID is visually analyzed at most once unless forced. */
   visualAnalyzedAt: string | null;
+  /** PID whose product facts passed the current evidence validation pipeline. */
+  verifiedPid: string;
+  /** Exact public source URL used by the successful evidence validation. */
+  verifiedSourceUrl: string;
+  /** Validation-policy version that certified the stored product facts. */
+  evidenceVersion: string;
+  /** ISO timestamp of the last atomic verified-fact merge. */
+  factsVerifiedAt: string;
   bannedTerms: string;
   notes: string;
   isSystem: boolean;
   videoCount: number;
   createdAt: string;
   updatedAt: string;
+}
+
+/**
+ * A parser-certified, atomic product-fact update. Undefined fields preserve a
+ * prior snapshot only when PID and evidence version both match. The source URL
+ * is updated to the exact source used for the current merge. Explicit empty
+ * strings/arrays clear that field within the same snapshot.
+ */
+export interface VerifiedProductFactsMergeInput {
+  pid: string;
+  sourceUrl: string;
+  evidenceVersion: string;
+  verifiedAt: string;
+  sku?: string;
+  coreFunctions?: string[];
+  productParameters?: string;
+  usageMethod?: string;
+  targetAudience?: string;
+  usageScenes?: string;
+  sourceTitle?: string;
+  sourceDescription?: string;
+  sourceImageUrls?: string[];
+  visualEvidence?: string;
+  visualAnalysisStatus?: Product["visualAnalysisStatus"];
 }
 
 export interface ScoreSet {

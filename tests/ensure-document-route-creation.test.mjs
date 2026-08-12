@@ -15,11 +15,11 @@ async function loadRouteModule() {
     export const NextResponse = { json: (body, init = {}) => ({ body, status: init.status || 200 }) };
     export const createProduct = (...args) => hooks().createProduct(...args);
     export const getProductByPid = (...args) => hooks().getProductByPid?.(...args) ?? null;
+    export const mergeVerifiedProductFacts = (...args) => hooks().mergeVerifiedProductFacts?.(...args) ?? null;
     export const updateProduct = (...args) => hooks().updateProduct?.(...args) ?? null;
     export const ensureProductDocument = (...args) => hooks().ensureProductDocument(...args);
     export const ensureFeishuConnection = (...args) => hooks().ensureFeishuConnection?.(...args) ?? null;
     export const getConnectedFeishuChannel = (...args) => hooks().getConnectedFeishuChannel?.(...args) ?? null;
-    export const hasUsableProductInfo = (...args) => hooks().hasUsableProductInfo?.(...args) ?? false;
     export const isExactTikTokProductSource = (...args) => hooks().isExactTikTokProductSource?.(...args) ?? true;
     export const parsePublicProductPage = (...args) => hooks().parsePublicProductPage(...args);
   `;
@@ -62,6 +62,10 @@ function product() {
     coreFunctions: [],
     propImages: [],
     visualAnalyzedAt: null,
+    verifiedPid: "",
+    verifiedSourceUrl: "",
+    evidenceVersion: "",
+    factsVerifiedAt: "",
   };
 }
 
@@ -105,4 +109,65 @@ test("explicit parseProduct:false keeps the manual creation path", async () => {
   assert.equal(createCalls, 1);
   assert.equal(parseCalls, 0);
   assert.equal(documentCalls, 1);
+});
+
+test("partial refresh renders the complete merged verified snapshot", async () => {
+  const existing = {
+    ...product(),
+    coreFunctions: ["旧有可信功能"],
+    productParameters: "分辨率：2.5K",
+    verifiedPid: pid,
+    verifiedSourceUrl: productUrl,
+    evidenceVersion: "exact-pdp-atomic-v1",
+    factsVerifiedAt: "2026-08-12T00:00:00.000Z",
+  };
+  const merged = {
+    ...existing,
+    usageMethod: "点击按钮启动",
+    factsVerifiedAt: "2026-08-12T01:00:00.000Z",
+  };
+  let current = existing;
+  let documentInput = null;
+  globalThis.__ensureDocumentRouteTestHooks = {
+    getProductByPid: () => current,
+    updateProduct: () => current,
+    parsePublicProductPage: async () => ({
+      sku: "",
+      coreFunctions: [],
+      productParameters: "",
+      usageMethod: "点击按钮启动",
+      audience: "",
+      scenes: "",
+      sellingPoints: "",
+      sourceTitle: "Exact product",
+      sourceDescription: "",
+      sourceImageUrls: [],
+      visualEvidence: "",
+      visualAnalysisStatus: "unavailable",
+      verification: {
+        status: "partial",
+        verifiedFactCount: 1,
+        rejectedFactCount: 0,
+        verifiedFields: ["usageMethod"],
+        missingFields: ["sku", "coreFunctions", "productParameters", "audience", "scenes"],
+        sourceUrl: productUrl,
+        evidenceVersion: "exact-pdp-atomic-v1",
+      },
+    }),
+    mergeVerifiedProductFacts: () => {
+      current = merged;
+      return merged;
+    },
+    getConnectedFeishuChannel: () => ({ rawClient: {} }),
+    ensureProductDocument: async (_client, _product, input) => {
+      documentInput = input;
+      return { documentId: "document", documentUrl: "https://feishu.cn/docx/document" };
+    },
+  };
+
+  const response = await route.POST(request({ forceProductParse: true }));
+  assert.equal(response.status, 200);
+  assert.deepEqual(documentInput.coreFunctions, ["旧有可信功能"]);
+  assert.equal(documentInput.productParameters, "分辨率：2.5K");
+  assert.equal(documentInput.usageMethod, "点击按钮启动");
 });

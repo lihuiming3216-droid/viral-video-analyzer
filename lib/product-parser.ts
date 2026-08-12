@@ -778,8 +778,10 @@ export async function parsedProductInfoFromOpenAICapture(input: {
     audience,
     scenes,
     sellingPoints: "",
-    visualEvidence: `已完成 ${input.capture.images.length} 张同 PID 商品主体图片分析`,
-    visualAnalysisStatus: "completed",
+    visualEvidence: input.capture.images.length
+      ? `已完成 ${input.capture.images.length} 张同 PID 商品主体图片分析`
+      : "无商品主体图片，已基于完整商品详情文字分析",
+    visualAnalysisStatus: input.capture.images.length ? "completed" : "unavailable",
     verification: {
       // withProductVerification recomputes all counters from this basis map.
       status: "partial",
@@ -1753,15 +1755,6 @@ export async function collectProductPageWithDriver(
     expectedImageCount: structured.imageCandidates.length,
     usableImageCount: usable.length,
   } as const;
-  // A zero-image capture has a stable, actionable classification regardless
-  // of whether detail expansion or scrolling also failed.
-  if (usable.length === 0) {
-    return unavailableCollectionResult("all_product_images_unavailable", {
-      html: collected.html,
-      text: collected.text,
-      diagnostics,
-    });
-  }
   if (collected.detailTextTruncated || detailState === "incomplete" || scrollState === "incomplete") {
     return unavailableCollectionResult("page_incomplete", {
       html: collected.html,
@@ -1793,6 +1786,18 @@ export async function collectProductPageWithDriver(
     fragments.push({ id: "scoped-dom-details", kind: "scoped_dom", text: scopedDetailText });
   }
   fragments.splice(64);
+  const substantiveTextLength = fragments
+    .filter((fragment) => fragment.id !== "router-title")
+    .reduce((total, fragment) => total + clean(fragment.text).length, 0);
+  // A complete exact-PID description is sufficient evidence even when the
+  // seller publishes only video media. A bare title plus zero images is not.
+  if (!images.length && substantiveTextLength < 200) {
+    return unavailableCollectionResult("all_product_images_unavailable", {
+      html: collected.html,
+      text: collected.text,
+      diagnostics,
+    });
+  }
   const digestInput = {
     captureId,
     pid,

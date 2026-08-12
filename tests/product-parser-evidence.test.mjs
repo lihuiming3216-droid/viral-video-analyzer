@@ -305,6 +305,23 @@ test("collection rejects trusted-host aliases with a conflicting PID or a non-of
   }
 });
 
+test("browser navigation permits only a same-PID official view endpoint as an intermediate hop", () => {
+  const samePidView = `https://www.tiktok.com/view/product/${cameraPid}?pid=${cameraPid}`;
+  assert.equal(parser.isTrustedProductNavigationHopUrl(samePidView, cameraPid), true);
+  assert.equal(parser.isExactTikTokProductSource(samePidView, cameraPid), false,
+    "a view endpoint may never become final product evidence");
+
+  for (const sourceUrl of [
+    `https://www.tiktok.com/view/product/1732364299482009896`,
+    `https://www.tiktok.com/view/product/${cameraPid}?product_id=1732364299482009896`,
+    `http://www.tiktok.com/view/product/${cameraPid}`,
+    `https://user:password@www.tiktok.com/view/product/${cameraPid}`,
+    `https://www.tiktok.com:8443/view/product/${cameraPid}`,
+    `https://www.tiktok.com.evil.example/view/product/${cameraPid}`,
+    `https://www.tiktok.com/@seller/video/${cameraPid}`,
+  ]) assert.equal(parser.isTrustedProductNavigationHopUrl(sourceUrl, cameraPid), false, sourceUrl);
+});
+
 test("anonymous product fetch follows only trusted same-PID redirects", async () => {
   const url = `https://shop.tiktokw.us/us/pdp/${cameraPid}`;
   const trusted = `https://shop.tiktok.com/us/pdp/camera/${cameraPid}`;

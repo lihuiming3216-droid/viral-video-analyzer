@@ -171,3 +171,55 @@ test("partial refresh renders the complete merged verified snapshot", async () =
   assert.equal(documentInput.productParameters, "分辨率：2.5K");
   assert.equal(documentInput.usageMethod, "点击按钮启动");
 });
+
+test("labelled OpenAI inference is accepted without pretending it was directly verified", async () => {
+  let current = product();
+  let mergeInput = null;
+  const inferred = {
+    coreFunctions: ["辅助查看门外情况（AI推断）"],
+    usageMethod: "安装后通过手机查看（AI推断）",
+    audience: "需要查看访客的家庭用户（AI推断）",
+    scenes: "住宅门口访客查看（AI推断）",
+  };
+  globalThis.__ensureDocumentRouteTestHooks = {
+    getProductByPid: () => current,
+    updateProduct: () => current,
+    parsePublicProductPage: async () => ({
+      sku: "", productParameters: "", sellingPoints: "", sourceTitle: "Exact product",
+      sourceDescription: "", sourceImageUrls: [], visualEvidence: "", visualAnalysisStatus: "completed",
+      ...inferred,
+      verification: {
+        status: "complete",
+        verifiedFactCount: 0,
+        acceptedFactCount: 4,
+        inferredFactCount: 4,
+        rejectedFactCount: 0,
+        verifiedFields: [],
+        acceptedFields: ["coreFunctions", "usageMethod", "audience", "scenes"],
+        inferredFields: ["coreFunctions", "usageMethod", "audience", "scenes"],
+        missingFields: [],
+        sourceUrl: productUrl,
+        evidenceVersion: "complete-pdp-openai-v1",
+        factProvenance: {
+          coreFunctions: [{ value: inferred.coreFunctions[0], basis: "ai_inference" }],
+          usageMethod: [{ value: inferred.usageMethod, basis: "ai_inference" }],
+          audience: [{ value: inferred.audience, basis: "ai_inference" }],
+          scenes: [{ value: inferred.scenes, basis: "ai_inference" }],
+        },
+      },
+    }),
+    mergeVerifiedProductFacts: (_id, input) => {
+      mergeInput = input;
+      current = { ...current, ...inferred };
+      return current;
+    },
+    getConnectedFeishuChannel: () => ({ rawClient: {} }),
+    ensureProductDocument: async () => ({ documentId: "document", documentUrl: "https://feishu.cn/docx/document" }),
+  };
+
+  const response = await route.POST(request({ forceProductParse: true }));
+  assert.equal(response.status, 200);
+  assert.deepEqual(mergeInput.coreFunctions, inferred.coreFunctions);
+  assert.equal(mergeInput.usageMethod, inferred.usageMethod);
+  assert.equal(mergeInput.factProvenance.coreFunctions[0].basis, "ai_inference");
+});

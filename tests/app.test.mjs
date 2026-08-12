@@ -77,14 +77,20 @@ test("product documents auto-sync in lightweight mode and keep the manual prop a
   assert.match(tokscript, /options\.includeCover !== false/);
   assert.match(tokscript, /fetchWithProxy\(this\.endpoint/);
   assert.match(tokscript, /AbortSignal\.timeout/);
-  assert.match(tokscript, /TokScript 口播获取超时，已改用音频转写/);
+  assert.match(tokscript, /TokScript 未返回有效口播文案/);
+  assert.match(tokscript, /resolveTokScriptVideoUrl/);
+  assert.doesNotMatch(tokscript, /已改用音频转写/);
   assert.match(processing, /includeAudio\?: boolean/);
   assert.match(processing, /fetchWithProxy\(url/);
   assert.match(processing, /signal: requestSignal/);
   assert.match(processing, /normalizedDownloadError/);
   assert.match(analysis, /withOneNetworkRetry/);
   assert.match(analysis, /原视频下载较慢，正在自动重试/);
-  assert.match(analysis, /includeAudio: !transcript/);
+  assert.match(analysis, /includeAudio: initial\.sourceType !== "tiktok" && !transcript/);
+  assert.match(analysis, /initial\.sourceType !== "tiktok" && !transcript && assets\.audioPath/);
+  assert.match(analysis, /storedTokScriptFailure/);
+  assert.match(analysis, /tokScriptTranscriptFailure\(transcript\)/);
+  assert.match(analysis, /!relativeVideoPath \|\| !transcript\.trim\(\) \|\| storedTokScriptFailure/);
   assert.match(document, /insertProductPropsSection/);
   assert.match(document, /道具列表（员工手动录入）/);
   assert.match(document, /column_size: 3/);
@@ -242,7 +248,9 @@ test("Feishu button automation acknowledges immediately and writes back in the b
   assert.match(route, /after\(async \(\) =>/);
   assert.match(route, /writeBack: true/);
   assert.match(route, /\{ status: 202 \}/);
-  assert.match(route, /activeProductJobs/);
+  assert.doesNotMatch(route, /activeProductJobs/);
+  assert.match(route, /Every accepted click schedules one refresh/);
+  assert.match(automation, /product-card-record:/);
   assert.doesNotMatch(automation, /canRelinkExistingDocument|cachedFallbackEligible|hasVerifiedCache/);
   assert.match(automation, /ensureProductCardShell/);
   assert.match(automation, /Every click performs a new exact-link\/PID parse/);
@@ -263,9 +271,10 @@ test("generated Feishu documents grant company editors collaborator management",
   assert.match(permissionRoute, /getCompanyDocumentPermission/);
 });
 
-test("product cards use verified TikTok evidence and resync reused documents", async () => {
-  const [parser, automation, document, database, ensureDocument, tiktokProduct] = await Promise.all([
+test("product cards use complete TikTok captures, OpenAI analysis, and safe document resync", async () => {
+  const [parser, openaiAnalyzer, automation, document, database, ensureDocument, tiktokProduct] = await Promise.all([
     readFile(new URL("lib/product-parser.ts", root), "utf8"),
+    readFile(new URL("lib/openai-product-analyzer.ts", root), "utf8"),
     readFile(new URL("lib/feishu/automation.ts", root), "utf8"),
     readFile(new URL("lib/feishu/document.ts", root), "utf8"),
     readFile(new URL("lib/database.ts", root), "utf8"),
@@ -294,13 +303,15 @@ test("product cards use verified TikTok evidence and resync reused documents", a
   assert.match(parser, /SKU 不得填写 PID 或商品ID/);
   assert.match(parser, /SKU is copied only from the exact-PID router model/);
   assert.match(parser, /sku: base\.sku/);
-  assert.match(parser, /type: "image_url"/);
-  assert.match(parser, /MAX_PRODUCT_IMAGES = 8/);
+  assert.match(parser, /analyzeProductCaptureWithOpenAI/);
+  assert.match(parser, /parsedProductInfoFromOpenAICapture/);
+  assert.match(parser, /MAX_PRODUCT_IMAGES = 20/);
   assert.match(parser, /playwright-core/);
-  assert.match(parser, /查看更多\|View more\|See more/);
-  assert.match(parser, /NON_PRODUCT_SECTION/);
-  assert.match(parser, /Coupon center\|优惠券/);
-  assert.match(parser, /About this shop\|关于店铺/);
+  assert.match(parser, /PRODUCT_DETAIL_CONTROL_LABELS/);
+  assert.match(parser, /"详细内容"/);
+  assert.match(parser, /requiredStableRounds/);
+  assert.match(parser, /all_product_images_unavailable/);
+  assert.match(parser, /scoped-dom-details/);
   assert.match(parser, /max_pixels: MAX_IMAGE_PIXELS/);
   assert.match(parser, /visualEvidence/);
   assert.match(parser, /hasReliableVisualEvidence/);
@@ -309,11 +320,19 @@ test("product cards use verified TikTok evidence and resync reused documents", a
   assert.match(parser, /exactSourceMatched/);
   assert.match(parser, /sellingPoints: ""/);
   assert.match(parser, /sourceImageUrls: \[\]/);
+  assert.match(openaiAnalyzer, /gpt-5\.6-terra/);
+  assert.match(openaiAnalyzer, /type: "json_schema"/);
+  assert.match(openaiAnalyzer, /strict: true/);
+  assert.match(openaiAnalyzer, /（AI推断）/);
+  assert.match(openaiAnalyzer, /CONTROLLED_INFERENCE_TEMPLATES/);
+  assert.match(openaiAnalyzer, /titleHasAccessorySubject/);
+  assert.match(openaiAnalyzer, /role: "developer"/);
   assert.match(automation, /const productUrl = urlField/);
   assert.match(automation, /const pid = extractProductIdFromUrl\(productUrl\)/);
   assert.match(automation, /ensureProductCardShell\(input\.client/);
   assert.match(automation, /手卡已就绪，资料刷新中/);
-  assert.match(automation, /手卡已就绪，资料刷新失败/);
+  assert.match(automation, /productCardFailureStatus/);
+  assert.match(automation, /资料\$\{analysisFailure \? "分析" : "刷新"\}失败/);
   assert.match(automation, /syncProductCardManagedFields/);
   assert.match(automation, /clearDerived: true/);
   assert.doesNotMatch(automation, /productUrlFromPid\(pid\)/);

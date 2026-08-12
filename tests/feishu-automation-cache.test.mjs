@@ -52,7 +52,7 @@ async function loadAutomationModule() {
     export const isExactTikTokProductSource = (sourceUrl, productId) => {
       try {
         const url = new URL(sourceUrl);
-        const match = url.pathname.match(/\\/pdp\\/[^/]+\\/(\\d{6,})\\/?$/);
+        const match = url.pathname.match(/\\/pdp\\/(?:[^/]+\\/)?(\\d{6,})\\/?$/);
         if (url.protocol !== "https:" || url.hostname !== "shop.tiktok.com" || match?.[1] !== productId) return false;
         return ["pid", "product_id", "productId", "item_id", "itemId"]
           .every((key) => url.searchParams.getAll(key).every((value) => value === productId));
@@ -211,6 +211,67 @@ test("the product-card hyperlink field uses its link instead of display text", (
     产品手卡: { text: "打开手卡", link: documentUrl },
   });
   assert.equal(resolved.productDocument, documentUrl);
+});
+
+test("typed page and image failures publish the stable Base statuses", () => {
+  for (const [code, expected] of [
+    ["page_unavailable", "无法打开页面"],
+    ["security_challenge", "无法打开页面"],
+    ["all_product_images_unavailable", "无法获取图片信息"],
+    ["page_incomplete", "商品信息获取不完整"],
+    ["invalid_capture", "商品信息获取不完整"],
+  ]) {
+    const error = Object.assign(new Error("provider detail must not replace the stable status"), { code });
+    assert.equal(automation.productCardFailureStatus({ error }), expected);
+  }
+  assert.match(
+    automation.productCardFailureStatus({
+      error: Object.assign(new Error("OpenAI 商品分析请求超时"), { code: "timeout" }),
+      retainedVerifiedSnapshot: true,
+    }),
+    /^手卡已就绪，资料分析失败：OpenAI 商品分析请求超时；已保留/,
+  );
+});
+
+test("typed capture failures keep the created card and reach the terminal Base status", async () => {
+  for (const [index, code, expected] of [
+    [1, "page_unavailable", "无法打开页面"],
+    [2, "all_product_images_unavailable", "无法获取图片信息"],
+    [3, "page_incomplete", "商品信息获取不完整"],
+  ]) {
+    const created = cachedProduct({
+      id: `capture-failure-${index}`,
+      documentId: `capture-doc-${index}`,
+      documentUrl: `https://feishu.cn/docx/capture-doc-${index}`,
+      sku: "", coreFunctions: [], productParameters: "", usageMethod: "", targetAudience: "", usageScenes: "",
+      verifiedPid: "", verifiedSourceUrl: "", evidenceVersion: "", factsVerifiedAt: "",
+    });
+    globalThis.__feishuAutomationCacheTestHooks = {
+      getProductByPid: () => null,
+      ensureProductCardShell: async () => ({
+        documentId: created.documentId,
+        documentUrl: created.documentUrl,
+        reused: false,
+      }),
+      syncProductCardManagedFields: async () => ({
+        scanned: 9, updated: 0, missingLabels: [], duplicateLabels: [], currentValues: {},
+      }),
+      createProduct: () => created,
+      parsePublicProductPage: async () => {
+        throw Object.assign(new Error("provider diagnostics"), { code });
+      },
+    };
+    const baseWrites = [];
+    const result = await automation.handleFeishuAutomation({
+      ...automationInput(),
+      recordId: `capture-record-${index}`,
+      client: { request: async ({ data }) => { baseWrites.push(data.fields); return { code: 0 }; } },
+      writeBack: true,
+    });
+    assert.equal(result.productCardStatus, expected);
+    assert.equal(result.patch.产品手卡, created.documentUrl);
+    assert.equal(baseWrites.some((fields) => fields.手卡状态 === expected), true);
+  }
 });
 
 test("a historical same-PID card without managed markers is never cleared before a failed refresh", async () => {
@@ -658,7 +719,7 @@ test("a recovered shell clears then restores its trusted DB snapshot before a fa
   assert.equal(restored.clearDerived, true);
   assert.deepEqual(restored.coreFunctions, ["防震保护"]);
   assert.equal(restored.productParameters, "硅胶材质");
-  assert.match(result.productCardStatus, /资料刷新失败.*已保留上次逐条验证通过的资料/);
+  assert.match(result.productCardStatus, /资料刷新失败.*已保留上次通过安全校验的资料/);
 });
 
 test("a PID switch cannot report completion when its final atomic replacement fails", async () => {
@@ -829,7 +890,7 @@ test("a later click restores a DB merge that succeeded before the prior document
   assert.equal(retryEvents[2].clearDerived, true);
   assert.equal(retryEvents[2].productParameters, "材质：TPU",
     "the next click repairs the document from DB before attempting the provider again");
-  assert.match(second.productCardStatus, /资料刷新失败.*provider timeout on retry.*已保留上次逐条验证通过的资料/);
+  assert.match(second.productCardStatus, /资料刷新失败.*provider timeout on retry.*已保留上次通过安全校验的资料/);
   assert.equal(product.productParameters, "材质：TPU");
 });
 
@@ -886,9 +947,9 @@ test("a partial same-version parse writes only nonempty verified fields and reta
   const result = await automation.handleFeishuAutomation(automationInput());
   assert.match(result.productCardStatus, /^部分完成：已写入 1 条可信资料/);
   assert.equal(mergeInput.productParameters, "尺寸：6.1 英寸；材质：新硅胶");
-  assert.equal(mergeInput.usageMethod, undefined);
-  assert.equal(mergeInput.targetAudience, undefined);
-  assert.equal(mergeInput.usageScenes, undefined);
+  assert.equal(mergeInput.usageMethod, "卡扣式安装");
+  assert.equal(mergeInput.targetAudience, "手机用户");
+  assert.equal(mergeInput.usageScenes, "通勤");
   assert.equal(product.usageMethod, "卡扣式安装");
   assert.equal(product.targetAudience, "手机用户");
   assert.equal(product.usageScenes, "通勤");
@@ -900,6 +961,54 @@ test("a partial same-version parse writes only nonempty verified fields and reta
   assert.deepEqual(finalSync.coreFunctions, ["防震保护"]);
   assert.equal(finalSync.clearDerived, true,
     "the DB-returned complete trusted snapshot replaces the managed derived area atomically");
+});
+
+test("accepted OpenAI inference writes all four managed fields without inflating direct verification", async () => {
+  const product = cachedProduct({
+    documentId: "existing-document", documentUrl: "https://feishu.cn/docx/existing-document",
+    coreFunctions: [], usageMethod: "", targetAudience: "", usageScenes: "",
+  });
+  const parsed = verifiedParse({
+    sku: "", productParameters: "", coreFunctions: ["夜视（AI推断）"],
+    usageMethod: "安装后通过手机查看（AI推断）",
+    audience: "需要远程查看的家庭用户（AI推断）",
+    scenes: "住宅门口（AI推断）",
+    verification: {
+      status: "complete", verifiedFactCount: 0, rejectedFactCount: 0,
+      verifiedFields: [], missingFields: [], evidenceVersion: "complete-pdp-openai-v1", sourceUrl: productUrl,
+      acceptedFactCount: 4, acceptedFields: ["coreFunctions", "usageMethod", "audience", "scenes"],
+      inferredFactCount: 4, inferredFields: ["coreFunctions", "usageMethod", "audience", "scenes"],
+      factProvenance: {
+        coreFunctions: [{ value: "夜视（AI推断）", basis: "ai_inference" }],
+        usageMethod: [{ value: "安装后通过手机查看（AI推断）", basis: "ai_inference" }],
+        audience: [{ value: "需要远程查看的家庭用户（AI推断）", basis: "ai_inference" }],
+        scenes: [{ value: "住宅门口（AI推断）", basis: "ai_inference" }],
+      },
+    },
+  });
+  let mergeInput;
+  globalThis.__feishuAutomationCacheTestHooks = {
+    getFeishuProductCardMapping: () => ({ productId: product.id, documentId: product.documentId, documentUrl: product.documentUrl }),
+    getProductByPid: () => product,
+    ensureProductCardShell: async () => ({ documentId: product.documentId, documentUrl: product.documentUrl, reused: true }),
+    parsePublicProductPage: async () => parsed,
+    updateProduct: (_id, input) => Object.assign(product, input),
+    mergeVerifiedProductFacts: (_id, input) => {
+      mergeInput = input;
+      return Object.assign(product, mergeVerifiedSnapshot(product, input));
+    },
+    syncProductCardManagedFields: async () => ({ scanned: 9, updated: 4, missingLabels: [], duplicateLabels: [] }),
+  };
+
+  const result = await automation.handleFeishuAutomation(automationInput());
+  assert.equal(result.productCardStatus, "已完成");
+  assert.deepEqual(mergeInput.coreFunctions, ["夜视（AI推断）"]);
+  assert.equal(mergeInput.usageMethod, "安装后通过手机查看（AI推断）");
+  assert.equal(mergeInput.targetAudience, "需要远程查看的家庭用户（AI推断）");
+  assert.equal(mergeInput.usageScenes, "住宅门口（AI推断）");
+  assert.deepEqual(mergeInput.factProvenance.usageMethod, [
+    { value: "安装后通过手机查看（AI推断）", basis: "ai_inference" },
+  ]);
 });
 
 test("a parse with zero verified facts cannot merge, patch derived fields, or report completion", async () => {
@@ -949,7 +1058,7 @@ test("a parse with zero verified facts cannot merge, patch derived fields, or re
   assert.equal(product.productParameters, snapshot.productParameters);
 });
 
-test("a new evidence version cannot inherit omitted facts from the old certified snapshot", async () => {
+test("a new evidence version does not promote omitted facts from the previous validator", async () => {
   const product = cachedProduct({
     documentId: "existing-document",
     documentUrl: "https://feishu.cn/docx/existing-document",
@@ -991,8 +1100,9 @@ test("a new evidence version cannot inherit omitted facts from the old certified
 
   const result = await automation.handleFeishuAutomation(automationInput());
   assert.match(result.productCardStatus, /^部分完成/);
-  assert.equal(mergeInput.usageMethod, "喷涂使用", "old evidence must not be concatenated into a new policy version");
+  assert.equal(mergeInput.usageMethod, "喷涂使用");
   assert.equal(mergeInput.coreFunctions, undefined);
+  assert.equal(mergeInput.productParameters, undefined);
   assert.deepEqual(product.coreFunctions, []);
   assert.equal(product.productParameters, "");
   assert.equal(product.usageMethod, "喷涂使用");

@@ -3,7 +3,10 @@ import "server-only";
 import type { Client } from "@larksuiteoapi/node-sdk";
 import {
   createVideo,
+  getProduct,
+  getVideo,
   getVideoBySourceUrl,
+  listFeishuProductCardMappingsByProductId,
   listProducts,
   updateVideo,
 } from "@/lib/database";
@@ -40,6 +43,26 @@ workerState.__productDocSyncRunning ||= false;
 workerState.__productDocSyncCursor ||= 0;
 workerState.__productDocSyncLastError ||= "";
 
+function productDocumentTargets(product: Product) {
+  const seen = new Set<string>();
+  const targets: Product[] = [];
+  const add = (documentId: string | null | undefined, documentUrl: string | null | undefined) => {
+    const normalizedId = documentId?.trim() || "";
+    if (!normalizedId || seen.has(normalizedId)) return;
+    seen.add(normalizedId);
+    targets.push({
+      ...product,
+      documentId: normalizedId,
+      documentUrl: documentUrl?.trim() || null,
+    });
+  };
+  add(product.documentId, product.documentUrl);
+  for (const mapping of listFeishuProductCardMappingsByProductId(product.id)) {
+    add(mapping.documentId, mapping.documentUrl);
+  }
+  return targets;
+}
+
 function textFrom(block: DocBlock | undefined) {
   return (block?.text?.elements || []).map((element) => element.text_run?.content || "").join("").trim();
 }
@@ -49,7 +72,13 @@ function normalizeTikTokUrl(value: string) {
   try {
     const url = new URL(candidate);
     const host = url.hostname.toLowerCase();
-    return host === "tiktok.com" || host.endsWith(".tiktok.com") ? url.toString() : "";
+    return url.protocol === "https:"
+      && !url.username
+      && !url.password
+      && !url.port
+      && (host === "tiktok.com" || host.endsWith(".tiktok.com"))
+      ? url.toString()
+      : "";
   } catch {
     return "";
   }
@@ -72,11 +101,16 @@ function statusText(video: VideoRecord) {
   } as Record<string, string>)[video.status] || "待处理";
 }
 
-async function fetchBlock(client: Client, documentId: string, blockId: string): Promise<DocBlock> {
+async function fetchBlock(
+  client: Client,
+  documentId: string,
+  blockId: string,
+  documentRevisionId = -1,
+): Promise<DocBlock> {
   const response = await client.request<{ code?: number; msg?: string; data?: { block?: DocBlock } }>({
     url: `/open-apis/docx/v1/documents/${encodeURIComponent(documentId)}/blocks/${encodeURIComponent(blockId)}`,
     method: "GET",
-    params: { document_revision_id: "-1" },
+    params: { document_revision_id: String(documentRevisionId) },
   });
   const block = response.data?.block as DocBlock | undefined;
   if (!block) throw new Error(`飞书没有返回文档块 ${blockId}`);
@@ -131,16 +165,52 @@ async function updateIfChanged(
   blockId: string,
   current: string,
   next: string,
+  options: { documentRevisionId?: number } = {},
 ) {
   if (!blockId || current === next) return false;
-  await updateFeishuTextBlock(client, documentId, blockId, next);
+  await updateFeishuTextBlock(client, documentId, blockId, next, options);
   // Feishu allows only a few document edits per second. Spacing writes keeps
   // multi-column result updates reliable instead of intermittently rate-limited.
   await new Promise((resolve) => setTimeout(resolve, 380));
   return true;
 }
 
-export async function syncProductDocument(client: Client, product: Product): Promise<SyncResult> {
+/**
+ * Result cells become user-owned as soon as they contain text. Always bypass
+ * the table-scan cache immediately before an automatic write: the status patch
+ * above can be rate-limited for hundreds of milliseconds, during which a user
+ * may have entered a correction that must win.
+ */
+async function updateBlankResultCell(
+  client: Client,
+  documentId: string,
+  blockId: string,
+  next: string,
+) {
+  const normalizedNext = next.trim();
+  if (!blockId || !normalizedNext) return false;
+  const documentResponse = await client.request<{
+    code?: number;
+    msg?: string;
+    data?: { document?: { revision_id?: number } };
+  }>({
+    url: `/open-apis/docx/v1/documents/${encodeURIComponent(documentId)}`,
+    method: "GET",
+  });
+  const documentRevisionId = documentResponse.data?.document?.revision_id;
+  if (!Number.isInteger(documentRevisionId)) throw new Error("飞书没有返回文档版本号");
+  const latest = await fetchBlock(client, documentId, blockId, documentRevisionId);
+  if (textFrom(latest).trim()) return false;
+  // Feishu rejects a patch whose expected revision is no longer current. That
+  // closes the last read/write race if a user types after the fresh block GET.
+  return updateIfChanged(client, documentId, blockId, "", normalizedNext, { documentRevisionId });
+}
+
+export async function syncProductDocument(
+  client: Client,
+  product: Product,
+  options: { onlyVideoId?: string } = {},
+): Promise<SyncResult> {
   const result: SyncResult = { found: 0, queued: 0, completed: 0, failed: 0 };
   if (!product.documentId) return result;
   const blocks = await listFeishuDocumentBlocks(client, product.documentId);
@@ -153,9 +223,9 @@ export async function syncProductDocument(client: Client, product: Product): Pro
     const row = await Promise.all(cells.slice(rowStart, rowStart + 4).map((cellId) => cellText(cellId, readBlock)));
     const link = normalizeTikTokUrl(row[0].text);
     if (!link || row.some((cell) => !cell.textId)) continue;
-    result.found += 1;
-
     let video = getVideoBySourceUrl(link);
+    if (options.onlyVideoId && video?.id !== options.onlyVideoId) continue;
+    result.found += 1;
     if (!video) {
       video = createVideo({
         productId: product.id,
@@ -170,7 +240,7 @@ export async function syncProductDocument(client: Client, product: Product): Pro
       continue;
     }
 
-    if (["failed", "stopped"].includes(video.status) && /^(?:重试|retry)/i.test(row[1].text)) {
+    if (["failed", "stopped", "completed"].includes(video.status) && /^(?:重试|retry)/i.test(row[1].text)) {
       video = updateVideo(video.id, { error_message: null }) || video;
       enqueueVideos([video.id]);
       await updateIfChanged(client, product.documentId, row[1].textId, row[1].text, "排队中");
@@ -180,14 +250,21 @@ export async function syncProductDocument(client: Client, product: Product): Pro
 
     await updateIfChanged(client, product.documentId, row[1].textId, row[1].text, statusText(video));
     if (video.status === "completed") {
-      await updateIfChanged(client, product.documentId, row[2].textId, row[2].text, conciseProductDocAnalysis(video));
-      await updateIfChanged(
-        client,
-        product.documentId,
-        row[3].textId,
-        row[3].text,
-        video.transcriptZh || "暂无中文翻译",
-      );
+      // Analysis and translation cells are user-owned once they contain text.
+      // Keep the two columns independent so clearing either cell explicitly opts
+      // only that cell back into automatic delivery.
+      if (!row[2].text.trim()) {
+        await updateBlankResultCell(
+          client,
+          product.documentId,
+          row[2].textId,
+          conciseProductDocAnalysis(video),
+        );
+      }
+      const transcriptZh = String(video.transcriptZh || "").trim();
+      if (!row[3].text.trim() && transcriptZh) {
+        await updateBlankResultCell(client, product.documentId, row[3].textId, transcriptZh);
+      }
       result.completed += 1;
     } else if (video.status === "failed") {
       result.failed += 1;
@@ -196,16 +273,47 @@ export async function syncProductDocument(client: Client, product: Product): Pro
   return result;
 }
 
+/** Deliver a newly completed video to its exact product-document row now. */
+export async function syncCompletedVideoToProductDocument(videoId: string) {
+  const video = getVideo(videoId);
+  if (!video || video.status !== "completed") return false;
+  const product = getProduct(video.productId);
+  if (!product) return false;
+  const documents = productDocumentTargets(product);
+  if (!documents.length) return false;
+  const channel = getConnectedFeishuChannel() || await ensureFeishuConnection();
+  if (!channel) return false;
+  let firstError: unknown;
+  for (const document of documents) {
+    try {
+      await syncProductDocument(channel.rawClient, document, { onlyVideoId: video.id });
+    } catch (error) {
+      firstError ??= error;
+    }
+  }
+  if (firstError) throw firstError;
+  return true;
+}
+
 export async function syncAllProductDocuments() {
   const channel = getConnectedFeishuChannel() || await ensureFeishuConnection();
   if (!channel) return { documents: 0, found: 0, queued: 0, completed: 0, failed: 0 };
-  const products = listProducts().filter((product) => product.documentId && product.pid && !product.isSystem);
-  if (!products.length) return { documents: 0, found: 0, queued: 0, completed: 0, failed: 0 };
+  const seenDocumentIds = new Set<string>();
+  const documents = listProducts()
+    .filter((product) => product.pid && !product.isSystem)
+    .flatMap(productDocumentTargets)
+    .filter((product) => {
+      const documentId = product.documentId!;
+      if (seenDocumentIds.has(documentId)) return false;
+      seenDocumentIds.add(documentId);
+      return true;
+    });
+  if (!documents.length) return { documents: 0, found: 0, queued: 0, completed: 0, failed: 0 };
 
   const batchSize = Math.max(1, Math.min(20, Number(process.env.PRODUCT_DOC_SYNC_BATCH_SIZE || 12)));
-  const start = workerState.__productDocSyncCursor! % products.length;
-  const selected = Array.from({ length: Math.min(batchSize, products.length) }, (_, index) => products[(start + index) % products.length]);
-  workerState.__productDocSyncCursor = (start + selected.length) % products.length;
+  const start = workerState.__productDocSyncCursor! % documents.length;
+  const selected = Array.from({ length: Math.min(batchSize, documents.length) }, (_, index) => documents[(start + index) % documents.length]);
+  workerState.__productDocSyncCursor = (start + selected.length) % documents.length;
   const total = { documents: 0, found: 0, queued: 0, completed: 0, failed: 0 };
   for (const product of selected) {
     try {
@@ -229,7 +337,7 @@ export async function syncAllProductDocuments() {
 
 export function startProductDocumentSyncWorker() {
   if (workerState.__productDocSyncTimer) return;
-  const interval = Math.max(5_000, Number(process.env.PRODUCT_DOC_SYNC_INTERVAL_MS || 12_000));
+  const interval = Math.max(5_000, Number(process.env.PRODUCT_DOC_SYNC_INTERVAL_MS || 20_000));
   const run = async () => {
     if (workerState.__productDocSyncRunning) return;
     workerState.__productDocSyncRunning = true;
@@ -245,8 +353,9 @@ export function startProductDocumentSyncWorker() {
       workerState.__productDocSyncRunning = false;
     }
   };
-  const initial = setTimeout(() => void run(), 2_500);
-  initial.unref();
+  // Do not scan immediately at process startup. Video completion is delivered
+  // directly by completeFeishuAutomation; this timer is only a low-frequency
+  // safety net for document-table links and missed external edits.
   workerState.__productDocSyncTimer = setInterval(() => void run(), interval);
   workerState.__productDocSyncTimer.unref();
 }

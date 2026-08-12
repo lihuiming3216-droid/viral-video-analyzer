@@ -11,6 +11,9 @@ import type {
   FeishuProductCardMappingKey,
   ManualLabel,
   Product,
+  ProductFactBasis,
+  ProductFactField,
+  ProductFactProvenance,
   ProviderName,
   ProviderSetting,
   SceneRecord,
@@ -84,6 +87,7 @@ function initialize(db: DatabaseSync) {
       verified_source_url TEXT NOT NULL DEFAULT '',
       evidence_version TEXT NOT NULL DEFAULT '',
       facts_verified_at TEXT NOT NULL DEFAULT '',
+      fact_provenance_json TEXT NOT NULL DEFAULT '{}',
       banned_terms TEXT NOT NULL DEFAULT '',
       notes TEXT NOT NULL DEFAULT '',
       is_system INTEGER NOT NULL DEFAULT 0,
@@ -354,6 +358,7 @@ function initialize(db: DatabaseSync) {
     ["verified_source_url", "TEXT NOT NULL DEFAULT ''"],
     ["evidence_version", "TEXT NOT NULL DEFAULT ''"],
     ["facts_verified_at", "TEXT NOT NULL DEFAULT ''"],
+    ["fact_provenance_json", "TEXT NOT NULL DEFAULT '{}'"],
     ["prop_images_json", "TEXT NOT NULL DEFAULT '[]'"],
   ]) {
     if (!productColumns.some((column) => String(column.name) === name)) db.exec(`ALTER TABLE products ADD COLUMN ${name} ${definition}`);
@@ -530,6 +535,17 @@ export function getFeishuProductCardMapping(key: FeishuProductCardMappingKey) {
     WHERE app_token=? AND table_id=? AND record_id=?`)
     .get(appToken, tableId, recordId) as Record<string, unknown> | undefined;
   return row ? productCardMappingFromRow(row) : null;
+}
+
+/** All row-owned product-card documents currently bound to one internal product. */
+export function listFeishuProductCardMappingsByProductId(productId: string) {
+  const normalized = productId.trim();
+  if (!normalized) return [];
+  const rows = getDb().prepare(`SELECT * FROM feishu_product_card_mappings
+    WHERE product_id=? AND document_id IS NOT NULL AND TRIM(document_id)<>''
+    ORDER BY created_at, app_token, table_id, record_id`)
+    .all(normalized) as Array<Record<string, unknown>>;
+  return rows.map(productCardMappingFromRow);
 }
 
 export function upsertFeishuProductCardMapping(
@@ -747,6 +763,7 @@ function productFromRow(row: Record<string, unknown>): Product {
     verifiedSourceUrl: String(row.verified_source_url ?? ""),
     evidenceVersion: String(row.evidence_version ?? ""),
     factsVerifiedAt: String(row.facts_verified_at ?? ""),
+    factProvenance: json<ProductFactProvenance>(row.fact_provenance_json, {}),
     bannedTerms: String(row.banned_terms ?? ""),
     notes: String(row.notes ?? ""),
     isSystem: Boolean(row.is_system),
@@ -905,7 +922,7 @@ export function updateProduct(id: string, input: Partial<Product>) {
   const verifiedFactWasWritten = [
     "sku", "coreFunctions", "productParameters", "usageMethod", "targetAudience",
     "usageScenes", "sourceTitle", "sourceDescription", "sourceImageUrls",
-    "visualEvidence", "visualAnalysisStatus", "visualAnalyzedAt",
+    "visualEvidence", "visualAnalysisStatus", "visualAnalyzedAt", "factProvenance",
   ].some((key) => input[key as keyof Product] !== undefined);
   const keepVerifiedState = !pidChanged && !verifiedFactWasWritten;
   getDb()
@@ -913,7 +930,7 @@ export function updateProduct(id: string, input: Partial<Product>) {
       target_audience=?, pain_points=?, competitors=?, product_url=?, banned_terms=?, notes=?,
       core_functions_json=?, product_parameters=?, usage_method=?, usage_scenes=?, source_title=?, source_description=?,
       source_image_urls_json=?, visual_evidence=?, visual_analysis_status=?, visual_analyzed_at=?,
-      verified_pid=?, verified_source_url=?, evidence_version=?, facts_verified_at=?, updated_at=? WHERE id=?`)
+      verified_pid=?, verified_source_url=?, evidence_version=?, facts_verified_at=?, fact_provenance_json=?, updated_at=? WHERE id=?`)
     .run(
       input.name ?? current.name,
       nextPid,
@@ -946,6 +963,7 @@ export function updateProduct(id: string, input: Partial<Product>) {
       keepVerifiedState ? current.verifiedSourceUrl : "",
       keepVerifiedState ? current.evidenceVersion : "",
       keepVerifiedState ? current.factsVerifiedAt : "",
+      keepVerifiedState ? JSON.stringify(current.factProvenance) : "{}",
       now(),
       id,
     );
@@ -965,6 +983,49 @@ function verifiedString(value: string | undefined, current: string, sameEvidence
 function verifiedList(value: string[] | undefined, current: string[], sameEvidence: boolean) {
   if (value === undefined) return sameEvidence ? current : [];
   return value.map((item) => String(item).trim()).filter(Boolean);
+}
+
+const provenanceFields = ["coreFunctions", "usageMethod", "audience", "scenes"] as const satisfies readonly ProductFactField[];
+
+function factItems(value: string | string[]) {
+  const values = Array.isArray(value) ? value : value.split(/[；;]/);
+  return values.map((item) => String(item).trim()).filter(Boolean);
+}
+
+function factProvenanceForMerge(
+  input: VerifiedProductFactsMergeInput,
+  current: Product,
+  next: Pick<Product, "coreFunctions" | "usageMethod" | "targetAudience" | "usageScenes">,
+  sameEvidence: boolean,
+): ProductFactProvenance {
+  const submitted = input.factProvenance || {};
+  const result: ProductFactProvenance = {};
+  const nextValues: Record<ProductFactField, string[]> = {
+    coreFunctions: factItems(next.coreFunctions),
+    usageMethod: factItems(next.usageMethod),
+    audience: factItems(next.targetAudience),
+    scenes: factItems(next.usageScenes),
+  };
+  for (const field of provenanceFields) {
+    // Provenance is reusable only inside the same evidence policy. A new
+    // version must submit a fresh basis for every accepted fact; otherwise an
+    // earlier validator's classification could be silently promoted.
+    const currentByValue = new Map((sameEvidence ? current.factProvenance[field] || [] : [])
+      .map((fact) => [fact.value.trim(), fact.basis]));
+    const submittedByValue = new Map((submitted[field] || [])
+      .map((fact) => [String(fact.value || "").trim(), fact.basis] as const));
+    const facts = nextValues[field].map((value) => {
+      const basis = submittedByValue.get(value) || currentByValue.get(value) || "verified_text";
+      return {
+        value,
+        basis: (["verified_text", "verified_image_ocr", "ai_inference"].includes(basis)
+          ? basis
+          : "verified_text") as ProductFactBasis,
+      };
+    });
+    if (facts.length) result[field] = facts;
+  }
+  return result;
 }
 
 function hasIncomingVerifiedFacts(input: VerifiedProductFactsMergeInput) {
@@ -1040,11 +1101,12 @@ export function mergeVerifiedProductFacts(id: string, input: VerifiedProductFact
       : next.visualAnalysisStatus === "unavailable"
         ? null
         : sameEvidence ? current.visualAnalyzedAt : null;
+    const factProvenance = factProvenanceForMerge(input, current, next, sameEvidence);
     db.prepare(`UPDATE products SET
       sku=?, core_functions_json=?, product_parameters=?, usage_method=?, target_audience=?, usage_scenes=?,
       source_title=?, source_description=?, source_image_urls_json=?, visual_evidence=?,
       visual_analysis_status=?, visual_analyzed_at=?, verified_pid=?, verified_source_url=?,
-      evidence_version=?, facts_verified_at=?, updated_at=?
+      evidence_version=?, facts_verified_at=?, fact_provenance_json=?, updated_at=?
       WHERE id=? AND pid=?`)
       .run(
         next.sku,
@@ -1063,6 +1125,7 @@ export function mergeVerifiedProductFacts(id: string, input: VerifiedProductFact
         sourceUrl,
         evidenceVersion,
         verifiedAt,
+        JSON.stringify(factProvenance),
         now(),
         productId,
         pid,

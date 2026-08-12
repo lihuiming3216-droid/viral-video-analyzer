@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
+import { existsSync as realExistsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import ts from "typescript";
+import { chromium } from "playwright-core";
 
 const parserSource = await readFile(
   new URL("../lib/product-parser.ts", import.meta.url),
@@ -13,6 +15,9 @@ async function loadProductParserModule() {
     const hooks = () => globalThis.__productParserTestHooks || {};
     export const existsSync = () => false;
     export const fetchWithProxy = (...args) => hooks().fetchWithProxy(...args);
+    export const createProductCaptureDigest = (...args) => hooks().createProductCaptureDigest?.(...args) ?? "capture-digest";
+    export const analyzeProductCaptureWithOpenAI = (...args) => hooks().analyzeProductCaptureWithOpenAI?.(...args);
+    export const formatProductFactsForCard = (field) => field.facts.map((fact) => fact.valueZh + (fact.basis === "ai_inference" ? "（AI推断）" : "")).join("；");
     export const getProviderConfig = () => ({
       enabled: true,
       apiKey: "test-key",
@@ -47,6 +52,7 @@ async function loadProductParserModule() {
     .replace('import "server-only";', "")
     .replaceAll('"node:fs"', JSON.stringify(stubUrl))
     .replaceAll('"@/lib/network"', JSON.stringify(stubUrl))
+    .replaceAll('"@/lib/openai-product-analyzer"', JSON.stringify(stubUrl))
     .replaceAll('"@/lib/provider-config"', JSON.stringify(stubUrl))
     .replaceAll('"@/lib/json-utils"', JSON.stringify(stubUrl))
     .replaceAll('"@/lib/tiktok-product"', JSON.stringify(stubUrl));
@@ -55,6 +61,15 @@ async function loadProductParserModule() {
 }
 
 const parser = await loadProductParserModule();
+const previousOpenAIProductAnalysisEnabled = process.env.OPENAI_PRODUCT_ANALYSIS_ENABLED;
+process.env.OPENAI_PRODUCT_ANALYSIS_ENABLED = "false";
+test.after(() => {
+  if (previousOpenAIProductAnalysisEnabled === undefined) {
+    delete process.env.OPENAI_PRODUCT_ANALYSIS_ENABLED;
+  } else {
+    process.env.OPENAI_PRODUCT_ANALYSIS_ENABLED = previousOpenAIProductAnalysisEnabled;
+  }
+});
 const pid = "1732364299482009895";
 const productSlug = "anime-n-narutos-silicone-case-for-iphone-samsung-shockproof";
 const productTitle = "anime n narutos silicone case for iphone samsung shockproof";
@@ -99,21 +114,6 @@ function structuredCameraPage(options = {}) {
   return `<html><head><meta property="og:title" content="${metaTitle}"><title>${metaTitle}</title></head><body><script id="__MODERN_ROUTER_DATA__" type="application/json">${JSON.stringify({ loaderData: { product_model: model, ...(options.routerExtras || {}) } })}</script></body></html>`;
 }
 
-function structuredPhoneCasePage() {
-  const model = {
-    product_id: pid,
-    name: productTitle,
-    description: JSON.stringify([{ text: "Shockproof silicone case for iPhone and Samsung" }]),
-    images: [],
-    product_properties: [
-      { property_name: "Material", property_values: [{ property_value_name: "Silicone" }] },
-      { property_name: "Compatible Devices", property_values: [{ property_value_name: "iPhone Samsung" }] },
-    ],
-    skus: [],
-  };
-  return `<html><head><title>Untrusted meta printer listing</title></head><body><script id="__MODERN_ROUTER_DATA__" type="application/json">${JSON.stringify({ loaderData: { product_model: model } })}</script></body></html>`;
-}
-
 function qwenProductResponse(product) {
   return new Response(JSON.stringify({
     choices: [{ message: { content: JSON.stringify(product) } }],
@@ -140,11 +140,14 @@ test("expanded Chromium challenge pages are rejected as product evidence", () =>
 test("exact public evidence accepts only official TikTok product paths with the same PID", () => {
   const accepted = [
     `https://shop.tiktok.com/us/pdp/${productSlug}/${pid}?source=anchor`,
+    `https://shop.tiktok.com/us/pdp/${pid}?source=anchor`,
     `https://www.tiktok.com/shop/pdp/${productSlug}/${pid}?source=301`,
-    `https://www.tiktok.com/view/product/${pid}`,
+    `https://www.tiktok.com/shop/pdp/${pid}?source=301`,
     `https://shop.tiktok.com/us/pdp/${productSlug}/${pid}?pid=${pid}&product_id=${pid}`,
   ];
   for (const url of accepted) assert.equal(parser.isExactTikTokProductSource(url, pid), true, url);
+  assert.equal(parser.isExactTikTokProductSource(`https://www.tiktok.com/view/product/${pid}`, pid), false);
+  assert.equal(parser.isTikTokProductDiscoverySource(`https://www.tiktok.com/view/product/${pid}`, pid), true);
 
   const rejected = [
     `http://shop.tiktok.com/us/pdp/anime-phone-case/${pid}`,
@@ -153,6 +156,8 @@ test("exact public evidence accepts only official TikTok product paths with the 
     `https://www.tiktok.com/video/${pid}`,
     `https://shop.tiktok.com.evil.example/us/pdp/anime-phone-case/${pid}`,
     `https://evil.example/www.tiktok.com/shop/pdp/anime-phone-case/${pid}`,
+    `https://user:password@shop.tiktok.com/us/pdp/${productSlug}/${pid}`,
+    `https://shop.tiktok.com:8443/us/pdp/${productSlug}/${pid}`,
     `https://shop.tiktok.com/us/pdp/${productSlug}/${pid}?pid=1732364299482009896`,
     `https://shop.tiktok.com/us/pdp/${productSlug}/${pid}?product_id=${pid}&product_id=1732364299482009896`,
     `https://www.tiktok.com/shop/pdp/${productSlug}/${pid}?itemId=1732364299482009896`,
@@ -166,6 +171,475 @@ test("exact public evidence accepts only official TikTok product paths with the 
     "",
     "an overlong slug must be rejected whole instead of truncating a trailing negation",
   );
+});
+
+function collectionDriver({
+  html,
+  snapshots,
+  imageResults,
+  expansion = { found: true, expanded: true },
+  securityText = "",
+}) {
+  let snapshotIndex = 0;
+  let expandCalls = 0;
+  return {
+    driver: {
+      navigate: async (url) => ({ ok: true, finalUrl: url, status: 200 }),
+      expandProductDetails: async (labels) => {
+        expandCalls += 1;
+        assert.equal(labels.includes("详细内容"), true);
+        assert.equal(labels.includes("Product details"), true);
+        return expansion;
+      },
+      resetToTop: async () => {},
+      snapshot: async () => snapshots[Math.min(snapshotIndex++, snapshots.length - 1)],
+      scrollNext: async () => {},
+      wait: async () => {},
+      collect: async () => ({ html, text: "Product details scoped text", securityText }),
+      probeImage: async (url) => imageResults.get(url) || null,
+    },
+    expandCalls: () => expandCalls,
+  };
+}
+
+test("slugless official PDP capture expands details, reaches three stable bottom rounds, and keeps usable images", async () => {
+  const url = `https://shop.tiktok.com/us/pdp/${cameraPid}?source=anchor`;
+  const firstImage = "https://p16-oec-va.ibyteimg.com/camera-cover.webp";
+  const failedImage = "https://p16-oec-va.ibyteimg.com/camera-detail.webp";
+  const html = structuredCameraPage({ images: [
+    { url_list: [firstImage] },
+    { url_list: [failedImage] },
+  ] });
+  const stable = { atBottom: true, scrollHeight: 4200, detailHash: "same", productImageKeys: [firstImage, failedImage] };
+  const fake = collectionDriver({
+    html,
+    snapshots: [
+      { ...stable, atBottom: false },
+      stable,
+      stable,
+      stable,
+    ],
+    imageResults: new Map([[firstImage, { dataUrl: "data:image/webp;base64,UklGRgQAAABXRUJQ" }]]),
+  });
+  const result = await parser.collectProductPageWithDriver(fake.driver, url, {
+    captureId: "capture-camera",
+    waitMilliseconds: 0,
+  });
+  assert.equal(result.errorCode, "");
+  assert.equal(result.capture.pid, cameraPid);
+  assert.equal(result.capture.canonicalUrl, `https://shop.tiktok.com/us/pdp/${cameraPid}`);
+  assert.equal(result.capture.coverage.details, "converged");
+  assert.equal(result.capture.coverage.scroll, "converged");
+  assert.equal(result.capture.coverage.expectedImageCount, 2);
+  assert.equal(result.capture.coverage.usableImageCount, 1,
+    "one failed thumbnail must not block a usable exact-product image");
+  assert.equal(result.capture.images.length, 1);
+  assert.equal(result.capture.fragments.some((fragment) => (
+    fragment.kind === "scoped_dom" && fragment.text.includes("Product details scoped text")
+  )), true, "expanded detail text must enter the sealed capture instead of being discarded");
+  assert.equal(fake.expandCalls() >= 4, true, "lazy detail controls are rescanned while scrolling");
+});
+
+test("collection rejects a final navigation outside the exact official PDP", async () => {
+  const url = `https://shop.tiktok.com/us/pdp/${cameraPid}?source=anchor`;
+  let probed = false;
+  const fake = collectionDriver({
+    html: structuredCameraPage(),
+    snapshots: [{ atBottom: true, scrollHeight: 1000, detailHash: "same", productImageKeys: [] }],
+    imageResults: new Map(),
+  });
+  fake.driver.navigate = async () => ({
+    ok: true,
+    finalUrl: `https://evil.example/us/pdp/${cameraPid}`,
+    status: 200,
+  });
+  fake.driver.probeImage = async () => {
+    probed = true;
+    return null;
+  };
+  const result = await parser.collectProductPageWithDriver(fake.driver, url, { waitMilliseconds: 0 });
+  assert.equal(result.errorCode, "page_unavailable");
+  assert.equal(probed, false);
+});
+
+test("anonymous product fetch follows only trusted same-PID redirects", async () => {
+  const url = `https://shop.tiktokw.us/us/pdp/${cameraPid}`;
+  const trusted = `https://shop.tiktok.com/us/pdp/camera/${cameraPid}`;
+  const calls = [];
+  globalThis.__productParserTestHooks = {
+    fetchWithProxy: async (requested, init) => {
+      calls.push({ requested: String(requested), redirect: init.redirect });
+      if (calls.length === 1) {
+        return new Response(null, { status: 302, headers: { location: trusted } });
+      }
+      return new Response("ok", { status: 200 });
+    },
+  };
+  const accepted = await parser.fetchTrustedTikTokProductResponse(url, cameraPid);
+  assert.equal(accepted.finalUrl, trusted);
+  assert.deepEqual(calls.map((call) => call.redirect), ["manual", "manual"]);
+
+  globalThis.__productParserTestHooks = {
+    fetchWithProxy: async () => new Response(null, {
+      status: 302,
+      headers: { location: `https://evil.example/us/pdp/${cameraPid}` },
+    }),
+  };
+  assert.equal(await parser.fetchTrustedTikTokProductResponse(url, cameraPid), null);
+});
+
+test("a sealed capture produces all four managed fields and labels only inferred facts", async () => {
+  const capture = {
+    captureId: "capture-openai",
+    sourceDigest: "capture-digest",
+    canonicalUrl: `https://shop.tiktok.com/us/pdp/${cameraPid}`,
+    pid: cameraPid,
+    fragments: [{ id: "router-title", kind: "router_text", text: "Wireless video doorbell camera" }],
+    images: [{ id: "product-image-1", role: "cover", dataUrl: "data:image/webp;base64,UklGRgQAAABXRUJQ" }],
+    coverage: {
+      identity: "exact", details: "converged", scroll: "converged",
+      expectedImageCount: 1, usableImageCount: 1,
+    },
+  };
+  let analyzerInput;
+  let digestInput;
+  globalThis.__productParserTestHooks = {
+    createProductCaptureDigest: (input) => {
+      digestInput = input;
+      return "capture-with-name-digest";
+    },
+    analyzeProductCaptureWithOpenAI: async (input) => {
+      analyzerInput = input;
+      const verified = (valueZh) => ({
+        valueZh, basis: "verified_text",
+        evidenceRefs: [{ sourceType: "router_text", sourceId: "router-title", exactQuote: "video doorbell" }],
+      });
+      const inferred = (valueZh) => ({
+        valueZh, basis: "ai_inference",
+        evidenceRefs: [{ sourceType: "visual_observation", sourceId: "product-image-1", exactQuote: "" }],
+      });
+      return {
+        coreFunctions: { facts: [verified("查看门外访客"), inferred("辅助门口观察")] },
+        usageMethod: { facts: [inferred("安装后通过手机查看门外情况")] },
+        audience: { facts: [inferred("需要查看访客的家庭用户")] },
+        scenes: { facts: [inferred("住宅门口访客查看")] },
+      };
+    },
+  };
+  const result = await parser.parsedProductInfoFromOpenAICapture({
+    capture,
+    productNameHint: "无线可视门铃摄像头",
+    base: {
+      productName: "无线可视门铃摄像头", sku: "", coreFunctions: [], productParameters: "",
+      usageMethod: "", audience: "", scenes: "", sellingPoints: "",
+      sourceTitle: "Wireless video doorbell camera", sourceDescription: "",
+      sourceImageUrls: ["https://p16-oec-va.ibyteimg.com/doorbell.webp"],
+      visualEvidence: "", visualAnalysisStatus: "unavailable",
+    },
+  });
+  assert.equal(analyzerInput.productNameHint, "无线可视门铃摄像头");
+  assert.equal(analyzerInput.sourceDigest, "capture-with-name-digest");
+  assert.notEqual(analyzerInput.sourceDigest, capture.sourceDigest,
+    "adding the non-evidence product-name hint must reseal the analysis input");
+  assert.equal(digestInput.productNameHint, "无线可视门铃摄像头");
+  assert.equal(digestInput.captureId, capture.captureId);
+  assert.equal(digestInput.pid, capture.pid);
+  assert.deepEqual(result.coreFunctions, ["查看门外访客", "辅助门口观察（AI推断）"]);
+  assert.equal(result.usageMethod, "安装后通过手机查看门外情况（AI推断）");
+  assert.equal(result.audience, "需要查看访客的家庭用户（AI推断）");
+  assert.equal(result.scenes, "住宅门口访客查看（AI推断）");
+  assert.equal(result.verification.status, "complete");
+  assert.deepEqual(result.verification.missingFields, []);
+  assert.equal(result.verification.verifiedFactCount, 1, "AI inference must not be counted as directly verified");
+  assert.deepEqual(result.verification.verifiedFields, ["coreFunctions"]);
+  assert.equal(result.verification.acceptedFactCount, 5);
+  assert.deepEqual(result.verification.acceptedFields, ["coreFunctions", "usageMethod", "audience", "scenes"]);
+  assert.equal(result.verification.inferredFactCount, 4);
+  assert.deepEqual(result.verification.inferredFields, ["coreFunctions", "usageMethod", "audience", "scenes"]);
+  assert.deepEqual(result.verification.factProvenance.coreFunctions, [
+    { value: "查看门外访客", basis: "verified_text" },
+    { value: "辅助门口观察（AI推断）", basis: "ai_inference" },
+  ]);
+});
+
+test("capture distinguishes incomplete pages from zero usable exact-product images", async () => {
+  const url = `https://shop.tiktok.com/us/pdp/${cameraPid}`;
+  const imageUrl = "https://p16-oec-va.ibyteimg.com/camera.webp";
+  const html = structuredCameraPage({ images: [{ url_list: [imageUrl] }] });
+  const incomplete = collectionDriver({
+    html,
+    snapshots: [{ atBottom: false, scrollHeight: 9999, detailHash: "growing", productImageKeys: [imageUrl] }],
+    imageResults: new Map([[imageUrl, { dataUrl: "data:image/webp;base64,UklGRgQAAABXRUJQ" }]]),
+  });
+  const incompleteResult = await parser.collectProductPageWithDriver(incomplete.driver, url, {
+    maxRounds: 3, waitMilliseconds: 0,
+  });
+  assert.equal(incompleteResult.errorCode, "page_incomplete");
+
+  const stable = { atBottom: true, scrollHeight: 4200, detailHash: "same", productImageKeys: [imageUrl] };
+  const noImages = collectionDriver({
+    html,
+    snapshots: [stable, stable, stable],
+    imageResults: new Map(),
+  });
+  const noImagesResult = await parser.collectProductPageWithDriver(noImages.driver, url, {
+    maxRounds: 3, waitMilliseconds: 0,
+  });
+  assert.equal(noImagesResult.errorCode, "all_product_images_unavailable");
+  assert.equal(noImagesResult.diagnostics.usableImageCount, 0);
+
+  const incompleteAndNoImages = collectionDriver({
+    html,
+    snapshots: [{ atBottom: false, scrollHeight: 9999, detailHash: "growing", productImageKeys: [imageUrl] }],
+    imageResults: new Map(),
+  });
+  const combinedFailure = await parser.collectProductPageWithDriver(incompleteAndNoImages.driver, url, {
+    maxRounds: 3, waitMilliseconds: 0,
+  });
+  assert.equal(combinedFailure.errorCode, "all_product_images_unavailable",
+    "zero usable images has the stable image-specific classification even when scrolling is incomplete");
+});
+
+test("capture waits for all lazy detail controls before counting three stable rounds", async () => {
+  const url = `https://shop.tiktok.com/us/pdp/${cameraPid}`;
+  const imageUrl = "https://p16-oec-va.ibyteimg.com/camera.webp";
+  const html = structuredCameraPage({ images: [{ url_list: [imageUrl] }] });
+  const stable = { atBottom: true, scrollHeight: 4200, detailHash: "same", productImageKeys: [imageUrl] };
+  let expansionCall = 0;
+  const fake = collectionDriver({
+    html,
+    snapshots: [stable, stable, stable, stable, stable],
+    imageResults: new Map([[imageUrl, { dataUrl: "data:image/webp;base64,UklGRgQAAABXRUJQ" }]]),
+    expansion: { found: true, expanded: true },
+  });
+  fake.driver.expandProductDetails = async () => {
+    expansionCall += 1;
+    return expansionCall < 3
+      ? { found: true, expanded: false, pendingCount: 1 }
+      : { found: true, expanded: true, pendingCount: 0 };
+  };
+  const result = await parser.collectProductPageWithDriver(fake.driver, url, {
+    maxRounds: 6, waitMilliseconds: 0,
+  });
+  assert.equal(result.errorCode, "");
+  assert.equal(result.diagnostics.stableRounds, 3);
+  assert.equal(expansionCall >= 5, true,
+    "stability rounds begin only after all scoped detail controls are resolved");
+});
+
+test("router images use trusted CDN fallbacks and never probe arbitrary or private hosts", async () => {
+  const url = `https://shop.tiktok.com/us/pdp/${cameraPid}`;
+  const blockedPublic = "https://attacker.example/product.webp";
+  const blockedPrivate = "https://127.0.0.1/admin.png";
+  const failedTrusted = "https://p16-oec-va.ibyteimg.com/failed.webp";
+  const fallbackTrusted = "https://p16-oec-va.ibyteimg.com/fallback.webp";
+  const html = structuredCameraPage({ images: [
+    { url_list: [blockedPublic, blockedPrivate, failedTrusted, fallbackTrusted] },
+  ] });
+  const probed = [];
+  const stable = { atBottom: true, scrollHeight: 4200, detailHash: "same", productImageKeys: [fallbackTrusted] };
+  const fake = collectionDriver({ html, snapshots: [stable, stable, stable], imageResults: new Map() });
+  fake.driver.probeImage = async (imageUrl) => {
+    probed.push(imageUrl);
+    return imageUrl === fallbackTrusted
+      ? { dataUrl: "data:image/webp;base64,UklGRgQAAABXRUJQ" }
+      : null;
+  };
+  const result = await parser.collectProductPageWithDriver(fake.driver, url, {
+    maxRounds: 3, waitMilliseconds: 0,
+  });
+  assert.equal(result.errorCode, "");
+  assert.deepEqual(probed, [failedTrusted, fallbackTrusted]);
+  assert.equal(parser.safeTikTokProductImageUrl(blockedPublic), "");
+  assert.equal(parser.safeTikTokProductImageUrl(blockedPrivate), "");
+});
+
+test("image probes are bounded and tiny tracking pixels are not usable product images", async () => {
+  assert.equal(parser.hasUsableProductImageDimensions(31, 200), false);
+  assert.equal(parser.hasUsableProductImageDimensions(200, 1), false);
+  assert.equal(parser.hasUsableProductImageDimensions(32, 32), true);
+  assert.equal(parser.hasUsableProductImageDimensions(10_000, 10_000), false);
+
+  const url = `https://shop.tiktok.com/us/pdp/${cameraPid}`;
+  const imageUrls = Array.from(
+    { length: 10 },
+    (_, index) => `https://p16-oec-va.ibyteimg.com/product-${index}.webp`,
+  );
+  const html = structuredCameraPage({
+    images: imageUrls.map((imageUrl) => ({ url_list: [imageUrl] })),
+  });
+  const stable = { atBottom: true, scrollHeight: 4200, detailHash: "same", productImageKeys: imageUrls };
+  const fake = collectionDriver({ html, snapshots: [stable, stable, stable], imageResults: new Map() });
+  let active = 0;
+  let peak = 0;
+  fake.driver.probeImage = async () => {
+    active += 1;
+    peak = Math.max(peak, active);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    active -= 1;
+    return { dataUrl: "data:image/webp;base64,UklGRgQAAABXRUJQ" };
+  };
+  const result = await parser.collectProductPageWithDriver(fake.driver, url, {
+    maxRounds: 3, waitMilliseconds: 0,
+  });
+  assert.equal(result.errorCode, "");
+  assert.equal(result.diagnostics.usableImageCount, 10);
+  assert.equal(peak <= 4, true, `expected at most 4 concurrent image probes, observed ${peak}`);
+  assert.equal(peak >= 2, true, "the bounded worker pool should still overlap independent images");
+});
+
+test("an opened page without an exact-PID router model is incomplete, not unavailable", async () => {
+  const url = `https://shop.tiktok.com/us/pdp/${cameraPid}`;
+  const stable = { atBottom: true, scrollHeight: 1200, detailHash: "same", productImageKeys: [] };
+  const fake = collectionDriver({
+    html: "<html><head><title>Ordinary opened page</title></head><body>Product details</body></html>",
+    snapshots: [stable, stable, stable],
+    imageResults: new Map(),
+    expansion: { found: false, expanded: true, pendingCount: 0 },
+  });
+  const result = await parser.collectProductPageWithDriver(fake.driver, url, {
+    maxRounds: 3, waitMilliseconds: 0,
+  });
+  assert.equal(result.errorCode, "page_incomplete");
+  assert.match(result.html, /Ordinary opened page/);
+});
+
+test("a body-only security challenge remains unavailable without entering scoped evidence", async () => {
+  const url = `https://shop.tiktok.com/us/pdp/${cameraPid}`;
+  const stable = { atBottom: true, scrollHeight: 900, detailHash: "empty", productImageKeys: [] };
+  const fake = collectionDriver({
+    html: "<html><head><title>TikTok Shop</title></head><body>Verify to continue</body></html>",
+    securityText: "Verify to continue",
+    snapshots: [stable, stable, stable],
+    imageResults: new Map(),
+    expansion: { found: false, expanded: true, pendingCount: 0 },
+  });
+  const result = await parser.collectProductPageWithDriver(fake.driver, url, {
+    maxRounds: 3, waitMilliseconds: 0,
+  });
+  assert.equal(result.errorCode, "page_unavailable");
+});
+
+test("section exclusion descriptors cover nested recommendations, reviews, shops, and accessories", () => {
+  for (const descriptor of [
+    "recommendation-carousel",
+    "customer-reviews",
+    "similar_products",
+    "about-this-shop",
+    "frequently-bought-accessories",
+    "用户评价",
+    "相关配件",
+  ]) assert.equal(parser.isExcludedProductSectionDescriptor(descriptor), true, descriptor);
+  assert.equal(parser.isExcludedProductSectionDescriptor("product-description-content"), false);
+});
+
+const localBrowserExecutable = [
+  process.env.PRODUCT_BROWSER_EXECUTABLE_PATH,
+  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+  "/usr/bin/chromium",
+].find((candidate) => candidate && realExistsSync(candidate));
+
+test("browser driver deep-prunes nested non-product sections and expands only detail controls", {
+  skip: localBrowserExecutable ? false : "no local Chromium executable",
+}, async () => {
+  const browser = await chromium.launch({ executablePath: localBrowserExecutable, headless: true });
+  try {
+    const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+    await page.setContent(`
+      <main data-e2e="pdp-container">
+        <section data-e2e="pdp-gallery"><img src="https://p16-oec-va.ibyteimg.com/main.webp"></section>
+        <section data-e2e="product-description">
+          <h2>Product details</h2>
+          <p>MAIN_SENTINEL includes one mounting accessory</p>
+          <button id="main-more">See more</button><div id="main-panel" hidden>EXPANDED_SENTINEL</div>
+          <div class="customer-reviews"><button id="review-more">See more</button>REVIEW_SENTINEL<img src="https://p16-oec-va.ibyteimg.com/review.webp"></div>
+          <div data-e2e="recommendation-carousel"><button id="recommend-more">See more</button>RECOMMEND_SENTINEL<img src="https://p16-oec-va.ibyteimg.com/recommend.webp"></div>
+          <aside aria-label="About this shop"><button id="shop-more">See more</button>SHOP_SENTINEL</aside>
+          <div class="frequently-bought-accessories"><button id="accessory-more">See more</button>ACCESSORY_SENTINEL</div>
+        </section>
+      </main>
+      <script>
+        globalThis.clickCounts = {};
+        for (const id of ["main-more","review-more","recommend-more","shop-more","accessory-more"]) {
+          document.getElementById(id).addEventListener("click", () => {
+            globalThis.clickCounts[id] = (globalThis.clickCounts[id] || 0) + 1;
+            if (id === "main-more") {
+              document.getElementById("main-panel").hidden = false;
+              document.getElementById(id).setAttribute("aria-expanded", "true");
+            }
+          });
+        }
+      </script>
+    `);
+    const driver = parser.createProductPageCollectionDriver(page);
+    const expansion = await driver.expandProductDetails(parser.PRODUCT_DETAIL_CONTROL_LABELS);
+    const firstSnapshot = await driver.snapshot();
+    const collected = await driver.collect();
+    assert.deepEqual(await page.evaluate(() => globalThis.clickCounts), { "main-more": 1 });
+    assert.equal(expansion.expanded, true);
+    assert.match(collected.text, /MAIN_SENTINEL/);
+    assert.match(collected.text, /EXPANDED_SENTINEL/);
+    for (const sentinel of ["REVIEW_SENTINEL", "RECOMMEND_SENTINEL", "SHOP_SENTINEL", "ACCESSORY_SENTINEL"]) {
+      assert.doesNotMatch(collected.text, new RegExp(sentinel));
+    }
+    assert.equal(firstSnapshot.productImageKeys.some((url) => /review|recommend/.test(url)), false);
+
+    await page.evaluate(() => {
+      document.querySelector(".customer-reviews").append(" CHANGED_REVIEW_TEXT");
+      document.querySelector('[data-e2e="recommendation-carousel"] img').src = "https://p16-oec-va.ibyteimg.com/changed-recommend.webp";
+    });
+    const secondSnapshot = await driver.snapshot();
+    assert.equal(secondSnapshot.detailHash, firstSnapshot.detailHash);
+    assert.deepEqual(secondSnapshot.productImageKeys, firstSnapshot.productImageKeys);
+
+    await page.setContent(`<main><button id="ambiguous">Product details</button></main><script>
+      globalThis.ambiguousClicks = 0;
+      document.getElementById("ambiguous").addEventListener("click", () => { globalThis.ambiguousClicks += 1; });
+    </script>`);
+    const ambiguousDriver = parser.createProductPageCollectionDriver(page);
+    const ambiguous = await ambiguousDriver.expandProductDetails(parser.PRODUCT_DETAIL_CONTROL_LABELS);
+    const ambiguousSnapshot = await ambiguousDriver.snapshot();
+    const ambiguousCollected = await ambiguousDriver.collect();
+    assert.equal(ambiguous.found, true);
+    assert.equal(ambiguous.expanded, false);
+    assert.equal(ambiguous.pendingCount > 0, true);
+    assert.equal(ambiguousSnapshot.pendingDetailControls > 0, true);
+    assert.equal(ambiguousCollected.text, "",
+      "an unbound full-page detail control must not create scoped product evidence");
+    assert.equal(await page.evaluate(() => globalThis.ambiguousClicks), 0,
+      "the driver must not click an untrusted full-page control");
+  } finally {
+    await browser.close();
+  }
+});
+
+test("browser driver expands every scoped control once without a twelve-control cap or repeat collapse", {
+  skip: localBrowserExecutable ? false : "no local Chromium executable",
+}, async () => {
+  const browser = await chromium.launch({ executablePath: localBrowserExecutable, headless: true });
+  try {
+    const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+    await page.setContent(`<section data-e2e="product-description"><h2>Product details</h2>${
+      Array.from({ length: 15 }, (_, index) => `<button class="expand" data-index="${index}">See more</button><div id="panel-${index}" hidden>Detail ${index}</div>`).join("")
+    }</section><script>
+      globalThis.clicks = Array(15).fill(0);
+      for (const button of document.querySelectorAll(".expand")) button.addEventListener("click", () => {
+        const index = Number(button.dataset.index);
+        globalThis.clicks[index] += 1;
+        const panel = document.getElementById("panel-" + index);
+        panel.hidden = !panel.hidden;
+      });
+    </script>`);
+    const driver = parser.createProductPageCollectionDriver(page);
+    const first = await driver.expandProductDetails(parser.PRODUCT_DETAIL_CONTROL_LABELS);
+    const second = await driver.expandProductDetails(parser.PRODUCT_DETAIL_CONTROL_LABELS);
+    assert.deepEqual(first, { found: true, expanded: true, pendingCount: 0 });
+    assert.deepEqual(second, { found: true, expanded: true, pendingCount: 0 });
+    assert.deepEqual(await page.evaluate(() => globalThis.clicks), Array(15).fill(1));
+    assert.equal(await page.locator('[id^="panel-"]:not([hidden])').count(), 15);
+  } finally {
+    await browser.close();
+  }
 });
 
 test("the parser rejects a TikTok video URL before fetching it", async () => {
@@ -1148,42 +1622,20 @@ test("a direct TikTok challenge falls through to exact-source web search", { tim
   assert.doesNotMatch(JSON.stringify(result), /waterproof|battery/i);
 });
 
-test("a view-product endpoint recovers an exact same-PID PDP and parses that fetched router model", async () => {
+test("a view-product endpoint is discovery-only and cannot directly enter product parsing", async () => {
   const viewUrl = `https://www.tiktok.com/view/product/${pid}`;
-  const recoveredUrl = `https://www.tiktok.com/shop/pdp/${productSlug}/${pid}?source=301`;
-  let recoveredFetches = 0;
-  let searchCalls = 0;
+  let providerCalls = 0;
   globalThis.__productParserTestHooks = {
-    fetchWithProxy: async (url) => {
-      const requestUrl = String(url);
-      if (requestUrl.includes("/responses")) {
-        searchCalls += 1;
-        return new Response(JSON.stringify({
-          output: [{
-            type: "web_search_call",
-            status: "completed",
-            action: { sources: [{ url: recoveredUrl }] },
-          }],
-        }), { status: 200 });
-      }
-      if (requestUrl.includes("/chat/completions")) {
-        return qwenProductResponse({ coreFunctions: [], evidenceQuotes: {} });
-      }
-      if (requestUrl.includes(`/shop/pdp/${productSlug}/${pid}`)) {
-        recoveredFetches += 1;
-        return new Response(structuredPhoneCasePage(), { status: 200 });
-      }
+    fetchWithProxy: async () => {
+      providerCalls += 1;
       return new Response("", { status: 404 });
     },
   };
-
-  const result = await parser.parsePublicProductPage(viewUrl, { productName: "手机壳", pid });
-  assert.equal(searchCalls, 1);
-  assert.equal(recoveredFetches, 1, "the discovered exact PDP must actually be fetched");
-  assert.deepEqual(result.coreFunctions, ["防震保护"]);
-  assert.match(result.productParameters, /材质：硅胶/);
-  assert.equal(result.verification.sourceUrl, recoveredUrl);
-  assert.doesNotMatch(JSON.stringify(result), /printer/i);
+  await assert.rejects(
+    parser.parsePublicProductPage(viewUrl, { productName: "手机壳", pid }),
+    /产品链接必须是 HTTPS TikTok 官方商品详情页/,
+  );
+  assert.equal(providerCalls, 0, "a discovery-only URL must be rejected before page or model access");
 });
 
 test("grounded-looking model output is rejected when search found only another PID", async () => {
@@ -1288,7 +1740,7 @@ test("an exact view-product URL without a slug fails closed", async () => {
   };
   await assert.rejects(
     parser.parsePublicProductPage(productUrl, { productName: "手机壳", pid }),
-    /链接路径没有可独立验证的商品资料/,
+    /联网检索也未找到与该 PID 完全匹配的官方公开商品页/,
   );
   assert.equal(searchCalls, 1, "a view-only result must fail without a second discovery or chat call");
   assert.equal(extractionCalls, 0);

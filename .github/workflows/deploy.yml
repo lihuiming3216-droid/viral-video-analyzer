@@ -9,12 +9,17 @@ concurrency:
   group: production-deploy
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Build Docker image on GitHub runner
         run: docker build -t viral-video-analyzer:latest .
@@ -23,7 +28,7 @@ jobs:
         run: docker save viral-video-analyzer:latest | gzip > viral-video-analyzer.tar.gz
 
       - name: Copy runtime configuration to AWS Lightsail
-        uses: appleboy/scp-action@v1
+        uses: appleboy/scp-action@ff85246acaad7bdce478db94a363cd2bf7c90345 # v1
         with:
           host: ${{ secrets.ECS_HOST }}
           username: ${{ secrets.ECS_USER }}
@@ -33,7 +38,7 @@ jobs:
           overwrite: true
 
       - name: Copy built Docker image to AWS Lightsail
-        uses: appleboy/scp-action@v1
+        uses: appleboy/scp-action@ff85246acaad7bdce478db94a363cd2bf7c90345 # v1
         with:
           host: ${{ secrets.ECS_HOST }}
           username: ${{ secrets.ECS_USER }}
@@ -43,11 +48,16 @@ jobs:
           overwrite: true
 
       - name: Deploy over SSH
-        uses: appleboy/ssh-action@v1.2.5
+        # Pin third-party code that receives deployment secrets to an immutable
+        # commit instead of a movable tag.
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         with:
           host: ${{ secrets.ECS_HOST }}
           username: ${{ secrets.ECS_USER }}
           key: ${{ secrets.ECS_SSH_KEY }}
+          envs: OPENAI_API_KEY
           script: |
             set -e
             if ! command -v docker >/dev/null 2>&1; then
@@ -64,6 +74,24 @@ jobs:
               sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nginx
             fi
             cd /opt/viral-video-analyzer
+            if [ -z "${OPENAI_API_KEY:-}" ]; then
+              echo "OPENAI_API_KEY repository secret is missing" >&2
+              exit 1
+            fi
+            # Persist the runtime key without printing it. This preserves the
+            # existing server-side .env values and keeps manual container
+            # restarts consistent with GitHub deployments.
+            umask 077
+            runtime_env_tmp=$(mktemp)
+            trap 'rm -f "$runtime_env_tmp"' EXIT
+            if [ -f .env ]; then
+              sudo awk '!/^OPENAI_API_KEY=/' .env > "$runtime_env_tmp"
+            fi
+            printf 'OPENAI_API_KEY=%s\n' "$OPENAI_API_KEY" >> "$runtime_env_tmp"
+            sudo install -m 600 "$runtime_env_tmp" .env
+            rm -f "$runtime_env_tmp"
+            trap - EXIT
+            unset OPENAI_API_KEY
             sudo docker load -i /opt/viral-video-analyzer/viral-video-analyzer.tar.gz
             rm -f /opt/viral-video-analyzer/viral-video-analyzer.tar.gz
             # The container may have been created manually during recovery,

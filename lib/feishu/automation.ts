@@ -224,6 +224,57 @@ function safeAutomationFailure(error: unknown) {
     .slice(0, 360) || "资料刷新失败";
 }
 
+function productRefreshFailureCode(error: unknown) {
+  if (!error || typeof error !== "object" || !("code" in error)) return "";
+  return String((error as { code?: unknown }).code || "").trim().toLowerCase();
+}
+
+export function productCardFailureStatus(input: {
+  error: unknown;
+  retainedVerifiedSnapshot?: boolean;
+  identityWarning?: string;
+}) {
+  const code = productRefreshFailureCode(input.error);
+  // These three terminal states are deliberately short and stable: they are
+  // operational outcomes for the Base row, not provider diagnostics. The
+  // product-card link has already been written before any of them can occur.
+  if ([
+    "page_unavailable",
+    "page_network_error",
+    "page_timeout",
+    "security_challenge",
+    "browser_unavailable",
+    "browser_launch_failed",
+    "browser_navigation_timeout",
+  ].includes(code)) return "无法打开页面";
+  if ([
+    "all_product_images_unavailable",
+    "no_product_images_declared",
+  ].includes(code)) return "无法获取图片信息";
+  if ([
+    "page_incomplete",
+    "details_expand_failed",
+    "scroll_incomplete",
+    "invalid_capture",
+  ].includes(code)) return "商品信息获取不完整";
+
+  const failure = safeAutomationFailure(input.error);
+  const retainedSuffix = input.retainedVerifiedSnapshot ? "；已保留上次通过安全校验的资料" : "";
+  const identitySuffix = input.identityWarning ? "；基础信息写入待重试" : "";
+  const analysisFailure = [
+    "not_configured",
+    "timeout",
+    "authentication",
+    "quota_or_rate_limit",
+    "provider_error",
+    "refusal",
+    "incomplete",
+    "invalid_response",
+    "insufficient_safe_facts",
+  ].includes(code);
+  return `手卡已就绪，资料${analysisFailure ? "分析" : "刷新"}失败：${failure}${retainedSuffix}${identitySuffix}`.slice(0, 500);
+}
+
 function factItems(value: string) {
   return String(value || "")
     .split(/[；;\n]+/)
@@ -231,16 +282,27 @@ function factItems(value: string) {
     .filter(Boolean);
 }
 
+function factIdentity(value: string) {
+  return value
+    .replace(/（AI推断）/g, "")
+    .normalize("NFKC")
+    .toLowerCase()
+    .trim();
+}
+
 function mergeFactItems(existing: string, verified: string) {
-  const items = [...factItems(existing)];
-  const seen = new Set(items.map((item) => item.normalize("NFKC").toLowerCase()));
-  for (const item of factItems(verified)) {
-    const normalized = item.normalize("NFKC").toLowerCase();
-    if (seen.has(normalized)) continue;
-    seen.add(normalized);
-    items.push(item);
+  const facts = new Map<string, string>();
+  for (const item of [...factItems(existing), ...factItems(verified)]) {
+    const identity = factIdentity(item);
+    if (!identity) continue;
+    const current = facts.get(identity);
+    // The same claim may first appear as an inference and later gain direct
+    // evidence. Keep one copy and prefer the directly supported wording.
+    if (!current || (current.includes("（AI推断）") && !item.includes("（AI推断）"))) {
+      facts.set(identity, item);
+    }
   }
-  return items.join("；");
+  return [...facts.values()].join("；");
 }
 
 function mergeParameterFacts(existing: string, verified: string) {
@@ -256,20 +318,33 @@ function mergeParameterFacts(existing: string, verified: string) {
 }
 
 function mergeCoreFunctions(existing: string[], verified: string[]) {
-  const result: string[] = [];
-  const seen = new Set<string>();
+  const facts = new Map<string, string>();
   for (const value of [...(existing || []), ...(verified || [])]) {
     const item = String(value || "").replace(/\s+/g, " ").trim();
-    const normalized = item.normalize("NFKC").toLowerCase();
-    if (!item || seen.has(normalized)) continue;
-    seen.add(normalized);
-    result.push(item);
+    const identity = factIdentity(item);
+    if (!identity) continue;
+    const current = facts.get(identity);
+    if (!current || (current.includes("（AI推断）") && !item.includes("（AI推断）"))) {
+      facts.set(identity, item);
+    }
   }
-  return result.slice(0, 8);
+  return [...facts.values()].slice(0, 8);
 }
 
 function parsedVerificationSummary(parsed: Awaited<ReturnType<typeof parsePublicProductPage>>) {
   return parsed.verification || null;
+}
+
+/**
+ * New parser responses distinguish direct evidence from accepted, labelled AI
+ * inference. Older parser versions only have `verified*`, whose historical
+ * meaning was safe-to-write, so retain that compatibility fallback.
+ */
+function acceptedVerificationSummary(verification: NonNullable<ReturnType<typeof parsedVerificationSummary>>) {
+  return {
+    factCount: verification.acceptedFactCount ?? verification.safeFactCount ?? verification.verifiedFactCount,
+    fields: new Set(verification.acceptedFields || verification.verifiedFields),
+  };
 }
 
 function productLinkInputError(input: { productUrl: string; extractedPid: string }) {
@@ -681,8 +756,10 @@ async function handleFeishuAutomationUnlocked(input: FeishuAutomationInput) {
       pid: effectivePid,
     });
     const verification = parsedVerificationSummary(parsed);
+    const accepted = verification ? acceptedVerificationSummary(verification) : null;
     if (!verification
-      || verification.verifiedFactCount <= 0
+      || !accepted
+      || accepted.factCount <= 0
       || !verification.evidenceVersion
       || !isExactTikTokProductSource(verification.sourceUrl, effectivePid)) {
       throw new Error("商品资料解析失败：没有取得任何逐条可验证的商品事实");
@@ -696,13 +773,17 @@ async function handleFeishuAutomationUnlocked(input: FeishuAutomationInput) {
       let current = getProductByPid(effectivePid)
         || getProduct(parsedProductId)
         || product!;
-      const verifiedFields = new Set(verification.verifiedFields);
-      const parsedSku = verifiedFields.has("sku") ? parsed.sku : "";
-      const parsedCoreFunctions = verifiedFields.has("coreFunctions") ? parsed.coreFunctions : [];
-      const parsedProductParameters = verifiedFields.has("productParameters") ? parsed.productParameters : "";
-      const parsedUsageMethod = verifiedFields.has("usageMethod") ? parsed.usageMethod : "";
-      const parsedAudience = verifiedFields.has("audience") ? parsed.audience : "";
-      const parsedScenes = verifiedFields.has("scenes") ? parsed.scenes : "";
+      const acceptedFields = acceptedVerificationSummary(verification).fields;
+      const parsedSku = acceptedFields.has("sku") ? parsed.sku : "";
+      const parsedCoreFunctions = acceptedFields.has("coreFunctions") ? parsed.coreFunctions : [];
+      const parsedProductParameters = acceptedFields.has("productParameters") ? parsed.productParameters : "";
+      const parsedUsageMethod = acceptedFields.has("usageMethod") ? parsed.usageMethod : "";
+      const parsedAudience = acceptedFields.has("audience") ? parsed.audience : "";
+      const parsedScenes = acceptedFields.has("scenes") ? parsed.scenes : "";
+      // Only facts certified by the same validation policy may be merged
+      // incrementally. A new evidence version must re-establish each fact with
+      // the current sealed capture; otherwise an older validator's false
+      // positive would be silently promoted into the new policy.
       const sameVerifiedProduct = current.verifiedPid === effectivePid
         && current.evidenceVersion === verification.evidenceVersion;
       const mergedCoreFunctions = parsedCoreFunctions.length
@@ -730,17 +811,22 @@ async function handleFeishuAutomationUnlocked(input: FeishuAutomationInput) {
         sourceUrl: verification.sourceUrl,
         evidenceVersion: verification.evidenceVersion,
         verifiedAt: new Date().toISOString(),
-        sku: parsedSku || undefined,
-        coreFunctions: mergedCoreFunctions,
-        productParameters: mergedProductParameters,
-        usageMethod: mergedUsageMethod,
-        targetAudience: mergedAudience,
-        usageScenes: mergedScenes,
-        sourceTitle: parsed.sourceTitle || undefined,
-        sourceDescription: parsed.sourceDescription || undefined,
-        sourceImageUrls: parsed.sourceImageUrls.length ? parsed.sourceImageUrls : undefined,
-        visualEvidence: parsed.visualEvidence || undefined,
-        visualAnalysisStatus: parsed.visualAnalysisStatus === "completed" ? "completed" : undefined,
+        sku: parsedSku || (sameVerifiedProduct ? current.sku : undefined),
+        coreFunctions: mergedCoreFunctions || (sameVerifiedProduct ? current.coreFunctions : undefined),
+        productParameters: mergedProductParameters || (sameVerifiedProduct ? current.productParameters : undefined),
+        usageMethod: mergedUsageMethod || (sameVerifiedProduct ? current.usageMethod : undefined),
+        targetAudience: mergedAudience || (sameVerifiedProduct ? current.targetAudience : undefined),
+        usageScenes: mergedScenes || (sameVerifiedProduct ? current.usageScenes : undefined),
+        sourceTitle: parsed.sourceTitle || (sameVerifiedProduct ? current.sourceTitle : undefined),
+        sourceDescription: parsed.sourceDescription || (sameVerifiedProduct ? current.sourceDescription : undefined),
+        sourceImageUrls: parsed.sourceImageUrls.length
+          ? parsed.sourceImageUrls
+          : sameVerifiedProduct ? current.sourceImageUrls : undefined,
+        visualEvidence: parsed.visualEvidence || (sameVerifiedProduct ? current.visualEvidence : undefined),
+        visualAnalysisStatus: parsed.visualAnalysisStatus === "completed"
+          ? "completed"
+          : sameVerifiedProduct && current.visualAnalysisStatus === "completed" ? "completed" : undefined,
+        factProvenance: verification.factProvenance,
       });
     });
     const synchronized = await syncProductCardManagedFields(input.client, {
@@ -778,7 +864,8 @@ async function handleFeishuAutomationUnlocked(input: FeishuAutomationInput) {
     });
     if (verification.status === "partial") {
       const missing = verification.missingFields.length;
-      productCardStatus = `部分完成：已写入 ${verification.verifiedFactCount} 条可信资料${missing ? `，${missing} 项暂无可验证证据` : ""}`;
+      const acceptedFactCount = acceptedVerificationSummary(verification).factCount;
+      productCardStatus = `部分完成：已写入 ${acceptedFactCount} 条可信资料${missing ? `，${missing} 项暂无可验证证据` : ""}`;
     } else {
       productCardStatus = productCardWarning
         ? "手卡已就绪，资料已刷新，但文档权限待修复"
@@ -786,9 +873,11 @@ async function handleFeishuAutomationUnlocked(input: FeishuAutomationInput) {
     }
   } catch (error) {
     productRefreshError = safeAutomationFailure(error);
-    const identitySuffix = shell.identityWarning ? "；基础信息写入待重试" : "";
-    const retainedSuffix = retainedVerifiedSnapshot ? "；已保留上次逐条验证通过的资料" : "";
-    productCardStatus = `手卡已就绪，资料刷新失败：${productRefreshError}${retainedSuffix}${identitySuffix}`.slice(0, 500);
+    productCardStatus = productCardFailureStatus({
+      error,
+      retainedVerifiedSnapshot,
+      identityWarning: shell.identityWarning,
+    });
   }
   // Give the critical document-link field one final independent attempt before
   // publishing the terminal status. Never tell the user "已完成" while the row

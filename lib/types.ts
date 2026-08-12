@@ -13,6 +13,21 @@ export type VideoStatus =
 
 export type ManualLabel = "优质" | "普通" | "较差" | null;
 
+/** How a product-card fact was established. AI inference is safe to display,
+ * but is deliberately distinct from a directly evidenced fact. */
+export type ProductFactBasis = "verified_text" | "verified_image_ocr" | "ai_inference";
+
+export type ProductFactField = "coreFunctions" | "usageMethod" | "audience" | "scenes";
+
+export interface ProductFactProvenanceEntry {
+  /** The exact normalized value displayed in the corresponding card field. */
+  value: string;
+  basis: ProductFactBasis;
+}
+
+/** Per-fact provenance for the four OpenAI-managed product-card fields. */
+export type ProductFactProvenance = Partial<Record<ProductFactField, ProductFactProvenanceEntry[]>>;
+
 export interface Product {
   id: string;
   name: string;
@@ -52,6 +67,8 @@ export interface Product {
   evidenceVersion: string;
   /** ISO timestamp of the last atomic verified-fact merge. */
   factsVerifiedAt: string;
+  /** Per-fact basis for facts generated from the sealed product-page capture. */
+  factProvenance: ProductFactProvenance;
   bannedTerms: string;
   notes: string;
   isSystem: boolean;
@@ -82,6 +99,8 @@ export interface VerifiedProductFactsMergeInput {
   sourceImageUrls?: string[];
   visualEvidence?: string;
   visualAnalysisStatus?: Product["visualAnalysisStatus"];
+  /** Omitted provenance follows the same PID/evidence-version preservation rule as facts. */
+  factProvenance?: ProductFactProvenance;
 }
 
 export interface ScoreSet {

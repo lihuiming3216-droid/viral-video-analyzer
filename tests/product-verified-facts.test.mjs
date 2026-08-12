@@ -44,9 +44,10 @@ test("legacy products migrate with an explicitly unverified empty provenance", a
     assert.equal(product.verifiedSourceUrl, "");
     assert.equal(product.evidenceVersion, "");
     assert.equal(product.factsVerifiedAt, "");
+    assert.deepEqual(product.factProvenance, {});
     const columns = database.getDb().prepare("PRAGMA table_info(products)").all()
       .map((column) => String(column.name));
-    for (const expected of ["verified_pid", "verified_source_url", "evidence_version", "facts_verified_at"]) {
+    for (const expected of ["verified_pid", "verified_source_url", "evidence_version", "facts_verified_at", "fact_provenance_json"]) {
       assert.ok(columns.includes(expected), `missing migrated column ${expected}`);
     }
     assert.ok(columns.every((column) => !/(?:secret|prompt|response)/i.test(column)));
@@ -67,6 +68,48 @@ test("legacy products migrate with an explicitly unverified empty provenance", a
     INSERT INTO products(id,name,pid,core_functions_json,product_parameters,created_at,updated_at)
     VALUES ('legacy-product','旧产品','1730000000000000000','["未经验证功能"]','未经验证参数','2026-08-01','2026-08-01');`);
     legacy.close();
+  });
+});
+
+test("fact basis persists through partial merges and ordinary updates cannot fabricate it", async () => {
+  await withDatabase(async (database) => {
+    const product = database.createProduct({ name: "室内摄像头", pid: "1731678528327946361" });
+    const identity = {
+      pid: product.pid,
+      sourceUrl: `https://www.tiktok.com/shop/pdp/indoor-camera/${product.pid}`,
+      evidenceVersion: "complete-pdp-openai-v1",
+    };
+    const first = database.mergeVerifiedProductFacts(product.id, {
+      ...identity,
+      verifiedAt: "2026-08-12T08:00:00.000Z",
+      coreFunctions: ["夜视", "辅助看护（AI推断）"],
+      usageMethod: "安装后通过手机查看（AI推断）",
+      factProvenance: {
+        coreFunctions: [
+          { value: "夜视", basis: "verified_text" },
+          { value: "辅助看护（AI推断）", basis: "ai_inference" },
+        ],
+        usageMethod: [{ value: "安装后通过手机查看（AI推断）", basis: "ai_inference" }],
+      },
+    });
+    assert.deepEqual(first.factProvenance.coreFunctions, [
+      { value: "夜视", basis: "verified_text" },
+      { value: "辅助看护（AI推断）", basis: "ai_inference" },
+    ]);
+    const partial = database.mergeVerifiedProductFacts(product.id, {
+      ...identity,
+      verifiedAt: "2026-08-12T08:01:00.000Z",
+      usageScenes: "住宅门口（AI推断）",
+      factProvenance: {
+        scenes: [{ value: "住宅门口（AI推断）", basis: "ai_inference" }],
+      },
+    });
+    assert.deepEqual(partial.factProvenance.coreFunctions, first.factProvenance.coreFunctions,
+      "same PID/version partial merges retain basis for untouched facts");
+    assert.deepEqual(partial.factProvenance.scenes, [{ value: "住宅门口（AI推断）", basis: "ai_inference" }]);
+
+    const edited = database.updateProduct(product.id, { usageMethod: "人工编辑" });
+    assert.deepEqual(edited.factProvenance, {}, "ordinary writes clear, rather than invent, provenance");
   });
 });
 

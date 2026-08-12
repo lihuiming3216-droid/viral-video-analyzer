@@ -106,6 +106,7 @@ class TokScriptClient {
 }
 
 function parseToolPayload(result: Record<string, unknown>) {
+  if (result.isError === true) throw new Error("TokScript 工具返回错误");
   if (result.structuredContent) return result.structuredContent;
   const content = Array.isArray(result.content) ? result.content : [];
   for (const item of content) {
@@ -122,6 +123,41 @@ function parseToolPayload(result: Record<string, unknown>) {
     if (block.resource && typeof block.resource === "object") return block.resource;
   }
   return result;
+}
+
+type TranscriptToolPayload = {
+  payload: unknown;
+  plainText: string;
+};
+
+/**
+ * Transcript tool output has a stricter trust boundary than download output.
+ * A structured response is kept structured, while a single non-JSON MCP text
+ * block is marked separately for the narrowly-scoped labelled parser below.
+ */
+function parseTranscriptToolPayload(result: Record<string, unknown>): TranscriptToolPayload {
+  if (result.isError === true) throw new Error("TokScript 工具返回错误");
+  if (Object.prototype.hasOwnProperty.call(result, "structuredContent")) {
+    return { payload: result.structuredContent, plainText: "" };
+  }
+
+  const content = Array.isArray(result.content) ? result.content : [];
+  if (content.length === 1 && content[0] && typeof content[0] === "object") {
+    const block = content[0] as Record<string, unknown>;
+    if (typeof block.text === "string") {
+      const text = block.text.trim();
+      try {
+        return { payload: JSON.parse(text), plainText: "" };
+      } catch {
+        return { payload: {}, plainText: text };
+      }
+    }
+    if (block.resource && typeof block.resource === "object") {
+      return { payload: block.resource, plainText: "" };
+    }
+  }
+
+  return { payload: result, plainText: "" };
 }
 
 function findValue(root: unknown, keys: string[]): unknown {
@@ -187,7 +223,7 @@ function findMediaUrl(root: unknown, kind: "video" | "cover") {
 }
 
 function normalizeSegments(root: unknown) {
-  const candidate = findValue(root, ["segments", "captions", "transcript_segments", "transcriptSegments"]);
+  const candidate = findValue(root, ["segments", "transcript_segments", "transcriptSegments"]);
   if (!Array.isArray(candidate)) return [];
   return candidate
     .map((item) => {
@@ -199,6 +235,27 @@ function normalizeSegments(root: unknown) {
       return text ? { start, end, text } : null;
     })
     .filter(Boolean) as Array<{ start: number; end: number; text: string }>;
+}
+
+function explicitTranscript(root: unknown) {
+  const value = findValue(root, ["transcript", "full_transcript", "fullTranscript"]);
+  return typeof value === "string" ? value.trim() : "";
+}
+
+/**
+ * Some MCP clients serialize a transcript as one labelled text block instead
+ * of JSON. Accept only an explicit Transcript section, never arbitrary text or
+ * provider messages. Structured payloads do not enter this path.
+ */
+function labelledPlainTextTranscript(value: string) {
+  const normalized = String(value || "").replace(/\r\n?/g, "\n").trim();
+  const match = normalized.match(/^(?:#{1,6}\s*)?(?:full\s+)?transcript\s*:\s*([\s\S]*)$/i);
+  if (!match) return "";
+  const body = match[1].trim();
+  const metadataStart = body.search(
+    /\n(?:#{1,6}\s*)?(?:title|author|creator|duration|views?|likes?|comments?|shares?|bookmarks?|publish(?:ed)?(?:\s+date)?|hashtags?|audio(?:\s+track)?(?:\s+name|\s+url)?|thumbnail)\s*:/i,
+  );
+  return (metadataStart >= 0 ? body.slice(0, metadataStart) : body).trim();
 }
 
 function numeric(root: unknown, keys: string[]) {
@@ -215,6 +272,94 @@ function textValue(root: unknown, keys: string[]) {
 function timeoutLike(error: unknown) {
   const message = error instanceof Error ? error.message : String(error || "");
   return /(?:timeout|timed out|aborted due to timeout|etimedout)/i.test(message);
+}
+
+function isOfficialTikTokHttpsUrl(value: string) {
+  try {
+    const url = new URL(value);
+    const hostname = url.hostname.toLowerCase();
+    return url.protocol === "https:"
+      && !url.username
+      && !url.password
+      && !url.port
+      && (hostname === "tiktok.com" || hostname.endsWith(".tiktok.com"));
+  } catch {
+    return false;
+  }
+}
+
+function isCanonicalTikTokVideoUrl(value: string) {
+  if (!isOfficialTikTokHttpsUrl(value)) return false;
+  try {
+    return /^\/@[^/]+\/video\/\d+\/?$/.test(new URL(value).pathname);
+  } catch {
+    return false;
+  }
+}
+
+function isTikTokShortVideoUrl(value: string) {
+  if (!isOfficialTikTokHttpsUrl(value)) return false;
+  try {
+    const url = new URL(value);
+    const hostname = url.hostname.toLowerCase();
+    return (hostname === "www.tiktok.com" && /^\/t\/[^/]+\/?$/.test(url.pathname))
+      || ((hostname === "vm.tiktok.com" || hostname === "vt.tiktok.com") && url.pathname !== "/");
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * TokScript is the only transcript provider for TikTok links. Resolve official
+ * TikTok short links first so the transcript tool receives the stable video
+ * page instead of the lightweight redirect shell.
+ */
+export async function resolveTokScriptVideoUrl(
+  input: string,
+  signal?: AbortSignal,
+  request: typeof fetchWithProxy = fetchWithProxy,
+) {
+  if (isCanonicalTikTokVideoUrl(input) || !isTikTokShortVideoUrl(input)) return input;
+  let current = new URL(input);
+  const timeoutSignal = AbortSignal.timeout(20_000);
+  const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+  const seen = new Set<string>();
+  for (let redirect = 0; redirect <= 5; redirect += 1) {
+    const currentUrl = current.toString();
+    if (seen.has(currentUrl) || !isOfficialTikTokHttpsUrl(currentUrl)) break;
+    seen.add(currentUrl);
+    const response = await request(current, {
+      method: "GET",
+      redirect: "manual",
+      headers: { "User-Agent": "Mozilla/5.0" },
+      signal: requestSignal,
+    });
+    try {
+      if (response.status >= 300 && response.status < 400) {
+        const location = response.headers.get("location");
+        if (!location) break;
+        const next = new URL(location, current);
+        if (!isOfficialTikTokHttpsUrl(next.toString())) break;
+        current = next;
+        if (isCanonicalTikTokVideoUrl(current.toString())) return current.toString();
+        continue;
+      }
+      if (response.ok && isCanonicalTikTokVideoUrl(current.toString())) return current.toString();
+      break;
+    } finally {
+      await response.body?.cancel().catch(() => undefined);
+    }
+  }
+  throw new Error("TokScript 短链接未解析到官方 TikTok 视频地址");
+}
+
+/** Plain-text provider diagnostics must never be treated as spoken words. */
+export function tokScriptTranscriptFailure(value: string) {
+  const normalized = String(value || "").normalize("NFKC").trim().replace(/\s+/g, " ");
+  return /^(?:error|failed|failure|unable|could not|cannot|service unavailable|rate limit(?:ed)?|too many requests)\b/i.test(normalized)
+    || /(?:failed to extract transcript|transcript extraction (?:failed|error)|no transcript (?:data|available)|transcript (?:unavailable|not found)|SIGI_STATE|UNIVERSAL_DATA_FOR_REHYDRATION)/i.test(normalized)
+    || /^(?:there (?:is|was) no (?:speech|spoken audio|voice[ -]?over|narration)|no (?:speech|spoken audio|voice[ -]?over|narration)(?:\b.*)?|(?:only )?(?:background )?music(?: only)?|only music)(?:[.!！。]|$)/i.test(normalized)
+    || /^(?:(?:full )?transcript\s*:\s*)?(?:\(\s*empty\s*\)|empty|none|null|n\/?a)\s*$/i.test(normalized);
 }
 
 export async function testTokScriptConnection() {
@@ -235,6 +380,7 @@ export async function fetchTikTok(
   const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
   const client = new TokScriptClient(config.baseUrl, config.apiKey, requestSignal);
   try {
+    const resolvedUrl = await resolveTokScriptVideoUrl(url, requestSignal);
     await client.connect();
     const tools = await client.listTools();
     const pick = (names: string[]) => tools.find((tool) => names.includes(tool.name));
@@ -244,26 +390,24 @@ export async function fetchTikTok(
     if (!transcriptTool || !downloadTool) {
       throw new Error("TokScript 当前账号没有返回转写或下载工具，请检查套餐权限");
     }
-    // Obtain the downloadable media first. A slow transcript service should
-    // not discard a perfectly usable video; analysis can fall back to audio
-    // transcription only for that exceptional case.
-    const downloadRaw = parseToolPayload(await client.callTool(downloadTool, url));
-    let transcriptRaw: unknown = {};
-    let transcriptError = "";
-    try {
-      transcriptRaw = parseToolPayload(await client.callTool(transcriptTool, url));
-    } catch (error) {
-      if (signal?.aborted) throw error;
-      if (!timeoutSignal.aborted && !timeoutLike(error)) throw error;
-      transcriptError = "TokScript 口播获取超时，已改用音频转写";
-    }
+    // Obtain both outputs from TokScript. TikTok-link jobs never re-transcribe
+    // the downloaded media with another provider.
+    const downloadRaw = parseToolPayload(await client.callTool(downloadTool, resolvedUrl));
+    const parsedTranscript = parseTranscriptToolPayload(await client.callTool(transcriptTool, resolvedUrl));
+    const transcriptRaw = parsedTranscript.payload;
     const coverRaw = options.includeCover !== false && coverTool && !timeoutSignal.aborted
-      ? parseToolPayload(await client.callTool(coverTool, url))
+      ? parseToolPayload(await client.callTool(coverTool, resolvedUrl))
       : null;
-    const transcript = textValue(transcriptRaw, ["transcript", "full_transcript", "fullTranscript", "text", "content"]);
     const segments = normalizeSegments(transcriptRaw);
+    const transcript = explicitTranscript(transcriptRaw)
+      || labelledPlainTextTranscript(parsedTranscript.plainText)
+      || segments.map((segment) => segment.text).join(" ");
+    const normalizedTranscript = transcript.trim();
+    if (!normalizedTranscript || tokScriptTranscriptFailure(normalizedTranscript)) {
+      throw new Error("TokScript 未返回有效口播文案");
+    }
     return {
-      transcript: transcript || segments.map((segment) => segment.text).join(" "),
+      transcript: normalizedTranscript,
       language: textValue(transcriptRaw, ["language", "detected_language", "detectedLanguage"]),
       segments,
       downloadUrl: findMediaUrl(downloadRaw, "video"),
@@ -280,7 +424,7 @@ export async function fetchTikTok(
         favorites: numeric(transcriptRaw, ["favorite_count", "favoriteCount", "collect_count", "collectCount"]),
         followers: numeric(transcriptRaw, ["follower_count", "followerCount", "followers"]),
       },
-      raw: { transcript: transcriptRaw, transcriptError, download: downloadRaw, cover: coverRaw },
+      raw: { transcript: transcriptRaw, download: downloadRaw, cover: coverRaw },
     };
   } catch (error) {
     if (signal?.aborted) throw error;

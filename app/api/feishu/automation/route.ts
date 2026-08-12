@@ -5,8 +5,6 @@ import { handleFeishuAutomation, updateProductCardStatus, type FeishuAutomationF
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const activeProductJobs = new Set<string>();
-
 function automationAuth(request: NextRequest, body: Record<string, unknown>) {
   const expected = process.env.FEISHU_AUTOMATION_WEBHOOK_SECRET?.trim();
   if (!expected) return null;
@@ -48,6 +46,17 @@ function payloadFieldMap(value: unknown): Partial<FeishuAutomationFieldMap> {
   }
 }
 
+function safeBackgroundError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error || "飞书自动化处理失败");
+  return message
+    .replace(/\bauthorization\s*:\s*(?:bearer|basic)?\s*\S+/gi, "[已隐藏]")
+    .replace(/\bbearer\s+\S+/gi, "[已隐藏]")
+    .replace(/(?:api[_ -]?key|app[_ -]?secret|webhook[_ -]?secret)\s*[:=]?\s*\S+/gi, "[已隐藏]")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 360) || "飞书自动化处理失败";
+}
+
 export async function POST(request: NextRequest) {
   try {
     const contentType = request.headers.get("content-type") || "";
@@ -63,74 +72,71 @@ export async function POST(request: NextRequest) {
     const fields = payloadFields(body);
     if (!appToken || !tableId || !recordId) return NextResponse.json({ error: "缺少 appToken、tableId 或 recordId" }, { status: 400 });
     const fieldMap = payloadFieldMap(body.fieldMap || body.field_map);
-    const jobKey = `${appToken}:${tableId}:${recordId}`;
-    if (!activeProductJobs.has(jobKey)) {
-      activeProductJobs.add(jobKey);
-      after(async () => {
-        const startedAt = Date.now();
+    // Every accepted click schedules one refresh. The handler itself holds a
+    // per-Base-record lock across shell -> capture -> merge -> document sync,
+    // so concurrent clicks serialize without silently dropping a click.
+    after(async () => {
+      const startedAt = Date.now();
+      try {
+        const channel = getConnectedFeishuChannel() || await ensureFeishuConnection();
+        if (!channel) throw new Error("飞书应用尚未连接");
+        // The first external write is deliberately the newly created/reused
+        // hand-card URL inside handleFeishuAutomation. Product-page parsing
+        // and even status-column failures must come after the document exists.
+        const result = await handleFeishuAutomation({
+          client: channel.rawClient,
+          appToken,
+          tableId,
+          recordId,
+          fields,
+          fieldMap,
+          // Background jobs must write the result themselves. The Feishu HTTP
+          // action has already received its immediate acknowledgement.
+          writeBack: true,
+        });
+        console.info("[feishu-automation] completed", {
+          recordId,
+          pid: result.pid,
+          productName: result.productName,
+          documentUrl: result.documentUrl,
+          documentReady: result.documentReady,
+          productCardStatus: result.productCardStatus,
+          productCardWarning: result.productCardWarning,
+          productRefreshError: result.productRefreshError,
+          durationMs: Date.now() - startedAt,
+          writeBackError: result.writeBackError,
+        });
+      } catch (error) {
+        const message = safeBackgroundError(error);
         try {
           const channel = getConnectedFeishuChannel() || await ensureFeishuConnection();
-          if (!channel) throw new Error("飞书应用尚未连接");
-          // The first external write is deliberately the newly created/reused
-          // hand-card URL inside handleFeishuAutomation. Product-page parsing
-          // and even status-column failures must come after the document exists.
-          const result = await handleFeishuAutomation({
-            client: channel.rawClient,
-            appToken,
-            tableId,
-            recordId,
-            fields,
-            fieldMap,
-            // Background jobs must write the result themselves. The Feishu
-            // HTTP action has already received its immediate acknowledgement.
-            writeBack: true,
-          });
-          console.info("[feishu-automation] completed", {
-            recordId,
-            pid: result.pid,
-            productName: result.productName,
-            documentUrl: result.documentUrl,
-            documentReady: result.documentReady,
-            productCardStatus: result.productCardStatus,
-            productCardWarning: result.productCardWarning,
-            productRefreshError: result.productRefreshError,
-            durationMs: Date.now() - startedAt,
-            writeBackError: result.writeBackError,
-          });
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          try {
-            const channel = getConnectedFeishuChannel() || await ensureFeishuConnection();
-            if (channel && !fields[fieldMap.videoUrl || "视频链接"] && !fields["样片链接"]) {
-              await updateProductCardStatus({
-                client: channel.rawClient,
-                appToken,
-                tableId,
-                recordId,
-                status: `失败：${message}`,
-                fieldName: fieldMap.productCardStatus,
-              });
-            }
-          } catch (writeBackError) {
-            console.error("[feishu-automation] status write-back failed", {
+          if (channel && !fields[fieldMap.videoUrl || "视频链接"] && !fields["样片链接"]) {
+            await updateProductCardStatus({
+              client: channel.rawClient,
+              appToken,
+              tableId,
               recordId,
-              error: writeBackError instanceof Error ? writeBackError.message : String(writeBackError),
+              status: `失败：${message}`,
+              fieldName: fieldMap.productCardStatus,
             });
           }
-          console.error("[feishu-automation] failed", {
+        } catch (writeBackError) {
+          console.error("[feishu-automation] status write-back failed", {
             recordId,
-            durationMs: Date.now() - startedAt,
-            error: message,
+            error: safeBackgroundError(writeBackError),
           });
-        } finally {
-          activeProductJobs.delete(jobKey);
         }
-      });
-    }
+        console.error("[feishu-automation] failed", {
+          recordId,
+          durationMs: Date.now() - startedAt,
+          error: message,
+        });
+      }
+    });
     return NextResponse.json({
       ok: true,
       accepted: true,
-      status: activeProductJobs.has(jobKey) ? "后台处理中" : "任务已受理",
+      status: "后台处理中",
       fields: {},
       patch: {},
       productDocument: "",
@@ -138,6 +144,6 @@ export async function POST(request: NextRequest) {
       writeBackError: "",
     }, { status: 202 });
   } catch (error) {
-    return NextResponse.json({ error: error instanceof Error ? error.message : "飞书自动化处理失败" }, { status: 500 });
+    return NextResponse.json({ error: safeBackgroundError(error) }, { status: 500 });
   }
 }

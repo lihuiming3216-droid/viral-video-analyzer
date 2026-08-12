@@ -37,29 +37,33 @@ export async function POST(request: NextRequest) {
     if (parsed) {
       product = updateProduct(product.id, { name, pid, productUrl }) || product;
       const verification = parsed.verification;
+      const acceptedFactCount = verification
+        ? verification.acceptedFactCount ?? verification.safeFactCount ?? verification.verifiedFactCount
+        : 0;
       if (!verification
-        || verification.verifiedFactCount <= 0
+        || acceptedFactCount <= 0
         || !verification.evidenceVersion
         || !isExactTikTokProductSource(verification.sourceUrl, pid)) {
-        throw new Error("商品资料解析失败：没有取得任何逐条可验证的商品事实");
+        throw new Error("商品资料解析失败：没有取得任何通过安全校验的商品信息");
       }
-      const verifiedFields = new Set(verification.verifiedFields);
+      const acceptedFields = new Set(verification.acceptedFields || verification.verifiedFields);
       product = mergeVerifiedProductFacts(product.id, {
         pid,
         sourceUrl: verification.sourceUrl,
         evidenceVersion: verification.evidenceVersion,
         verifiedAt: new Date().toISOString(),
-        sku: verifiedFields.has("sku") && parsed.sku ? parsed.sku : undefined,
-        coreFunctions: verifiedFields.has("coreFunctions") && parsed.coreFunctions.length ? parsed.coreFunctions : undefined,
-        productParameters: verifiedFields.has("productParameters") && parsed.productParameters ? parsed.productParameters : undefined,
-        usageMethod: verifiedFields.has("usageMethod") && parsed.usageMethod ? parsed.usageMethod : undefined,
-        targetAudience: verifiedFields.has("audience") && parsed.audience ? parsed.audience : undefined,
-        usageScenes: verifiedFields.has("scenes") && parsed.scenes ? parsed.scenes : undefined,
+        sku: acceptedFields.has("sku") && parsed.sku ? parsed.sku : undefined,
+        coreFunctions: acceptedFields.has("coreFunctions") && parsed.coreFunctions.length ? parsed.coreFunctions : undefined,
+        productParameters: acceptedFields.has("productParameters") && parsed.productParameters ? parsed.productParameters : undefined,
+        usageMethod: acceptedFields.has("usageMethod") && parsed.usageMethod ? parsed.usageMethod : undefined,
+        targetAudience: acceptedFields.has("audience") && parsed.audience ? parsed.audience : undefined,
+        usageScenes: acceptedFields.has("scenes") && parsed.scenes ? parsed.scenes : undefined,
         sourceTitle: parsed.sourceTitle || undefined,
         sourceDescription: parsed.sourceDescription || undefined,
         sourceImageUrls: parsed.sourceImageUrls.length ? parsed.sourceImageUrls : undefined,
         visualEvidence: parsed.visualEvidence || undefined,
         visualAnalysisStatus: parsed.visualAnalysisStatus === "completed" ? "completed" : undefined,
+        factProvenance: verification.factProvenance,
       });
     }
     let currentProduct = getProductByPid(pid) || product;

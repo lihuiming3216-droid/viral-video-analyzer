@@ -110,6 +110,21 @@ test("Base row product-card mappings migrate and upsert without requiring a PID"
     assert.equal(partial.lastProductName, "室内安防摄像头");
     assert.equal(partial.managedProductPid, product.pid, "omitting the managed PID must preserve it");
 
+    database.upsertFeishuProductCardMapping({
+      appToken: "app-b",
+      tableId: "table-b",
+      recordId: "record-b",
+      productId: product.id,
+      documentId: "doc-b",
+      documentUrl: "https://feishu.cn/docx/doc-b",
+    });
+    assert.deepEqual(
+      database.listFeishuProductCardMappingsByProductId(product.id).map((mapping) => mapping.documentId),
+      ["doc-a", "doc-b"],
+      "all Base rows bound to one product remain independently enumerable",
+    );
+    assert.deepEqual(database.listFeishuProductCardMappingsByProductId(""), []);
+
     const cleared = database.upsertFeishuProductCardMapping({ ...key, managedProductPid: "" });
     assert.equal(cleared.managedProductPid, "", "an explicit empty managed PID must clear it");
 

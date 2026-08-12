@@ -980,8 +980,20 @@ export async function getFeishuDocumentBlock(client: Client, documentId: string,
   return response.data?.block || {};
 }
 
-export async function updateFeishuTextBlock(client: Client, documentId: string, blockId: string, content: string) {
-  return updateFeishuTextBlockElements(client, documentId, blockId, [{ text_run: { content } }]);
+export async function updateFeishuTextBlock(
+  client: Client,
+  documentId: string,
+  blockId: string,
+  content: string,
+  options: { documentRevisionId?: number } = {},
+) {
+  return updateFeishuTextBlockElements(
+    client,
+    documentId,
+    blockId,
+    [{ text_run: { content } }],
+    options,
+  );
 }
 
 type FeishuTextElement = {
@@ -999,10 +1011,14 @@ export async function updateFeishuTextBlockElements(
   documentId: string,
   blockId: string,
   elements: FeishuTextElement[],
+  options: { documentRevisionId?: number } = {},
 ) {
   const response = await client.docx.v1.documentBlock.patch({
     path: { document_id: documentId, block_id: blockId },
     data: { update_text_elements: { elements } },
+    params: options.documentRevisionId === undefined
+      ? undefined
+      : { document_revision_id: options.documentRevisionId },
   });
   apiError(response, "更新飞书文档文本失败");
 }

@@ -5,8 +5,9 @@ import { clampScore, formatTime } from "@/lib/json-utils";
 import { getLearningContext, learnFromVideo } from "@/lib/learning";
 import { getProviderConfig } from "@/lib/provider-config";
 import { analyzeVideoWithQwen, transcribeAudioWithQwen } from "@/lib/providers/qwen";
-import { fetchTikTok } from "@/lib/providers/tokscript";
+import { fetchTikTok, tokScriptTranscriptFailure } from "@/lib/providers/tokscript";
 import type { AnalysisResult, AnalysisScene, Product, ScoreSet } from "@/lib/types";
+import { transcriptAndTranslationAgree } from "@/lib/transcript-validation";
 import { emitVideoProgress } from "@/lib/video-events";
 import {
   createSceneClip,
@@ -180,8 +181,14 @@ function userFacingAnalysisError(error: unknown) {
   return message;
 }
 
-function isUsableAnalysis(value: Record<string, unknown> | undefined, sceneCount: number, mode: "full" | "product_doc") {
+function isUsableAnalysis(
+  value: Record<string, unknown> | undefined,
+  sceneCount: number,
+  mode: "full" | "product_doc",
+  transcript = "",
+) {
   if (!value || typeof value.summary !== "string" || !value.summary.trim()) return false;
+  if (!transcriptAndTranslationAgree(transcript, value.translationZh)) return false;
   const scores = value.scores;
   const scenes = value.scenes;
   // The table path deliberately asks for a compact object without scene rows
@@ -221,7 +228,11 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal) {
     let transcript = initial.transcriptOriginal;
     let transcriptSegments: Array<{ start: number; end: number; text: string }> = [];
 
-    if (initial.sourceType === "tiktok" && !relativeVideoPath) {
+    const storedTokScriptFailure = initial.sourceType === "tiktok"
+      && tokScriptTranscriptFailure(transcript);
+    const needsTokScriptRefresh = initial.sourceType === "tiktok"
+      && (!relativeVideoPath || !transcript.trim() || storedTokScriptFailure);
+    if (needsTokScriptRefresh) {
       setStage(videoId, "downloading", "正在通过 TokScript 获取视频和公开数据", 12);
       const tokOptions = {
         includeCover: analysisMode !== "product_doc",
@@ -258,20 +269,24 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal) {
         stats_captured_at: new Date().toISOString(),
         provider_payload_json: JSON.stringify(tok.raw),
       });
-      trace.push("TokScript：视频、文案与公开数据");
-      setStage(videoId, "downloading", "正在下载 TikTok 原视频", 22);
-      relativeVideoPath = await withOneNetworkRetry(
-        () => downloadMedia(videoId, tok.downloadUrl, "video", signal, {
-          timeoutMs: analysisMode === "product_doc" ? 90_000 : 180_000,
-        }),
-        () => setStage(videoId, "downloading", "原视频下载较慢，正在自动重试", 24),
-        signal,
-      );
-      const coverPath = tok.coverUrl ? await downloadMedia(videoId, tok.coverUrl, "cover", signal).catch((error) => {
-        if (signal?.aborted) throw error;
-        return null;
-      }) : null;
-      updateVideo(videoId, { original_path: relativeVideoPath, cover_path: coverPath });
+      trace.push(relativeVideoPath
+        ? "TokScript：已刷新先前无效的口播响应"
+        : "TokScript：视频、文案与公开数据");
+      if (!relativeVideoPath) {
+        setStage(videoId, "downloading", "正在下载 TikTok 原视频", 22);
+        relativeVideoPath = await withOneNetworkRetry(
+          () => downloadMedia(videoId, tok.downloadUrl, "video", signal, {
+            timeoutMs: analysisMode === "product_doc" ? 90_000 : 180_000,
+          }),
+          () => setStage(videoId, "downloading", "原视频下载较慢，正在自动重试", 24),
+          signal,
+        );
+        const coverPath = tok.coverUrl ? await downloadMedia(videoId, tok.coverUrl, "cover", signal).catch((error) => {
+          if (signal?.aborted) throw error;
+          return null;
+        }) : null;
+        updateVideo(videoId, { original_path: relativeVideoPath, cover_path: coverPath });
+      }
     } else if (initial.sourceType === "tiktok") {
       trace.push("本地缓存：复用已保存的 TikTok 原片和文案");
     }
@@ -280,19 +295,20 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal) {
     setStage(videoId, "extracting", "正在识别镜头并提取关键画面", 36);
     const assets = await extractVideoAssets(videoId, relativeVideoPath, signal, {
       light: analysisMode === "product_doc",
-      // TokScript normally supplies the transcript. Audio extraction is only
-      // enabled as a fallback, so successful lightweight jobs spend no extra
-      // transcription tokens.
-      includeAudio: !transcript,
+      // TokScript is the sole transcript source for TikTok links. Never
+      // re-transcribe the downloaded TikTok file with a second provider.
+      // Local uploads still need audio extraction because they have no
+      // TokScript transcript request.
+      includeAudio: initial.sourceType !== "tiktok" && !transcript,
     });
     updateVideo(videoId, {
       duration_seconds: assets.duration,
       cover_path: getVideo(videoId, false)?.coverPath || assets.scenes[0]?.screenshotPath || null,
     });
 
-    if (!transcript && assets.audioPath) {
+    if (initial.sourceType !== "tiktok" && !transcript && assets.audioPath) {
       if (!isConfigured("qwen")) {
-        throw new Error("TokScript 未返回口播，且 Qwen 语音转写尚未配置");
+        throw new Error("本地上传视频需要配置 Qwen 才能识别口播");
       }
       setStage(videoId, "transcribing", "正在识别英语或西语口播", 52);
       const audioChunks = await splitAudioForQwenAsr(assets.audioPath, assets.duration, signal);
@@ -332,7 +348,7 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal) {
 
     setStage(videoId, "analyzing", analysisMode === "product_doc" ? "正在生成轻量视频分析和中文翻译" : "正在生成中文深度报告和复拍脚本", 82);
     let rawAnalysis: Partial<AnalysisResult>;
-    if (isUsableAnalysis(qwenContext, assets.scenes.length, analysisMode)) {
+    if (isUsableAnalysis(qwenContext, assets.scenes.length, analysisMode, transcript)) {
       rawAnalysis = qwenContext as Partial<AnalysisResult>;
       trace.push("自动路由：Qwen 结果完整，直接生成快速报告");
     } else if (isConfigured("qwen")) {
@@ -348,7 +364,7 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal) {
       throw new Error("请先配置并启用 Qwen，所有 AI 分析只使用 Qwen");
     }
 
-    if (!isUsableAnalysis(rawAnalysis as Record<string, unknown>, assets.scenes.length, analysisMode)) {
+    if (!isUsableAnalysis(rawAnalysis as Record<string, unknown>, assets.scenes.length, analysisMode, transcript)) {
       throw new Error("Qwen 未返回完整的视频分析和中文翻译，请重试该链接");
     }
 
@@ -415,6 +431,12 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal) {
       analysis_json: JSON.stringify(analysis),
       error_message: null,
     });
+    // Push the finished result into the matching row immediately. The periodic
+    // document scan remains only a safety net and is not the normal delivery
+    // path for newly completed videos.
+    await import("@/lib/feishu/product-doc-sync")
+      .then(({ syncCompletedVideoToProductDocument }) => syncCompletedVideoToProductDocument(videoId))
+      .catch(() => false);
     // A video created by a Feishu Base automation carries a pending job. Push
     // the compact result back to that exact record after analysis completes.
     void import("@/lib/feishu/automation")

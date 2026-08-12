@@ -1,10 +1,17 @@
 import "server-only";
 
 import { existsSync } from "node:fs";
+import type { Page } from "playwright-core";
 import { fetchWithProxy } from "@/lib/network";
+import {
+  analyzeProductCaptureWithOpenAI,
+  createProductCaptureDigest,
+  formatProductFactsForCard,
+} from "@/lib/openai-product-analyzer";
 import { getProviderConfig } from "@/lib/provider-config";
 import { parseJsonLoose, readTextFromModelResponse } from "@/lib/json-utils";
 import { tiktokProductFetchUrls } from "@/lib/tiktok-product";
+import type { ProductFactBasis, ProductFactField, ProductFactProvenance } from "@/lib/types";
 
 export interface ParsedProductInfo {
   productName: string;
@@ -28,12 +35,157 @@ export interface ParsedProductInfo {
     missingFields: string[];
     sourceUrl: string;
     evidenceVersion: string;
+    /** Facts permitted to be written to the card, including clearly labelled AI inference. */
+    safeFactCount?: number;
+    acceptedFactCount?: number;
+    acceptedFields?: string[];
+    /** Direct text/OCR evidence only; never includes AI inference. */
+    inferredFactCount?: number;
+    inferredFields?: string[];
+    /** Basis for each OpenAI-managed fact, carried into the durable product snapshot. */
+    factProvenance?: ProductFactProvenance;
   };
 }
 
 export interface ProductParseHints {
   productName?: string;
   pid?: string;
+}
+
+export type ProductPageCaptureErrorCode =
+  | "page_unavailable"
+  | "page_incomplete"
+  | "all_product_images_unavailable";
+
+export class ProductPageCaptureError extends Error {
+  constructor(public readonly code: ProductPageCaptureErrorCode, safeMessage: string) {
+    super(safeMessage);
+    this.name = "ProductPageCaptureError";
+  }
+}
+
+function productPageCaptureMessage(code: ProductPageCaptureErrorCode) {
+  if (code === "page_incomplete") return "商品详情页没有完成展开并稳定滚动到底";
+  if (code === "all_product_images_unavailable") return "商品详情页没有可下载并解码的主体图片";
+  return "无法打开并确认同 PID 的 TikTok Shop 商品详情页";
+}
+
+export interface ProductPageCoverage {
+  identity: "exact";
+  details: "converged" | "not_required";
+  scroll: "converged";
+  expectedImageCount: number;
+  usableImageCount: number;
+}
+
+export interface CapturedProductFragment {
+  id: string;
+  kind: "router_text" | "router_property" | "scoped_dom";
+  text: string;
+}
+
+export interface CapturedProductImage {
+  id: string;
+  dataUrl: string;
+  role: "cover" | "detail";
+  ocrText?: string;
+}
+
+export interface CapturedProductPage {
+  captureId: string;
+  sourceDigest: string;
+  canonicalUrl: string;
+  pid: string;
+  fragments: CapturedProductFragment[];
+  images: CapturedProductImage[];
+  coverage: ProductPageCoverage;
+}
+
+export type ProductPageCaptureResult =
+  | { ok: true; capture: CapturedProductPage; errorCode: "" }
+  | {
+      ok: false;
+      capture: CapturedProductPage | null;
+      errorCode: ProductPageCaptureErrorCode;
+    };
+
+export interface ProductPageCollectionSnapshot {
+  atBottom: boolean;
+  scrollHeight: number;
+  detailHash: string;
+  productImageKeys: string[];
+  pendingDetailControls?: number;
+}
+
+export interface ProductPageCollectionDriver {
+  navigate(url: string): Promise<{ ok: boolean; finalUrl: string; status: number }>;
+  expandProductDetails(labels: readonly string[]): Promise<{
+    found: boolean;
+    expanded: boolean;
+    pendingCount?: number;
+  }>;
+  resetToTop(): Promise<void>;
+  snapshot(): Promise<ProductPageCollectionSnapshot>;
+  scrollNext(): Promise<void>;
+  wait(milliseconds: number): Promise<void>;
+  collect(): Promise<{
+    html: string;
+    text: string;
+    detailTextTruncated?: boolean;
+    /** Visible body text used only to classify security challenges, never as fact evidence. */
+    securityText?: string;
+  }>;
+  probeImage(url: string): Promise<{ dataUrl: string } | null>;
+}
+
+function isTrustedProductNavigationUrl(sourceUrl: string, productId: string) {
+  if (isExactTikTokProductSource(sourceUrl, productId)) return true;
+  try {
+    const url = new URL(sourceUrl);
+    if (url.protocol !== "https:" || url.username || url.password || url.port) return false;
+    if (url.hostname.toLowerCase() !== "shop.tiktokw.us") return false;
+    const canonical = new URL(url.toString());
+    canonical.hostname = "shop.tiktok.com";
+    return isExactTikTokProductSource(canonical.toString(), productId);
+  } catch {
+    return false;
+  }
+}
+
+function isObviouslyPrivateNetworkUrl(sourceUrl: string) {
+  try {
+    const url = new URL(sourceUrl);
+    if (!["http:", "https:"].includes(url.protocol)) return false;
+    const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+    if (host === "localhost" || host.endsWith(".localhost") || host === "::1" || host === "0.0.0.0") return true;
+    if (/^(?:127|10)\./.test(host) || /^192\.168\./.test(host) || /^169\.254\./.test(host)) return true;
+    const ipv4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    if (ipv4) {
+      const octets = ipv4.slice(1).map(Number);
+      if (octets.some((octet) => octet > 255)) return true;
+      if (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) return true;
+      if (octets[0] === 100 && octets[1] >= 64 && octets[1] <= 127) return true;
+    }
+    return /^(?:fc|fd|fe8|fe9|fea|feb)[0-9a-f:]*$/i.test(host);
+  } catch {
+    return true;
+  }
+}
+
+export interface ProductPageCollectionResult {
+  capture: CapturedProductPage | null;
+  errorCode: ProductPageCaptureErrorCode | "";
+  html: string;
+  text: string;
+  sourceImageUrls: string[];
+  imageDataUrls: string[];
+  diagnostics: {
+    details: "converged" | "not_required" | "incomplete";
+    scroll: "converged" | "incomplete";
+    stableRounds: number;
+    expectedImageCount: number;
+    usableImageCount: number;
+  };
 }
 
 type ProductEvidenceQuotes = {
@@ -64,12 +216,18 @@ export function extractProductIdFromUrl(productUrl: string) {
   }
 }
 
-const MAX_PRODUCT_IMAGES = 8;
+// Keep the whole normal TikTok product gallery available to the sealed
+// multimodal capture. The OpenAI analyzer enforces the same hard upper bound.
+const MAX_PRODUCT_IMAGES = 20;
 const MAX_IMAGE_PIXELS = 768 * 768;
 const PRODUCT_EVIDENCE_VERSION = "exact-pdp-atomic-v1";
 const VERIFIED_PRODUCT_FIELDS = [
   "sku", "coreFunctions", "productParameters", "usageMethod", "audience", "scenes",
 ] as const;
+
+const OPENAI_MANAGED_PRODUCT_FIELDS = [
+  "coreFunctions", "usageMethod", "audience", "scenes",
+] as const satisfies readonly ProductFactField[];
 
 function clean(value: unknown) {
   return String(value || "").replace(/\s+/g, " ").trim();
@@ -83,17 +241,28 @@ export function isProductSecurityChallenge(title: string, description = "", text
   return PRODUCT_SECURITY_CHALLENGE.test(`${clean(title)} ${clean(description)} ${clean(text).slice(0, 1_500)}`);
 }
 
-function officialTikTokProductPath(url: URL) {
+type OfficialTikTokProductPath = {
+  kind: "pdp" | "view";
+  slug: string;
+  pid: string;
+};
+
+function officialTikTokProductPath(url: URL): OfficialTikTokProductPath | null {
   const pathname = url.pathname.replace(/\/+$/, "") || "/";
   if (url.hostname.toLowerCase() === "shop.tiktok.com") {
-    const match = pathname.match(/^\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?pdp\/([^/]+)\/(\d{6,})$/i);
-    return match ? { slug: match[1], pid: match[2] } : null;
+    const localized = String.raw`(?:[a-z]{2}(?:-[a-z]{2})?\/)?`;
+    const namedMatch = pathname.match(new RegExp(`^\\/${localized}pdp\\/([^/]+)\\/(\\d{6,})$`, "i"));
+    if (namedMatch) return { kind: "pdp", slug: namedMatch[1], pid: namedMatch[2] };
+    const sluglessMatch = pathname.match(new RegExp(`^\\/${localized}pdp\\/(\\d{6,})$`, "i"));
+    return sluglessMatch ? { kind: "pdp", slug: "", pid: sluglessMatch[1] } : null;
   }
   if (url.hostname.toLowerCase() !== "www.tiktok.com") return null;
   const shopMatch = pathname.match(/^\/shop\/pdp\/([^/]+)\/(\d{6,})$/i);
-  if (shopMatch) return { slug: shopMatch[1], pid: shopMatch[2] };
+  if (shopMatch) return { kind: "pdp", slug: shopMatch[1], pid: shopMatch[2] };
+  const sluglessShopMatch = pathname.match(/^\/shop\/pdp\/(\d{6,})$/i);
+  if (sluglessShopMatch) return { kind: "pdp", slug: "", pid: sluglessShopMatch[1] };
   const viewMatch = pathname.match(/^\/view\/product\/(\d{6,})$/i);
-  return viewMatch ? { slug: "", pid: viewMatch[1] } : null;
+  return viewMatch ? { kind: "view", slug: "", pid: viewMatch[1] } : null;
 }
 
 export function productIdFromOfficialTikTokPath(sourceUrl: string) {
@@ -109,6 +278,22 @@ export function productIdFromOfficialTikTokPath(sourceUrl: string) {
  * a web-search/model response eligible as product evidence.
  */
 export function isExactTikTokProductSource(sourceUrl: string, productId: string) {
+  const expectedPid = clean(productId);
+  if (!/^\d{6,}$/.test(expectedPid)) return false;
+  try {
+    const url = new URL(sourceUrl);
+    if (url.protocol !== "https:" || url.username || url.password || url.port) return false;
+    const productPath = officialTikTokProductPath(url);
+    if (!productPath || productPath.kind !== "pdp" || productPath.pid !== expectedPid) return false;
+    return PRODUCT_ID_QUERY_KEYS.every((key) => url.searchParams.getAll(key)
+      .every((queryPid) => clean(queryPid) === expectedPid));
+  } catch {
+    return false;
+  }
+}
+
+/** View-product URLs may help discover a PDP, but never certify product facts. */
+export function isTikTokProductDiscoverySource(sourceUrl: string, productId: string) {
   const expectedPid = clean(productId);
   if (!/^\d{6,}$/.test(expectedPid)) return false;
   try {
@@ -205,15 +390,61 @@ function productFactGroups(info: Pick<ParsedProductInfo,
   };
 }
 
+function factValuesForField(
+  groups: ReturnType<typeof productFactGroups>,
+  field: ProductFactField,
+) {
+  return groups[field] || [];
+}
+
+function normalizedFactValue(value: string) {
+  return clean(value);
+}
+
+function basisFromRenderedFact(value: string): ProductFactBasis {
+  return /（AI推断）\s*$/.test(value) ? "ai_inference" : "verified_text";
+}
+
+function productFactProvenance(
+  info: ParsedProductInfo,
+  groups: ReturnType<typeof productFactGroups>,
+): ProductFactProvenance {
+  const existing = info.verification?.factProvenance || {};
+  const provenance: ProductFactProvenance = {};
+  for (const field of OPENAI_MANAGED_PRODUCT_FIELDS) {
+    const previous = new Map((existing[field] || []).map((fact) => [normalizedFactValue(fact.value), fact.basis]));
+    const facts = factValuesForField(groups, field).map((value) => ({
+      value,
+      basis: previous.get(normalizedFactValue(value)) || basisFromRenderedFact(value),
+    }));
+    if (facts.length) provenance[field] = facts;
+  }
+  return provenance;
+}
+
 function withProductVerification(
   info: ParsedProductInfo,
   sourceUrl: string,
   rejectedFactCount = 0,
+  requiredFields: readonly string[] = VERIFIED_PRODUCT_FIELDS,
 ) {
   const groups = productFactGroups(info);
-  const verifiedFields = VERIFIED_PRODUCT_FIELDS.filter((field) => groups[field].length > 0);
-  const missingFields = VERIFIED_PRODUCT_FIELDS.filter((field) => groups[field].length === 0);
-  const verifiedFactCount = VERIFIED_PRODUCT_FIELDS.reduce((total, field) => total + groups[field].length, 0);
+  const factProvenance = productFactProvenance(info, groups);
+  const acceptedFields = VERIFIED_PRODUCT_FIELDS.filter((field) => groups[field].length > 0);
+  const inferredFields = OPENAI_MANAGED_PRODUCT_FIELDS.filter((field) => (
+    (factProvenance[field] || []).some((fact) => fact.basis === "ai_inference")
+  ));
+  const verifiedFields = VERIFIED_PRODUCT_FIELDS.filter((field) => {
+    if (!OPENAI_MANAGED_PRODUCT_FIELDS.includes(field as ProductFactField)) return groups[field].length > 0;
+    return (factProvenance[field as ProductFactField] || []).some((fact) => fact.basis !== "ai_inference");
+  });
+  const missingFields = requiredFields.filter((field) => !acceptedFields.includes(field as typeof acceptedFields[number]));
+  const acceptedFactCount = VERIFIED_PRODUCT_FIELDS.reduce((total, field) => total + groups[field].length, 0);
+  const inferredFactCount = OPENAI_MANAGED_PRODUCT_FIELDS.reduce(
+    (total, field) => total + (factProvenance[field] || []).filter((fact) => fact.basis === "ai_inference").length,
+    0,
+  );
+  const verifiedFactCount = acceptedFactCount - inferredFactCount;
   const sourcePid = productIdFromOfficialTikTokPath(sourceUrl);
   const exactSourceUrl = sourcePid && isExactTikTokProductSource(sourceUrl, sourcePid) ? sourceUrl : "";
   return {
@@ -225,7 +456,12 @@ function withProductVerification(
       verifiedFields: [...verifiedFields],
       missingFields: [...missingFields],
       sourceUrl: exactSourceUrl,
-      evidenceVersion: PRODUCT_EVIDENCE_VERSION,
+      evidenceVersion: info.verification?.evidenceVersion || PRODUCT_EVIDENCE_VERSION,
+      acceptedFactCount,
+      acceptedFields: [...acceptedFields],
+      inferredFactCount,
+      inferredFields: [...inferredFields],
+      factProvenance,
     },
   };
 }
@@ -330,20 +566,6 @@ function htmlText(html: string) {
     .trim();
 }
 
-const NON_PRODUCT_SECTION = /(?:全球评价|客户评价|商品评价|买家评价|Reviews?|Ratings?|Coupon center|优惠券|运输和退货|发货和配送|退货|TikTok Shop 保障|About this shop|关于店铺|安全支付|配送保障|数据隐私|全天候应用内支持|退款保障)/i;
-
-function productDetailText(value: string) {
-  const text = value.replace(/\r/g, "\n");
-  const startMarkers = ["商品描述", "产品描述", "Product description", "About this item"];
-  const starts = startMarkers
-    .map((marker) => text.toLowerCase().indexOf(marker.toLowerCase()))
-    .filter((index) => index >= 0);
-  const start = starts.length ? Math.min(...starts) : 0;
-  const tail = text.slice(start);
-  const endMatch = tail.match(NON_PRODUCT_SECTION);
-  return clean(endMatch ? tail.slice(0, endMatch.index) : tail).slice(0, 18_000);
-}
-
 function attribute(tag: string, name: string) {
   const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const match = tag.match(new RegExp(`(?:^|\\s)${escaped}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`, "i"));
@@ -386,6 +608,38 @@ function normalizeImageUrl(value: string, productUrl: string) {
   } catch {
     return "";
   }
+}
+
+const TRUSTED_TIKTOK_IMAGE_HOST_SUFFIXES = [
+  "ibyteimg.com",
+  "byteimg.com",
+  "tiktokcdn.com",
+  "tiktokcdn-us.com",
+  "tiktokcdn-eu.com",
+  "muscdn.com",
+] as const;
+
+/** Router image URLs are still seller-controlled input; keep probes off private/arbitrary hosts. */
+export function safeTikTokProductImageUrl(value: string) {
+  const normalized = normalizeImageUrl(value, "https://www.tiktok.com/");
+  if (!normalized) return "";
+  try {
+    const url = new URL(normalized);
+    const hostname = url.hostname.toLowerCase();
+    if (url.protocol !== "https:" || url.username || url.password || url.port) return "";
+    if (!TRUSTED_TIKTOK_IMAGE_HOST_SUFFIXES.some((suffix) => (
+      hostname === suffix || hostname.endsWith(`.${suffix}`)
+    ))) return "";
+    return url.toString();
+  } catch {
+    return "";
+  }
+}
+
+export function hasUsableProductImageDimensions(width: number, height: number) {
+  return Number.isFinite(width) && Number.isFinite(height)
+    && width >= 32 && height >= 32
+    && width * height >= 1_024 && width * height <= 40_000_000;
 }
 
 function looksLikeProductImage(url: string) {
@@ -447,6 +701,97 @@ function baseInfo(
     visualEvidence: "",
     visualAnalysisStatus: "unavailable",
   };
+}
+
+const OPENAI_REQUIRED_PRODUCT_FIELDS = [
+  "coreFunctions",
+  "usageMethod",
+  "audience",
+  "scenes",
+] as const;
+
+/**
+ * Convert one sealed, exact-PID browser capture into the managed product-card
+ * snapshot. This helper stays independently testable: capture completeness is
+ * established before the model call, while SKU and parameters continue to
+ * come only from TikTok's exact-PID structured fields.
+ */
+export async function parsedProductInfoFromOpenAICapture(input: {
+  capture: CapturedProductPage;
+  productNameHint: string;
+  base: ParsedProductInfo;
+}): Promise<ParsedProductInfo> {
+  const productNameHint = clean(input.productNameHint) || input.base.productName;
+  const captureWithoutDigest = {
+    captureId: input.capture.captureId,
+    pid: input.capture.pid,
+    canonicalUrl: input.capture.canonicalUrl,
+    fragments: input.capture.fragments,
+    images: input.capture.images,
+    coverage: input.capture.coverage,
+  };
+  const analysis = await analyzeProductCaptureWithOpenAI({
+    ...input.capture,
+    productNameHint,
+    sourceDigest: createProductCaptureDigest({
+      ...captureWithoutDigest,
+      productNameHint,
+    }),
+  });
+  const formatFacts = (facts: typeof analysis.coreFunctions.facts) => facts
+    .map((fact) => formatProductFactsForCard({ facts: [fact] }))
+    .filter(Boolean);
+  const coreFunctions = formatFacts(analysis.coreFunctions.facts);
+  const usageMethod = formatFacts(analysis.usageMethod.facts).join("；");
+  const audience = formatFacts(analysis.audience.facts).join("；");
+  const scenes = formatFacts(analysis.scenes.facts).join("；");
+  if (!coreFunctions.length || !usageMethod || !audience || !scenes) {
+    // The analyzer already enforces this, but the parser repeats the boundary
+    // so a future provider adapter cannot publish an apparently completed card
+    // with one of the four business-required fields missing.
+    throw Object.assign(new Error("OpenAI 没有返回四个必填商品字段"), {
+      code: "insufficient_safe_facts",
+    });
+  }
+  const factProvenance: ProductFactProvenance = {
+    coreFunctions: analysis.coreFunctions.facts.map((fact, index) => ({
+      value: coreFunctions[index] || "",
+      basis: fact.basis,
+    })).filter((fact) => Boolean(fact.value)),
+    usageMethod: analysis.usageMethod.facts.map((fact) => ({
+      value: formatProductFactsForCard({ facts: [fact] }),
+      basis: fact.basis,
+    })).filter((fact) => Boolean(fact.value)),
+    audience: analysis.audience.facts.map((fact) => ({
+      value: formatProductFactsForCard({ facts: [fact] }),
+      basis: fact.basis,
+    })).filter((fact) => Boolean(fact.value)),
+    scenes: analysis.scenes.facts.map((fact) => ({
+      value: formatProductFactsForCard({ facts: [fact] }),
+      basis: fact.basis,
+    })).filter((fact) => Boolean(fact.value)),
+  };
+  return withProductVerification({
+    ...input.base,
+    coreFunctions,
+    usageMethod,
+    audience,
+    scenes,
+    sellingPoints: "",
+    visualEvidence: `已完成 ${input.capture.images.length} 张同 PID 商品主体图片分析`,
+    visualAnalysisStatus: "completed",
+    verification: {
+      // withProductVerification recomputes all counters from this basis map.
+      status: "partial",
+      verifiedFactCount: 0,
+      rejectedFactCount: 0,
+      verifiedFields: [],
+      missingFields: [],
+      sourceUrl: input.capture.canonicalUrl,
+      evidenceVersion: "complete-pdp-openai-v1",
+      factProvenance,
+    },
+  }, input.capture.canonicalUrl, 0, OPENAI_REQUIRED_PRODUCT_FIELDS);
 }
 
 function hasAffirmedSlugPhrase(evidence: string, phrase: RegExp) {
@@ -979,16 +1324,19 @@ function normalizeParsed(
   return withProductVerification(normalized, options.sourceUrl || "", rejectedFactCount);
 }
 
-type ProductPageResult = {
+export type ProductPageResult = {
   title: string;
   description: string;
   text: string;
   imageUrls: string[];
+  imageDataUrls?: string[];
   sku: string;
   productParameters?: string;
   error: string;
   structured: boolean;
   corroboratingText: string;
+  capture?: CapturedProductPage | null;
+  captureErrorCode?: ProductPageCaptureErrorCode | "";
 };
 
 function embeddedJson(html: string, id: string) {
@@ -1031,10 +1379,13 @@ function productModelFromRouterData(routerData: unknown, productId: string) {
 function descriptionEvidence(value: unknown) {
   let parsed = value;
   if (typeof parsed === "string" && /^[\s]*[\[{]/.test(parsed)) {
-    try { parsed = JSON.parse(parsed); } catch { return { texts: [clean(parsed)], imageUrls: [] }; }
+    try { parsed = JSON.parse(parsed); } catch {
+      return { texts: [clean(parsed)], imageUrls: [], imageUrlGroups: [] as string[][] };
+    }
   }
   const texts: string[] = [];
   const imageUrls: string[] = [];
+  const imageUrlGroups: string[][] = [];
   const stack: unknown[] = [parsed];
   while (stack.length) {
     const item = stack.pop();
@@ -1048,15 +1399,19 @@ function descriptionEvidence(value: unknown) {
     if (content && !texts.includes(content)) texts.push(content);
     const image = record.image;
     if (image && typeof image === "object") {
-      const raw = Array.isArray((image as Record<string, unknown>).url_list)
-        ? ((image as Record<string, unknown>).url_list as unknown[])[0]
-        : "";
-      const url = clean(raw);
-      if (/^https?:\/\//i.test(url) && !imageUrls.includes(url)) imageUrls.push(url);
+      const urls = (Array.isArray((image as Record<string, unknown>).url_list)
+        ? (image as Record<string, unknown>).url_list as unknown[]
+        : [])
+        .map((raw) => safeTikTokProductImageUrl(clean(raw)))
+        .filter((url, index, all) => Boolean(url) && all.indexOf(url) === index);
+      if (urls.length) {
+        imageUrlGroups.push(urls);
+        if (!imageUrls.includes(urls[0])) imageUrls.push(urls[0]);
+      }
     }
     stack.push(...Object.values(record));
   }
-  return { texts, imageUrls };
+  return { texts, imageUrls, imageUrlGroups };
 }
 
 function deterministicStructuredParameters(properties: Array<{ name: string; values: string[] }>) {
@@ -1120,19 +1475,42 @@ function structuredProductEvidence(html: string, productUrl: string) {
   const skus = (Array.isArray(model.skus) ? model.skus : [])
     .map((item) => item && typeof item === "object" ? clean((item as Record<string, unknown>).sku_name) : "")
     .filter((value, index, all) => Boolean(value) && all.indexOf(value) === index);
-  const coverImages = (Array.isArray(model.images) ? model.images : []).flatMap((image) => {
-      if (!image || typeof image !== "object") return [];
-      const urls = (image as Record<string, unknown>).url_list;
-      return Array.isArray(urls) && urls.length ? [clean(urls[0])] : [];
-    });
-  const imageUrls = [
-    coverImages[0],
-    ...description.imageUrls,
-    ...coverImages.slice(1),
-  ].filter((url, index, all) => /^https?:\/\//i.test(url) && all.indexOf(url) === index);
+  const coverImageGroups = (Array.isArray(model.images) ? model.images : []).flatMap((image) => {
+    if (!image || typeof image !== "object") return [];
+    const urls = (Array.isArray((image as Record<string, unknown>).url_list)
+      ? (image as Record<string, unknown>).url_list as unknown[]
+      : [])
+      .map((raw) => safeTikTokProductImageUrl(clean(raw)))
+      .filter((url, index, all) => Boolean(url) && all.indexOf(url) === index);
+    return urls.length ? [urls] : [];
+  });
+  const imageCandidates = [
+    coverImageGroups[0],
+    ...description.imageUrlGroups,
+    ...coverImageGroups.slice(1),
+  ].filter((urls): urls is string[] => Boolean(urls?.length))
+    .filter((urls, index, all) => all.findIndex((candidate) => candidate.join("\n") === urls.join("\n")) === index)
+    .slice(0, MAX_PRODUCT_IMAGES);
+  const imageUrls = imageCandidates.map((urls) => urls[0]);
   const title = clean(model.name);
   const detail = description.texts.join("\n").slice(0, 7_000);
   const propertyText = properties.join("\n").slice(0, 3_000);
+  const fragments: CapturedProductFragment[] = [
+    { id: "router-title", kind: "router_text", text: title },
+  ];
+  for (const [index, text] of description.texts.entries()) {
+    const normalized = clean(text).slice(0, 2_000);
+    if (normalized) fragments.push({ id: `router-description-${index + 1}`, kind: "router_text", text: normalized });
+  }
+  for (const [index, property] of propertyRecords.entries()) {
+    const propertyTextFragment = `${property.name}：${property.values.join("、")}`.slice(0, 1_000);
+    if (propertyTextFragment) fragments.push({
+      id: `router-property-${index + 1}`,
+      kind: "router_property",
+      text: propertyTextFragment,
+    });
+  }
+  fragments.splice(64);
   return {
     title,
     description: detail,
@@ -1141,10 +1519,12 @@ function structuredProductEvidence(html: string, productUrl: string) {
       .join("\n")
       .slice(0, 11_000),
     imageUrls: imageUrls.slice(0, MAX_PRODUCT_IMAGES),
+    imageCandidates,
     sku: skus.join("；"),
     productParameters: deterministicStructuredParameters(propertyRecords),
     structured: true,
     corroboratingText: title,
+    fragments,
   };
 }
 
@@ -1158,9 +1538,715 @@ function browserExecutable() {
   return candidates.find((candidate) => existsSync(candidate)) || "";
 }
 
+export const PRODUCT_DETAIL_CONTROL_LABELS = [
+  "详细内容",
+  "商品详情",
+  "产品详情",
+  "查看更多",
+  "展开",
+  "View more",
+  "See more",
+  "Show more",
+  "Read more",
+  "Product details",
+] as const;
+
+function unavailableCollectionResult(
+  errorCode: ProductPageCaptureErrorCode,
+  overrides: Partial<ProductPageCollectionResult> = {},
+): ProductPageCollectionResult {
+  return {
+    capture: null,
+    errorCode,
+    html: "",
+    text: "",
+    sourceImageUrls: [],
+    imageDataUrls: [],
+    diagnostics: {
+      details: "not_required",
+      scroll: "incomplete",
+      stableRounds: 0,
+      expectedImageCount: 0,
+      usableImageCount: 0,
+    },
+    ...overrides,
+  };
+}
+
+function canonicalProductCaptureUrl(productUrl: string) {
+  const url = new URL(productUrl);
+  url.username = "";
+  url.password = "";
+  url.search = "";
+  url.hash = "";
+  return url.toString();
+}
+
+export async function collectProductPageWithDriver(
+  driver: ProductPageCollectionDriver,
+  productUrl: string,
+  options: {
+    stableRounds?: number;
+    maxRounds?: number;
+    waitMilliseconds?: number;
+    captureId?: string;
+  } = {},
+): Promise<ProductPageCollectionResult> {
+  const pid = productIdFromOfficialTikTokPath(productUrl);
+  if (!pid || !isExactTikTokProductSource(productUrl, pid)) {
+    return unavailableCollectionResult("page_unavailable");
+  }
+
+  let navigation: Awaited<ReturnType<ProductPageCollectionDriver["navigate"]>>;
+  try {
+    navigation = await driver.navigate(productUrl);
+  } catch {
+    return unavailableCollectionResult("page_unavailable");
+  }
+  const finalUrl = navigation.finalUrl || productUrl;
+  if (!navigation.ok || navigation.status >= 400 || !isExactTikTokProductSource(finalUrl, pid)) {
+    return unavailableCollectionResult("page_unavailable");
+  }
+
+  let detailFound = false;
+  let detailExpansionComplete = true;
+  let pendingDetailControls = 0;
+  const expandVisibleDetails = async () => {
+    try {
+      const expansion = await driver.expandProductDetails(PRODUCT_DETAIL_CONTROL_LABELS);
+      if (expansion.found) detailFound = true;
+      pendingDetailControls = Math.max(0, expansion.pendingCount || 0);
+      detailExpansionComplete = !expansion.found
+        ? !detailFound || detailExpansionComplete
+        : expansion.expanded && pendingDetailControls === 0;
+    } catch {
+      detailExpansionComplete = false;
+      pendingDetailControls = Math.max(1, pendingDetailControls);
+    }
+  };
+  await expandVisibleDetails();
+  const currentDetailState = (): "converged" | "not_required" | "incomplete" => (
+    !detailExpansionComplete || pendingDetailControls > 0
+      ? "incomplete"
+      : detailFound ? "converged" : "not_required"
+  );
+
+  try {
+    await driver.resetToTop();
+  } catch {
+    return unavailableCollectionResult("page_incomplete", {
+      diagnostics: {
+        details: currentDetailState(),
+        scroll: "incomplete",
+        stableRounds: 0,
+        expectedImageCount: 0,
+        usableImageCount: 0,
+      },
+    });
+  }
+
+  const requiredStableRounds = Math.max(3, options.stableRounds || 3);
+  const maxRounds = Math.max(requiredStableRounds, options.maxRounds || 36);
+  let stableRounds = 0;
+  let previousSignature = "";
+  for (let round = 0; round < maxRounds; round += 1) {
+    // Detail controls are themselves lazy-loaded on some TikTok storefronts.
+    // Re-scan before every stability observation; a newly expanded section
+    // changes the signature and therefore restarts the three-round counter.
+    await expandVisibleDetails();
+    let snapshot: ProductPageCollectionSnapshot;
+    try {
+      snapshot = await driver.snapshot();
+    } catch {
+      break;
+    }
+    const signature = JSON.stringify([
+      Math.max(0, Math.round(snapshot.scrollHeight)),
+      clean(snapshot.detailHash),
+      [...new Set(snapshot.productImageKeys.map(clean).filter(Boolean))].sort(),
+    ]);
+    // The snapshot is the current DOM truth. Do not keep an old positive
+    // count latched after a lazy control was successfully expanded later.
+    pendingDetailControls = Math.max(0, snapshot.pendingDetailControls || 0);
+    const noPendingDetails = detailExpansionComplete && pendingDetailControls === 0;
+    if (snapshot.atBottom && noPendingDetails) {
+      stableRounds = signature === previousSignature ? stableRounds + 1 : 1;
+    } else {
+      stableRounds = 0;
+    }
+    previousSignature = signature;
+    if (stableRounds >= requiredStableRounds) break;
+    try {
+      await driver.scrollNext();
+      await driver.wait(Math.max(0, options.waitMilliseconds ?? 350));
+    } catch {
+      break;
+    }
+  }
+  const scrollState = stableRounds >= requiredStableRounds ? "converged" : "incomplete";
+  const detailState = currentDetailState();
+
+  let collected: {
+    html: string;
+    text: string;
+    detailTextTruncated?: boolean;
+    securityText?: string;
+  };
+  try {
+    collected = await driver.collect();
+  } catch {
+    return unavailableCollectionResult("page_unavailable");
+  }
+  const title = meta(collected.html, "og:title")
+    || clean(collected.html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]);
+  const description = meta(collected.html, "og:description") || meta(collected.html, "description");
+  if (isProductSecurityChallenge(title, description, collected.securityText || collected.text)) {
+    return unavailableCollectionResult("page_unavailable");
+  }
+  const structured = structuredProductEvidence(collected.html, finalUrl);
+  // Navigation succeeded, so a missing exact-PID router model is incomplete
+  // product evidence rather than a false "page could not be opened" report.
+  if (!structured) return unavailableCollectionResult("page_incomplete", {
+    html: collected.html,
+    text: collected.text,
+    diagnostics: {
+      details: collected.detailTextTruncated ? "incomplete" : detailState,
+      scroll: scrollState,
+      stableRounds,
+      expectedImageCount: 0,
+      usableImageCount: 0,
+    },
+  });
+
+  const probed: Array<{ index: number; url: string; dataUrl: string } | null> =
+    Array.from({ length: structured.imageCandidates.length }, () => null);
+  let nextImageIndex = 0;
+  const probeWorker = async () => {
+    while (nextImageIndex < structured.imageCandidates.length) {
+      const index = nextImageIndex;
+      nextImageIndex += 1;
+      const candidateUrls = structured.imageCandidates[index];
+      let usableImage: { index: number; url: string; dataUrl: string } | null = null;
+      for (const url of candidateUrls) {
+        try {
+          const image = await driver.probeImage(url);
+          if (image?.dataUrl) {
+            usableImage = { index, url, dataUrl: image.dataUrl };
+            break;
+          }
+        } catch {
+          // Try the next trusted CDN variant declared for the same logical image.
+        }
+      }
+      probed[index] = usableImage;
+    }
+  };
+  await Promise.all(Array.from(
+    { length: Math.min(4, structured.imageCandidates.length) },
+    () => probeWorker(),
+  ));
+  const usable = probed.filter((item): item is { index: number; url: string; dataUrl: string } => Boolean(item));
+  const diagnostics = {
+    details: collected.detailTextTruncated ? "incomplete" as const : detailState,
+    scroll: scrollState,
+    stableRounds,
+    expectedImageCount: structured.imageCandidates.length,
+    usableImageCount: usable.length,
+  } as const;
+  // A zero-image capture has a stable, actionable classification regardless
+  // of whether detail expansion or scrolling also failed.
+  if (usable.length === 0) {
+    return unavailableCollectionResult("all_product_images_unavailable", {
+      html: collected.html,
+      text: collected.text,
+      diagnostics,
+    });
+  }
+  if (collected.detailTextTruncated || detailState === "incomplete" || scrollState === "incomplete") {
+    return unavailableCollectionResult("page_incomplete", {
+      html: collected.html,
+      text: collected.text,
+      sourceImageUrls: usable.map((item) => item.url),
+      imageDataUrls: usable.map((item) => item.dataUrl),
+      diagnostics,
+    });
+  }
+
+  const canonicalUrl = canonicalProductCaptureUrl(finalUrl);
+  const captureId = clean(options.captureId) || `product-page-${pid}-${Date.now().toString(36)}`;
+  const images: CapturedProductImage[] = usable.map((item) => ({
+    id: `product-image-${item.index + 1}`,
+    dataUrl: item.dataUrl,
+    role: item.index === 0 ? "cover" : "detail",
+  }));
+  const coverage: ProductPageCoverage = {
+    identity: "exact",
+    details: detailState,
+    scroll: "converged",
+    expectedImageCount: structured.imageCandidates.length,
+    usableImageCount: images.length,
+  };
+  const scopedDetailText = clean(collected.text).slice(0, 300_000);
+  const fragments: CapturedProductFragment[] = [...structured.fragments];
+  if (scopedDetailText
+    && !fragments.some((fragment) => clean(fragment.text) === scopedDetailText)) {
+    fragments.push({ id: "scoped-dom-details", kind: "scoped_dom", text: scopedDetailText });
+  }
+  fragments.splice(64);
+  const digestInput = {
+    captureId,
+    pid,
+    canonicalUrl,
+    fragments,
+    images,
+    coverage,
+  };
+  const capture: CapturedProductPage = {
+    ...digestInput,
+    sourceDigest: createProductCaptureDigest(digestInput),
+  };
+  return {
+    capture,
+    errorCode: "",
+    html: collected.html,
+    text: collected.text,
+    sourceImageUrls: usable.map((item) => item.url),
+    imageDataUrls: usable.map((item) => item.dataUrl),
+    diagnostics,
+  };
+}
+
+const PRODUCT_DETAIL_ROOT_SELECTORS = [
+  '[data-e2e*="product-description" i]',
+  '[data-e2e*="pdp-description" i]',
+  '[class*="product-description" i]',
+  '[class*="pdp-description" i]',
+  '[id*="product-description" i]',
+] as const;
+
+const PRODUCT_GALLERY_ROOT_SELECTORS = [
+  '[data-e2e*="product-image" i]',
+  '[data-e2e*="pdp-gallery" i]',
+  '[class*="product-gallery" i]',
+  '[class*="pdp-gallery" i]',
+  '[class*="product-image" i]',
+] as const;
+
+const PRODUCT_MAIN_ROOT_SELECTORS = [
+  '[data-e2e*="pdp-container" i]',
+  '[data-e2e*="product-page" i]',
+  "main",
+] as const;
+
+const EXCLUDED_PRODUCT_SCOPE_PATTERN = String.raw`(?:customer[-_\s]*reviews?|reviews?|ratings?|recommended|recommendation|you[-_\s]*may[-_\s]*also[-_\s]*like|related[-_\s]*products?|similar[-_\s]*products?|more[-_\s]*products?|comments?|about[-_\s]*this[-_\s]*shop|seller|shop[-_\s]*info|store[-_\s]*info|accessor(?:y|ies)|frequently[-_\s]*bought|评价|评论|推荐|相似商品|更多商品|关于店铺|店铺信息|商家信息|配件)`;
+
+export function isExcludedProductSectionDescriptor(value: string) {
+  return new RegExp(EXCLUDED_PRODUCT_SCOPE_PATTERN, "i").test(clean(value));
+}
+
+type BrowserScopeInput = {
+  detailSelectors: string[];
+  gallerySelectors: string[];
+  mainSelectors: string[];
+  excludedPattern: string;
+  detailLabels: string[];
+};
+
+function productScopeStateInBrowser(input: BrowserScopeInput) {
+  const excluded = new RegExp(input.excludedPattern, "i");
+  const labelSet = new Set(input.detailLabels.map((label) => label.replace(/\s+/g, " ").trim().toLowerCase()));
+  const descriptor = (element: Element) => [
+    element.id,
+    element.getAttribute("class") || "",
+    element.getAttribute("data-e2e") || "",
+    element.getAttribute("data-testid") || "",
+    element.getAttribute("aria-label") || "",
+  ].join(" ");
+  const structuralHeading = (element: Element) => {
+    const directHeading = Array.from(element.children).find((child) => (
+      /^H[1-6]$/.test(child.tagName) || child.getAttribute("role") === "heading"
+    ));
+    return (directHeading?.textContent || "").replace(/\s+/g, " ").trim().slice(0, 160);
+  };
+  const excludedElement = (element: Element, boundary?: Element) => {
+    let current: Element | null = element;
+    while (current && current !== boundary && current !== document.body && current !== document.documentElement) {
+      if (excluded.test(descriptor(current)) || excluded.test(structuralHeading(current))) return true;
+      current = current.parentElement;
+    }
+    return false;
+  };
+  const dedupeOutermost = (items: HTMLElement[]) => [...new Set(items)]
+    .filter((candidate, index, all) => !all.some((other, otherIndex) => (
+      otherIndex !== index && other.contains(candidate)
+    )));
+  const detailRoots = Array.from(document.querySelectorAll<HTMLElement>(input.detailSelectors.join(",")))
+    .filter((element) => !excludedElement(element));
+  for (const heading of Array.from(document.querySelectorAll<HTMLElement>("h1,h2,h3,h4,[role=heading]"))) {
+    const label = (heading.innerText || "").replace(/\s+/g, " ").trim();
+    if (!/^(?:商品详情|产品详情|Product details)$/i.test(label)) continue;
+    const root = heading.closest<HTMLElement>("section,article");
+    if (root && root !== document.body && !excludedElement(root)) detailRoots.push(root);
+  }
+  const trustedDetailRoots = dedupeOutermost(detailRoots);
+  const galleryRoots = dedupeOutermost(
+    Array.from(document.querySelectorAll<HTMLElement>(input.gallerySelectors.join(",")))
+      .filter((element) => !excludedElement(element)),
+  );
+  const pruneClone = (root: HTMLElement) => {
+    const clone = root.cloneNode(true) as HTMLElement;
+    for (const node of Array.from(clone.querySelectorAll<HTMLElement>("*"))) {
+      if (excluded.test(descriptor(node)) || excluded.test(structuralHeading(node))) node.remove();
+    }
+    clone.querySelectorAll("script,style,noscript,template,[hidden],[aria-hidden='true']")
+      .forEach((node) => node.remove());
+    return clone;
+  };
+  const detailText = trustedDetailRoots
+    .map((root) => pruneClone(root).textContent || "")
+    .join("\n")
+    .replace(/\s+/g, " ")
+    .trim();
+  let hash = 2166136261;
+  for (let index = 0; index < detailText.length; index += 1) {
+    hash ^= detailText.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  const captureRoots = dedupeOutermost([...galleryRoots, ...trustedDetailRoots]);
+  const productImageKeys = captureRoots.flatMap((root) => (
+    Array.from(root.querySelectorAll<HTMLImageElement>("img"))
+      .filter((image) => !excludedElement(image, root))
+      .flatMap((image) => [image.currentSrc, image.src, image.getAttribute("data-src") || ""])
+  )).filter(Boolean);
+  const visible = (element: HTMLElement) => {
+    const style = window.getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    return style.display !== "none" && style.visibility !== "hidden"
+      && rect.width > 0 && rect.height > 0
+      && !element.hasAttribute("disabled") && element.getAttribute("aria-disabled") !== "true";
+  };
+  const pendingDetailControls = trustedDetailRoots.reduce((count, root) => {
+    const controls = Array.from(root.querySelectorAll<HTMLElement>("button,[role=button],a"))
+      .filter((element) => !excludedElement(element, root))
+      .filter((control) => {
+        const label = (control.innerText || control.getAttribute("aria-label") || "")
+          .replace(/\s+/g, " ").trim().toLowerCase();
+        return labelSet.has(label) && visible(control);
+      });
+    const verifiedKeys = new Set((root.getAttribute("data-codex-product-expanded-keys") || "")
+      .split("\n").filter(Boolean));
+    const pending = controls.filter((control, index) => {
+      const label = (control.innerText || control.getAttribute("aria-label") || "")
+        .replace(/\s+/g, " ").trim().toLowerCase();
+      const identity = control.id || control.getAttribute("aria-controls")
+        || control.getAttribute("data-e2e") || control.getAttribute("data-testid")
+        || control.getAttribute("data-index") || control.getAttribute("href") || String(index);
+      return control.getAttribute("aria-expanded") !== "true"
+        && control.getAttribute("data-codex-product-expanded") !== "1"
+        && !verifiedKeys.has(`${label}:${identity}`);
+    }).length;
+    const unresolved = root.getAttribute("data-codex-product-expand-unresolved") === "1" ? 1 : 0;
+    return count + pending + unresolved;
+  }, 0);
+  const unboundDetailControls = Array.from(document.querySelectorAll<HTMLElement>("button,[role=button],a"))
+    .filter((element) => !excludedElement(element))
+    .filter((control) => {
+      const label = (control.innerText || control.getAttribute("aria-label") || "")
+        .replace(/\s+/g, " ").trim().toLowerCase();
+      return labelSet.has(label) && visible(control)
+        && !trustedDetailRoots.some((root) => root.contains(control));
+    }).length;
+
+  const mainRoot = input.mainSelectors
+    .flatMap((selector) => Array.from(document.querySelectorAll<HTMLElement>(selector)))
+    .find((element) => !excludedElement(element));
+  let captureBottom = Math.max(window.innerHeight, ...captureRoots.map((root) => (
+    root.getBoundingClientRect().bottom + window.scrollY
+  )));
+  if (mainRoot) {
+    let mainBottom = mainRoot.getBoundingClientRect().bottom + window.scrollY;
+    const excludedDescendants = Array.from(mainRoot.querySelectorAll<HTMLElement>("section,article,aside,nav,div"))
+      .filter((element) => excluded.test(descriptor(element)) || excluded.test(structuralHeading(element)))
+      .map((element) => element.getBoundingClientRect().top + window.scrollY)
+      .filter((top) => top > 20);
+    if (excludedDescendants.length) mainBottom = Math.min(mainBottom, ...excludedDescendants);
+    captureBottom = Math.max(captureBottom, mainBottom);
+  }
+  return {
+    atBottom: window.scrollY + window.innerHeight >= captureBottom - 10,
+    scrollHeight: Math.max(0, Math.round(captureBottom)),
+    detailHash: (hash >>> 0).toString(16),
+    productImageKeys: [...new Set(productImageKeys)].sort(),
+    pendingDetailControls: pendingDetailControls + unboundDetailControls,
+    detailText: detailText.slice(0, 300_000),
+    detailTextTruncated: detailText.length > 300_000,
+    captureBottom,
+  };
+}
+
+async function expandProductDetailsInBrowser(input: BrowserScopeInput) {
+  const excluded = new RegExp(input.excludedPattern, "i");
+  const labelSet = new Set(input.detailLabels.map((label) => label.replace(/\s+/g, " ").trim().toLowerCase()));
+  const descriptor = (element: Element) => [
+    element.id,
+    element.getAttribute("class") || "",
+    element.getAttribute("data-e2e") || "",
+    element.getAttribute("data-testid") || "",
+    element.getAttribute("aria-label") || "",
+  ].join(" ");
+  const structuralHeading = (element: Element) => {
+    const directHeading = Array.from(element.children).find((child) => (
+      /^H[1-6]$/.test(child.tagName) || child.getAttribute("role") === "heading"
+    ));
+    return (directHeading?.textContent || "").replace(/\s+/g, " ").trim().slice(0, 160);
+  };
+  const excludedElement = (element: Element, boundary?: Element) => {
+    let current: Element | null = element;
+    while (current && current !== boundary && current !== document.body && current !== document.documentElement) {
+      if (excluded.test(descriptor(current)) || excluded.test(structuralHeading(current))) return true;
+      current = current.parentElement;
+    }
+    return false;
+  };
+  const roots = Array.from(document.querySelectorAll<HTMLElement>(input.detailSelectors.join(",")))
+    .filter((element) => !excludedElement(element));
+  for (const heading of Array.from(document.querySelectorAll<HTMLElement>("h1,h2,h3,h4,[role=heading]"))) {
+    const label = (heading.innerText || "").replace(/\s+/g, " ").trim();
+    if (!/^(?:商品详情|产品详情|Product details)$/i.test(label)) continue;
+    const root = heading.closest<HTMLElement>("section,article");
+    if (root && root !== document.body && !excludedElement(root)) roots.push(root);
+  }
+  const trustedRoots = [...new Set(roots)].filter((candidate, index, all) => !all.some((other, otherIndex) => (
+    otherIndex !== index && other.contains(candidate)
+  )));
+  const safeText = (root: HTMLElement) => {
+    const clone = root.cloneNode(true) as HTMLElement;
+    for (const node of Array.from(clone.querySelectorAll<HTMLElement>("*"))) {
+      if (excluded.test(descriptor(node)) || excluded.test(structuralHeading(node))) node.remove();
+    }
+    clone.querySelectorAll("script,style,noscript,template,[hidden],[aria-hidden='true']")
+      .forEach((node) => node.remove());
+    return (clone.textContent || "").replace(/\s+/g, " ").trim();
+  };
+  const visible = (element: HTMLElement) => {
+    const style = window.getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    return style.display !== "none" && style.visibility !== "hidden"
+      && rect.width > 0 && rect.height > 0
+      && !element.hasAttribute("disabled") && element.getAttribute("aria-disabled") !== "true";
+  };
+  const unboundDetailControls = Array.from(document.querySelectorAll<HTMLElement>("button,[role=button],a"))
+    .filter((element) => !excludedElement(element))
+    .filter((control) => {
+      const label = (control.innerText || control.getAttribute("aria-label") || "")
+        .replace(/\s+/g, " ").trim().toLowerCase();
+      return labelSet.has(label) && visible(control)
+        && !trustedRoots.some((root) => root.contains(control));
+    }).length;
+  let found = unboundDetailControls > 0;
+  let failed = unboundDetailControls > 0;
+  for (const root of trustedRoots) {
+    const controls = Array.from(root.querySelectorAll<HTMLElement>("button,[role=button],a"))
+      .filter((element) => !excludedElement(element, root))
+      .filter((element) => {
+        const label = (element.innerText || element.getAttribute("aria-label") || "")
+          .replace(/\s+/g, " ").trim().toLowerCase();
+        return labelSet.has(label) && visible(element);
+      });
+    if (controls.length) found = true;
+    for (const [index, control] of controls.entries()) {
+      if (control.getAttribute("aria-expanded") === "true"
+        || control.getAttribute("data-codex-product-expanded") === "1") continue;
+      const label = (control.innerText || control.getAttribute("aria-label") || "")
+        .replace(/\s+/g, " ").trim().toLowerCase();
+      const identity = control.id || control.getAttribute("aria-controls")
+        || control.getAttribute("data-e2e") || control.getAttribute("data-testid")
+        || control.getAttribute("data-index") || control.getAttribute("href") || String(index);
+      const key = `${label}:${identity}`;
+      const verifiedKeys = new Set((root.getAttribute("data-codex-product-expanded-keys") || "").split("\n").filter(Boolean));
+      if (verifiedKeys.has(key)) continue;
+      const beforeText = safeText(root);
+      const marker = `product-expand-${Date.now()}-${index}`;
+      control.setAttribute("data-codex-product-expand", marker);
+      control.click();
+      await new Promise((resolve) => setTimeout(resolve, 450));
+      const current = document.querySelector<HTMLElement>(`[data-codex-product-expand="${marker}"]`);
+      const afterText = safeText(root);
+      const expanded = current?.getAttribute("aria-expanded") === "true"
+        || afterText.length > beforeText.length + 5;
+      current?.removeAttribute("data-codex-product-expand");
+      if (expanded) {
+        current?.setAttribute("data-codex-product-expanded", "1");
+        verifiedKeys.add(key);
+        root.setAttribute("data-codex-product-expanded-keys", [...verifiedKeys].join("\n"));
+      } else {
+        failed = true;
+        root.setAttribute("data-codex-product-expand-unresolved", "1");
+      }
+    }
+    const remainingCandidates = Array.from(root.querySelectorAll<HTMLElement>("button,[role=button],a"))
+      .filter((element) => !excludedElement(element, root))
+      .filter((element) => {
+        const label = (element.innerText || element.getAttribute("aria-label") || "")
+          .replace(/\s+/g, " ").trim().toLowerCase();
+        return labelSet.has(label) && visible(element);
+      });
+    const verifiedKeys = new Set((root.getAttribute("data-codex-product-expanded-keys") || "")
+      .split("\n").filter(Boolean));
+    const remaining = remainingCandidates.filter((element, index) => {
+      const label = (element.innerText || element.getAttribute("aria-label") || "")
+        .replace(/\s+/g, " ").trim().toLowerCase();
+      const identity = element.id || element.getAttribute("aria-controls")
+        || element.getAttribute("data-e2e") || element.getAttribute("data-testid")
+        || element.getAttribute("data-index") || element.getAttribute("href") || String(index);
+      return element.getAttribute("aria-expanded") !== "true"
+        && element.getAttribute("data-codex-product-expanded") !== "1"
+        && !verifiedKeys.has(`${label}:${identity}`);
+    });
+    if (!remaining.length && !failed) root.removeAttribute("data-codex-product-expand-unresolved");
+  }
+  const pendingCount = trustedRoots.reduce((count, root) => {
+    const unresolved = root.getAttribute("data-codex-product-expand-unresolved") === "1" ? 1 : 0;
+    const candidates = Array.from(root.querySelectorAll<HTMLElement>("button,[role=button],a"))
+      .filter((element) => !excludedElement(element, root))
+      .filter((element) => {
+        const label = (element.innerText || element.getAttribute("aria-label") || "")
+          .replace(/\s+/g, " ").trim().toLowerCase();
+        return labelSet.has(label) && visible(element);
+      });
+    const verifiedKeys = new Set((root.getAttribute("data-codex-product-expanded-keys") || "")
+      .split("\n").filter(Boolean));
+    const controls = candidates.filter((element, index) => {
+      const label = (element.innerText || element.getAttribute("aria-label") || "")
+        .replace(/\s+/g, " ").trim().toLowerCase();
+      const identity = element.id || element.getAttribute("aria-controls")
+        || element.getAttribute("data-e2e") || element.getAttribute("data-testid")
+        || element.getAttribute("data-index") || element.getAttribute("href") || String(index);
+      return element.getAttribute("aria-expanded") !== "true"
+        && element.getAttribute("data-codex-product-expanded") !== "1"
+        && !verifiedKeys.has(`${label}:${identity}`);
+    }).length;
+    return count + unresolved + controls;
+  }, unboundDetailControls);
+  return { found: found || pendingCount > 0, expanded: pendingCount === 0 && !failed, pendingCount };
+}
+
+const productBrowserScopeInput = (): BrowserScopeInput => ({
+  detailSelectors: [...PRODUCT_DETAIL_ROOT_SELECTORS],
+  gallerySelectors: [...PRODUCT_GALLERY_ROOT_SELECTORS],
+  mainSelectors: [...PRODUCT_MAIN_ROOT_SELECTORS],
+  excludedPattern: EXCLUDED_PRODUCT_SCOPE_PATTERN,
+  detailLabels: [...PRODUCT_DETAIL_CONTROL_LABELS],
+});
+
+export function createProductPageCollectionDriver(page: Page): ProductPageCollectionDriver {
+  let navigationGuardInstalled = false;
+  let expectedPid = "";
+  return {
+    async navigate(url) {
+      expectedPid = productIdFromOfficialTikTokPath(url);
+      if (!navigationGuardInstalled) {
+        await page.route("**/*", async (route, request) => {
+          const requestUrl = request.url();
+          if (isObviouslyPrivateNetworkUrl(requestUrl)
+            || (request.isNavigationRequest() && !isTrustedProductNavigationUrl(requestUrl, expectedPid))) {
+            await route.abort("blockedbyclient");
+            return;
+          }
+          await route.continue();
+        });
+        navigationGuardInstalled = true;
+      }
+      const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30_000 });
+      return { ok: !response || response.ok(), finalUrl: page.url(), status: response?.status() || 0 };
+    },
+    async expandProductDetails(labels) {
+      return page.evaluate(expandProductDetailsInBrowser, {
+        ...productBrowserScopeInput(),
+        detailLabels: [...labels],
+      });
+    },
+    async resetToTop() {
+      await page.evaluate(() => window.scrollTo(0, 0));
+      await page.waitForTimeout(200);
+    },
+    async snapshot() {
+      const state = await page.evaluate(productScopeStateInBrowser, productBrowserScopeInput());
+      return {
+        atBottom: state.atBottom,
+        scrollHeight: state.scrollHeight,
+        detailHash: state.detailHash,
+        productImageKeys: state.productImageKeys,
+        pendingDetailControls: state.pendingDetailControls,
+      };
+    },
+    async scrollNext() {
+      const state = await page.evaluate(productScopeStateInBrowser, productBrowserScopeInput());
+      await page.evaluate((captureBottom) => {
+        const next = Math.min(
+          captureBottom,
+          window.scrollY + Math.max(700, window.innerHeight * 0.85),
+        );
+        window.scrollTo(0, next);
+      }, state.captureBottom);
+    },
+    async wait(milliseconds) {
+      await page.waitForTimeout(milliseconds);
+    },
+    async collect() {
+      const [html, state, securityText] = await Promise.all([
+        page.content(),
+        page.evaluate(productScopeStateInBrowser, productBrowserScopeInput()),
+        page.locator("body").innerText({ timeout: 2_000 }).catch(() => ""),
+      ]);
+      return {
+        html,
+        text: state.detailText,
+        detailTextTruncated: state.detailTextTruncated,
+        securityText: securityText.slice(0, 3_000),
+      };
+    },
+    async probeImage(url) {
+      const safeUrl = safeTikTokProductImageUrl(url);
+      if (!safeUrl) return null;
+      // Do not follow a CDN redirect to an arbitrary/private host. The router's
+      // next trusted url_list entry is the only allowed fallback.
+      const response = await page.context().request.get(safeUrl, {
+        timeout: 15_000,
+        maxRedirects: 0,
+      });
+      if (!response.ok()) return null;
+      const headers = response.headers();
+      const contentType = headers["content-type"]?.split(";", 1)[0].trim().toLowerCase() || "";
+      if (!/^image\/(?:png|jpeg|jpg|webp)$/.test(contentType)) return null;
+      const declaredLength = Number(headers["content-length"] || 0);
+      if (Number.isFinite(declaredLength) && declaredLength > 8 * 1024 * 1024) return null;
+      const body = await response.body();
+      if (body.length < 32 || body.length > 8 * 1024 * 1024) return null;
+      const dataUrl = `data:${contentType === "image/jpg" ? "image/jpeg" : contentType};base64,${body.toString("base64")}`;
+      const dimensions = await page.evaluate((source) => new Promise<{ width: number; height: number } | null>((resolve) => {
+        const image = new Image();
+        const timer = window.setTimeout(() => resolve(null), 5_000);
+        image.onload = () => {
+          window.clearTimeout(timer);
+          resolve({ width: image.naturalWidth, height: image.naturalHeight });
+        };
+        image.onerror = () => {
+          window.clearTimeout(timer);
+          resolve(null);
+        };
+        image.src = source;
+      }), dataUrl);
+      return dimensions && hasUsableProductImageDimensions(dimensions.width, dimensions.height)
+        ? { dataUrl }
+        : null;
+    },
+  };
+}
+
 let browserQueue: Promise<void> = Promise.resolve();
 
-async function readExpandedProductPage(productUrl: string) {
+async function readExpandedProductPage(productUrl: string): Promise<ProductPageCollectionResult | null> {
   const previous = browserQueue;
   let release!: () => void;
   browserQueue = new Promise<void>((resolve) => { release = resolve; });
@@ -1194,45 +2280,7 @@ async function readExpandedProductPage(productUrl: string) {
             userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
             viewport: { width: 1280, height: 900 },
           });
-      await page.goto(productUrl, { waitUntil: "domcontentloaded", timeout: 30_000 });
-      const moreText = /^(?:查看更多|View more|See more|Show more|Load more)$/i;
-      for (let round = 0; round < 12; round += 1) {
-        const controls = page.locator("button, [role=button]").filter({ hasText: moreText });
-        const textControls = page.getByText(moreText, { exact: true });
-        for (const locator of [controls, textControls]) {
-          const count = Math.min(await locator.count(), 6);
-          for (let index = 0; index < count; index += 1) {
-            await locator.nth(index).click({ timeout: 1_500 }).catch(() => undefined);
-          }
-        }
-        const reachedBottom = await page.evaluate(() => {
-          const before = window.scrollY;
-          window.scrollBy(0, Math.max(700, window.innerHeight * 0.8));
-          return before + window.innerHeight >= document.documentElement.scrollHeight - 10;
-        });
-        await page.waitForTimeout(250);
-        if (reachedBottom) break;
-      }
-      await page.waitForTimeout(500);
-      const [html, text, imageCandidates] = await Promise.all([
-        page.content(),
-        page.locator("body").innerText().catch(() => ""),
-        page.locator("img").evaluateAll((images) => images.flatMap((image) => {
-          const element = image as HTMLImageElement;
-          const srcset = element.getAttribute("srcset")?.split(",").map((part) => part.trim().split(/\s+/)[0]) || [];
-          let parent: HTMLElement | null = element;
-          for (let level = 0; level < 4 && parent?.parentElement; level += 1) parent = parent.parentElement;
-          const context = (parent?.innerText || element.alt || "").slice(0, 500);
-          return [element.currentSrc, element.src, element.getAttribute("data-src") || "", ...srcset]
-            .filter(Boolean)
-            .map((url) => ({ url, context }));
-        }).filter(Boolean)),
-      ]);
-      const normalizedImages = imageCandidates
-        .filter((candidate) => !NON_PRODUCT_SECTION.test(candidate.context))
-        .map((candidate) => normalizeImageUrl(candidate.url, productUrl))
-        .filter((url, index, all) => Boolean(url) && looksLikeProductImage(url) && all.indexOf(url) === index);
-      return { html, text: productDetailText(text), imageUrls: normalizedImages };
+      return collectProductPageWithDriver(createProductPageCollectionDriver(page), productUrl);
     } finally {
       if (persistent) await persistent.close();
       else await browser?.close();
@@ -1259,9 +2307,12 @@ export function expandedProductResult(
       // trust boundary. Body/meta text and DOM images can belong to a
       // recommendation, stale hydration block, or different product.
       text: structured.text,
-      imageUrls: structured.imageUrls,
+      imageUrls: expanded.sourceImageUrls.length ? expanded.sourceImageUrls : structured.imageUrls,
+      imageDataUrls: expanded.imageDataUrls,
       error: "",
       corroboratingText: structured.corroboratingText,
+      capture: expanded.capture,
+      captureErrorCode: expanded.errorCode,
     };
   }
   if (!title && !description && expanded.text.length < 300) return null;
@@ -1269,26 +2320,89 @@ export function expandedProductResult(
     title,
     description,
     text: expanded.text.slice(0, 20_000),
-    imageUrls: expanded.imageUrls.slice(0, MAX_PRODUCT_IMAGES),
+    imageUrls: expanded.sourceImageUrls.slice(0, MAX_PRODUCT_IMAGES),
+    imageDataUrls: expanded.imageDataUrls,
     sku: "",
     error: "",
     structured: false,
     corroboratingText: "",
+    capture: expanded.capture,
+    captureErrorCode: expanded.errorCode,
   };
+}
+
+export async function captureProductPage(
+  productUrl: string,
+  hints: Pick<ProductParseHints, "pid"> = {},
+): Promise<ProductPageCaptureResult> {
+  const canonicalUrl = productUrl.trim();
+  const pathPid = productIdFromOfficialTikTokPath(canonicalUrl);
+  const expectedPid = clean(hints.pid) || pathPid;
+  if (!isExactTikTokProductSource(canonicalUrl, expectedPid)) {
+    return { ok: false, capture: null, errorCode: "page_unavailable" };
+  }
+  const collected = await readExpandedProductPage(canonicalUrl);
+  if (!collected || !collected.capture || collected.errorCode) {
+    return {
+      ok: false,
+      capture: collected?.capture || null,
+      errorCode: collected?.errorCode || "page_unavailable",
+    };
+  }
+  return { ok: true, capture: collected.capture, errorCode: "" };
+}
+
+export async function fetchTrustedTikTokProductResponse(
+  fetchUrl: string,
+  productId: string,
+  init: RequestInit = {},
+) {
+  let currentUrl = fetchUrl;
+  for (let redirectCount = 0; redirectCount <= 5; redirectCount += 1) {
+    if (!isTrustedProductNavigationUrl(currentUrl, productId)) return null;
+    const response = await fetchWithProxy(currentUrl, { ...init, redirect: "manual" });
+    const observedUrl = response.url || currentUrl;
+    if (!isTrustedProductNavigationUrl(observedUrl, productId)) {
+      await response.body?.cancel().catch(() => undefined);
+      return null;
+    }
+    if (![301, 302, 303, 307, 308].includes(response.status)) {
+      return { response, finalUrl: observedUrl };
+    }
+    const location = response.headers.get("location");
+    await response.body?.cancel().catch(() => undefined);
+    if (!location || redirectCount === 5) return null;
+    try {
+      currentUrl = new URL(location, observedUrl).toString();
+    } catch {
+      return null;
+    }
+  }
+  return null;
 }
 
 async function readProductPage(productUrl: string): Promise<ProductPageResult> {
   let lastError = "商品页没有公开资料";
+  // Chromium is an independent authenticated source path. Do not make it
+  // contingent on a preceding anonymous fetch succeeding: TikTok commonly
+  // rejects the latter while the persisted browser session can still open PDPs.
+  const expanded = await readExpandedProductPage(productUrl);
+  const expandedResult = expanded ? expandedProductResult(expanded, productUrl) : null;
+  if (expandedResult?.structured) return expandedResult;
   for (const [index, fetchUrl] of tiktokProductFetchUrls(productUrl).entries()) {
     try {
-      const response = await fetchWithProxy(fetchUrl, {
+      const fetched = await fetchTrustedTikTokProductResponse(fetchUrl, productIdFromOfficialTikTokPath(productUrl), {
         headers: {
           "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/126 Safari/537.36",
           "Accept-Language": "en-US,en;q=0.9",
         },
-        redirect: "follow",
         signal: AbortSignal.timeout(index === 0 ? 20_000 : 10_000),
       });
+      if (!fetched) {
+        lastError = "商品页跳转到了不受信任的地址";
+        continue;
+      }
+      const { response } = fetched;
       if (!response.ok) {
         lastError = `HTTP ${response.status}`;
         continue;
@@ -1299,16 +2413,22 @@ async function readProductPage(productUrl: string): Promise<ProductPageResult> {
       const visibleText = htmlText(html).slice(0, 8_000);
       const blocked = isProductSecurityChallenge(title, metaDescription, visibleText);
       if (blocked) {
-        const expanded = await readExpandedProductPage(fetchUrl);
-        const browserResult = expanded ? expandedProductResult(expanded, productUrl) : null;
-        if (browserResult) return browserResult;
+        if (expandedResult) return expandedResult;
         lastError = "商品页要求安全验证";
         continue;
       }
       const structured = structuredProductEvidence(html, productUrl);
-      const expanded = await readExpandedProductPage(fetchUrl);
-      const expandedResult = expanded ? expandedProductResult(expanded, productUrl) : null;
-      const bestStructured = expandedResult?.structured ? expandedResult : structured || expandedResult;
+      const bestStructured = expandedResult?.structured
+        ? expandedResult
+        : structured
+          ? {
+              ...structured,
+              imageUrls: expanded?.sourceImageUrls.length ? expanded.sourceImageUrls : structured.imageUrls,
+              imageDataUrls: expanded?.imageDataUrls || [],
+              capture: expanded?.capture || null,
+              captureErrorCode: expanded?.errorCode || "page_unavailable" as ProductPageCaptureErrorCode,
+            }
+          : expandedResult;
       if (bestStructured) {
         return {
           ...bestStructured,
@@ -1325,13 +2445,16 @@ async function readProductPage(productUrl: string): Promise<ProductPageResult> {
           title,
           description: metaDescription,
           text: [visibleText, expanded?.text].filter(Boolean).join("\n").slice(0, 20_000),
-          imageUrls: [...extractProductImageUrls(html, productUrl), ...(expanded?.imageUrls || [])]
+          imageUrls: [...extractProductImageUrls(html, productUrl), ...(expanded?.sourceImageUrls || [])]
             .filter((url, imageIndex, all) => all.indexOf(url) === imageIndex)
             .slice(0, MAX_PRODUCT_IMAGES),
+          imageDataUrls: expanded?.imageDataUrls,
           sku: "",
           error: "",
           structured: false,
           corroboratingText: "",
+          capture: expanded?.capture,
+          captureErrorCode: expanded?.errorCode,
         };
       }
       lastError = "商品页没有公开资料";
@@ -1343,7 +2466,18 @@ async function readProductPage(productUrl: string): Promise<ProductPageResult> {
         : "商品页请求失败";
     }
   }
-  return { title: "", description: "", text: "", imageUrls: [], sku: "", error: lastError, structured: false, corroboratingText: "" };
+  return {
+    title: "",
+    description: "",
+    text: "",
+    imageUrls: [],
+    sku: "",
+    error: lastError,
+    structured: false,
+    corroboratingText: "",
+    capture: expanded?.capture || null,
+    captureErrorCode: expanded?.errorCode || "page_unavailable",
+  };
 }
 
 async function readProductPageWithRetry(productUrl: string): Promise<ProductPageResult> {
@@ -1616,6 +2750,39 @@ async function parsePublicProductPageInternal(
   // immediately so a button click cannot occupy a worker unnecessarily.
   const page = await readProductPageWithRetry(canonicalUrl);
   const base = baseInfo(page.title, page.description, hints, page.imageUrls, page.sku, page.productParameters);
+  if (process.env.OPENAI_PRODUCT_ANALYSIS_ENABLED !== "false") {
+    const captureErrorCode = page.captureErrorCode || (!page.capture ? "page_unavailable" : "");
+    if (captureErrorCode) {
+      throw new ProductPageCaptureError(captureErrorCode, productPageCaptureMessage(captureErrorCode));
+    }
+    const startedAt = Date.now();
+    try {
+      const result = await parsedProductInfoFromOpenAICapture({
+        capture: page.capture!,
+        productNameHint: clean(hints.productName),
+        base,
+      });
+      console.info("[product-parser] OpenAI product analysis", {
+        pid: productId,
+        stage: "complete_page_multimodal",
+        outcome: "success",
+        durationMs: Date.now() - startedAt,
+        imageCount: page.capture!.images.length,
+      });
+      return result;
+    } catch (error) {
+      console.warn("[product-parser] OpenAI product analysis", {
+        pid: productId,
+        stage: "complete_page_multimodal",
+        outcome: error && typeof error === "object" && "code" in error
+          ? String((error as { code?: unknown }).code || "failed")
+          : "failed",
+        durationMs: Date.now() - startedAt,
+        imageCount: page.capture!.images.length,
+      });
+      throw error;
+    }
+  }
   // A successful HTML response is not automatically product evidence. Only
   // an exact-PID router `product_model` binds facts to the requested product;
   // body/meta content can be a recommendation carousel or stale page shell.

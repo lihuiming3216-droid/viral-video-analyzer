@@ -2,14 +2,16 @@ import "server-only";
 
 import type { Client } from "@larksuiteoapi/node-sdk";
 import {
-  createProduct, createVideo, deleteFeishuAutomationJob, getFeishuAutomationJob,
-  getProduct, getProductByPid, getVideo, getVideoBySourceUrl, saveFeishuAutomationJob,
-  updateProduct, updateVideo,
+  claimFeishuProductCardDocument, clearProductDocumentLink, createProduct, createVideo,
+  deleteFeishuAutomationJob, getFeishuAutomationJobs,
+  getFeishuProductCardMapping, getProduct, getProductByPid, getVideo, getVideoBySourceUrl,
+  listFeishuAutomationJobVideoIds, saveFeishuAutomationJob, updateProduct, updateVideo,
+  upsertFeishuProductCardMapping,
 } from "@/lib/database";
 import { ensureFeishuConnection, getConnectedFeishuChannel } from "@/lib/feishu/runtime";
-import { ensureProductDocument } from "@/lib/feishu/document";
+import { ensureProductCardShell, syncProductCardManagedFields } from "@/lib/feishu/document";
 import { enqueueVideos } from "@/lib/queue";
-import { extractProductIdFromUrl, hasUsableProductInfo, isExactTikTokProductSource, parsePublicProductPage } from "@/lib/product-parser";
+import { extractProductIdFromUrl, isExactTikTokProductSource, parsePublicProductPage } from "@/lib/product-parser";
 import { conciseProductDocAnalysis } from "@/lib/product-doc-analysis";
 import { isTikTokUrl } from "@/lib/tiktok-product";
 
@@ -18,6 +20,7 @@ export interface FeishuAutomationFieldMap {
   pid: string;
   productName: string;
   productDocument: string;
+  productCardStatus: string;
   videoUrl: string;
   analysis: string;
   translation: string;
@@ -28,12 +31,34 @@ export const defaultFeishuAutomationFieldMap: FeishuAutomationFieldMap = {
   productUrl: "产品链接",
   pid: "商品ID",
   productName: "产品名称",
-  productDocument: "产品文档",
+  productDocument: "产品手卡",
+  productCardStatus: "手卡状态",
   videoUrl: "视频链接",
   analysis: "视频分析",
   translation: "中文翻译",
   status: "分析状态",
 };
+
+const productIdentityLockState = globalThis as typeof globalThis & {
+  __viralProductIdentityLocks?: Map<string, Promise<void>>;
+};
+const productIdentityLocks = productIdentityLockState.__viralProductIdentityLocks
+  ||= new Map<string, Promise<void>>();
+
+async function withProductIdentityLock<T>(pid: string, operation: () => Promise<T> | T) {
+  const previous = productIdentityLocks.get(pid) || Promise.resolve();
+  let release: () => void = () => undefined;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const tail = previous.catch(() => undefined).then(() => gate);
+  productIdentityLocks.set(pid, tail);
+  await previous.catch(() => undefined);
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (productIdentityLocks.get(pid) === tail) productIdentityLocks.delete(pid);
+  }
+}
 
 function text(value: unknown): string {
   if (value == null) return "";
@@ -99,7 +124,7 @@ export function resolveAutomationFields(
   const pid = extractProductIdFromUrl(productUrl);
   const suppliedPid = field(fields, map.pid, ["PID", "pid", "商品ID/PID"]);
   const documentField = inputMap.productDocument
-    || ("产品手卡" in fields ? "产品手卡" : map.productDocument);
+    || ("产品手卡" in fields ? "产品手卡" : "产品文档" in fields ? "产品文档" : map.productDocument);
   return {
     map: { ...map, productDocument: documentField },
     // The exact PDP URL is the source of truth. Generic /view/product links
@@ -109,7 +134,7 @@ export function resolveAutomationFields(
     pid,
     suppliedPid,
     productName: field(fields, map.productName, ["商品名称", "产品名", "productName", "product_name"]),
-    productDocument: field(fields, documentField, [map.productDocument, "产品手卡", "产品文档"]),
+    productDocument: urlField(fields, documentField, [map.productDocument, "产品手卡", "产品文档"]),
     videoUrl: cleanUrl(field(fields, map.videoUrl, ["样片链接", "视频链接"])),
     analysis: field(fields, map.analysis),
     translation: field(fields, map.translation),
@@ -135,41 +160,168 @@ export async function updateProductCardStatus(input: {
   tableId: string;
   recordId: string;
   status: string;
+  fieldName?: string;
 }) {
   await patchBaseRecord(input.client, {
     appToken: input.appToken,
     tableId: input.tableId,
     recordId: input.recordId,
-    fields: { "手卡状态": input.status.slice(0, 500) },
+    fields: { [input.fieldName?.trim() || "手卡状态"]: input.status.slice(0, 500) },
   });
 }
 
-export async function completeFeishuAutomation(videoId: string) {
-  const job = getFeishuAutomationJob(videoId);
-  const video = getVideo(videoId);
-  if (!job || !video || !["completed", "failed", "stopped"].includes(video.status)) return false;
-  const product = getProduct(video.productId);
-  const channel = getConnectedFeishuChannel() || await ensureFeishuConnection();
-  if (!channel) throw new Error("飞书应用尚未连接，无法回写自动化结果");
-  const map = { ...defaultFeishuAutomationFieldMap, ...job.fieldMap };
-  const fields: Record<string, unknown> = {
-    [map.status]: video.status === "completed" ? "已完成" : video.status === "failed" ? "失败" : "已停止",
-  };
-  if (video.status === "completed") {
-    fields[map.analysis] = conciseProductDocAnalysis(video);
-    fields[map.translation] = video.transcriptZh || "暂无中文翻译";
-    if (product?.documentUrl) fields[map.productDocument] = product.documentUrl;
-  } else if (video.errorMessage) {
-    fields[map.analysis] = `处理失败：${video.errorMessage}`;
-  }
+function trustedExistingDocumentUrl(value: string) {
+  if (!value) return "";
   try {
-    await patchBaseRecord(channel.rawClient, { ...job, fields });
-  } catch (error) {
-    if (!isBaseRolePermissionError(error)) throw error;
+    const url = new URL(value);
+    const host = url.hostname.toLowerCase();
+    return url.protocol === "https:"
+      && (host === "feishu.cn" || host.endsWith(".feishu.cn")
+        || host === "larksuite.com" || host.endsWith(".larksuite.com"))
+      && /^\/docx\/[A-Za-z0-9_-]+\/?$/.test(url.pathname)
+      ? value
+      : "";
+  } catch {
+    return "";
+  }
+}
+
+function productDocumentIdFromUrl(value: string) {
+  try {
+    return decodeURIComponent(new URL(value).pathname.match(/^\/docx\/([A-Za-z0-9_-]+)\/?$/)?.[1] || "");
+  } catch {
+    return "";
+  }
+}
+
+function safeAutomationFailure(error: unknown) {
+  const raw = error instanceof Error ? error.message : String(error || "资料刷新失败");
+  return raw
+    .replace(/\bauthorization\s*:\s*(?:bearer|basic)?\s*\S+/gi, "[已隐藏]")
+    .replace(/\bbearer\s+\S+/gi, "[已隐藏]")
+    .replace(/(?:api[_ -]?key|app[_ -]?secret|webhook[_ -]?secret)\s*[:=]?\s*\S+/gi, "[已隐藏]")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 360) || "资料刷新失败";
+}
+
+function productLinkInputError(input: { productUrl: string; extractedPid: string }) {
+  if (!input.productUrl) return "缺少产品链接";
+  if (!isTikTokUrl(input.productUrl)) return "产品链接必须是 HTTPS TikTok 链接";
+  if (!input.extractedPid) return "产品链接中没有可识别的商品 PID";
+  if (!isExactTikTokProductSource(input.productUrl, input.extractedPid)) {
+    return "产品链接必须是 HTTPS TikTok 官方商品详情页，且链接中的 PID 不能冲突";
+  }
+  return "";
+}
+
+export async function completeFeishuAutomation(videoId: string) {
+  const jobs = getFeishuAutomationJobs(videoId);
+  const video = getVideo(videoId);
+  if (!jobs.length || !video || !["completed", "failed", "stopped"].includes(video.status)) return false;
+  const product = getProduct(video.productId);
+  try {
+    const channel = getConnectedFeishuChannel() || await ensureFeishuConnection();
+    if (!channel) return false;
+    let allDelivered = true;
+    for (const job of jobs) {
+      try {
+        const productCardMapping = getFeishuProductCardMapping({
+          appToken: job.appToken,
+          tableId: job.tableId,
+          recordId: job.recordId,
+        });
+        const map = { ...defaultFeishuAutomationFieldMap, ...job.fieldMap };
+        const fields: Record<string, unknown> = {
+          [map.status]: video.status === "completed" ? "已完成" : video.status === "failed" ? "失败" : "已停止",
+        };
+        if (video.status === "completed") {
+          fields[map.analysis] = conciseProductDocAnalysis(video);
+          fields[map.translation] = video.transcriptZh || "暂无中文翻译";
+          const mappedDocumentUrl = productCardMapping?.documentUrl || product?.documentUrl;
+          if (mappedDocumentUrl) fields[map.productDocument] = mappedDocumentUrl;
+        } else if (video.errorMessage) {
+          fields[map.analysis] = `处理失败：${safeAutomationFailure(video.errorMessage)}`;
+        }
+        let delivered = false;
+        for (let attempt = 1; attempt <= 3; attempt += 1) {
+          try {
+            await patchBaseRecord(channel.rawClient, { ...job, fields });
+            delivered = true;
+            break;
+          } catch (error) {
+            if (isBaseRolePermissionError(error) || attempt === 3) break;
+            await new Promise((resolve) => setTimeout(resolve, attempt * 100));
+          }
+        }
+        if (!delivered) {
+          allDelivered = false;
+          continue;
+        }
+        deleteFeishuAutomationJob(job);
+      } catch {
+        // A single Base row must never prevent the remaining deliveries. The
+        // untouched job is the durable retry marker for a later completion run.
+        allDelivered = false;
+      }
+    }
+    return allDelivered;
+  } catch {
+    // Connection failures are retryable too; retain every delivery without
+    // propagating provider messages that might contain credentials.
     return false;
   }
-  deleteFeishuAutomationJob(videoId);
-  return true;
+}
+
+const automationDeliveryWorkerState = globalThis as typeof globalThis & {
+  __feishuAutomationDeliveryInitialTimer?: ReturnType<typeof setTimeout>;
+  __feishuAutomationDeliveryTimer?: ReturnType<typeof setInterval>;
+  __feishuAutomationDeliveryRunning?: boolean;
+};
+
+export async function runFeishuAutomationDeliveryPass() {
+  const pendingVideoIds = listFeishuAutomationJobVideoIds();
+  let terminalVideos = 0;
+  let deliveredVideos = 0;
+  for (const videoId of pendingVideoIds) {
+    const video = getVideo(videoId);
+    if (!video || !["completed", "failed", "stopped"].includes(video.status)) continue;
+    terminalVideos += 1;
+    try {
+      if (await completeFeishuAutomation(videoId)) deliveredVideos += 1;
+    } catch {
+      // The database job is the durable retry marker. Never log provider/Base
+      // errors here because they can contain authorization material.
+    }
+  }
+  return { pendingVideos: pendingVideoIds.length, terminalVideos, deliveredVideos };
+}
+
+function automationDeliveryWorkerInterval() {
+  const configured = Number(process.env.FEISHU_AUTOMATION_DELIVERY_INTERVAL_MS || 30_000);
+  return Number.isFinite(configured) ? Math.max(5_000, configured) : 30_000;
+}
+
+export function startFeishuAutomationDeliveryWorker() {
+  if (automationDeliveryWorkerState.__feishuAutomationDeliveryTimer) return;
+  const run = async () => {
+    if (automationDeliveryWorkerState.__feishuAutomationDeliveryRunning) return;
+    automationDeliveryWorkerState.__feishuAutomationDeliveryRunning = true;
+    try {
+      await runFeishuAutomationDeliveryPass();
+    } catch {
+      // A later fixed-interval pass will retry; do not emit sensitive errors.
+    } finally {
+      automationDeliveryWorkerState.__feishuAutomationDeliveryRunning = false;
+    }
+  };
+  automationDeliveryWorkerState.__feishuAutomationDeliveryInitialTimer = setTimeout(run, 2_500);
+  automationDeliveryWorkerState.__feishuAutomationDeliveryInitialTimer.unref();
+  automationDeliveryWorkerState.__feishuAutomationDeliveryTimer = setInterval(
+    run,
+    automationDeliveryWorkerInterval(),
+  );
+  automationDeliveryWorkerState.__feishuAutomationDeliveryTimer.unref();
 }
 
 export async function handleFeishuAutomation(input: {
@@ -183,91 +335,260 @@ export async function handleFeishuAutomation(input: {
 }) {
   const resolved = resolveAutomationFields(input.fields, input.fieldMap);
   const patch: Record<string, unknown> = {};
+  const pendingPatch: Record<string, unknown> = {};
   const writeBack = input.writeBack === true;
   let documentUrl = "";
   let writeBackError = "";
-  // Product-card automation requires the exact TikTok product link and the
-  // team's Chinese product name. PID is derived from the link, not entered by
-  // users as a separate trigger field.
-  if (!resolved.productUrl || !resolved.productName) {
-    throw new Error("必须同时填写产品链接和产品名称");
-  }
-  if (!isTikTokUrl(resolved.productUrl)) throw new Error("产品链接必须是 TikTok 链接");
-  if (!resolved.pid) throw new Error("产品链接中没有可识别的商品 PID");
-  if (!isExactTikTokProductSource(resolved.productUrl, resolved.pid)) {
-    throw new Error("产品链接必须是 HTTPS TikTok 官方商品详情页，不能使用视频页或其他页面");
-  }
-  let parsed = null;
-  const effectivePid = resolved.pid;
-  const effectiveName = resolved.productName;
-  // A request without a sample-video URL is the per-row “补录产品手卡”
-  // action. It must refresh product evidence even when this PID is already
-  // cached, then return the existing document to the clicked row.
-  const forceProductRefresh = !resolved.videoUrl;
-  let product = effectivePid ? getProductByPid(effectivePid) : null;
-  const productUrlChanged = Boolean(product && resolved.productUrl && product.productUrl !== resolved.productUrl);
+  const writeBackFailures = new Map<string, string>();
+  let productRefreshError = "";
+  let productCardWarning = "";
+  let productCardStatus = "";
+  let product = null as ReturnType<typeof getProductByPid>;
 
-  if (effectivePid && effectivePid !== resolved.suppliedPid) patch[resolved.map.pid] = effectivePid;
-  // 产品链接 is already present in Base and is a hyperlink field. Echoing the
-  // URL back as plain text causes URLFieldConvFail, so leave it untouched.
-
-  // Product docs need the PID, the team's Chinese name, and the generated URL.
-  if (effectiveName && effectivePid && resolved.productUrl) {
-    if ((forceProductRefresh || !product || productUrlChanged || !hasUsableProductInfo(product) || !product.visualAnalyzedAt) && resolved.productUrl) {
-      parsed = parsed || await parsePublicProductPage(resolved.productUrl, {
-        productName: effectiveName,
-        pid: effectivePid,
-      });
-      if (parsed) {
-        product = product || createProduct({ name: effectiveName, pid: effectivePid, productUrl: resolved.productUrl });
-        product = updateProduct(product.id, {
-          productUrl: resolved.productUrl,
-          sku: parsed.sku,
-          sellingPoints: "",
-          targetAudience: parsed.audience,
-          coreFunctions: parsed.coreFunctions,
-          productParameters: parsed.productParameters,
-          usageMethod: parsed.usageMethod,
-          usageScenes: parsed.scenes,
-          sourceTitle: parsed.sourceTitle,
-          sourceDescription: parsed.sourceDescription,
-          sourceImageUrls: parsed.sourceImageUrls,
-          visualEvidence: parsed.visualEvidence,
-          visualAnalysisStatus: parsed.visualAnalysisStatus,
-          visualAnalyzedAt: new Date().toISOString(),
-          name: effectiveName,
-          pid: effectivePid || product.pid,
-        }) || product;
+  const queuePatch = (fields: Record<string, unknown>) => {
+    Object.assign(patch, fields);
+    Object.assign(pendingPatch, fields);
+  };
+  const flushPatch = async () => {
+    if (!writeBack || !Object.keys(pendingPatch).length) return;
+    const snapshot = Object.entries(pendingPatch);
+    for (const [key, value] of snapshot) {
+      try {
+        await patchBaseRecord(input.client, {
+          appToken: input.appToken,
+          tableId: input.tableId,
+          recordId: input.recordId,
+          fields: { [key]: value },
+        });
+        if (pendingPatch[key] === value) delete pendingPatch[key];
+        writeBackFailures.delete(key);
+      } catch (error) {
+        writeBackFailures.set(key, safeAutomationFailure(error));
       }
     }
-    if (!product) throw new Error("商品资料解析成功但产品档案创建失败");
-    if (resolved.productUrl !== product.productUrl || effectiveName !== product.name || effectivePid !== product.pid) {
-      product = updateProduct(product.id, {
-        productUrl: resolved.productUrl,
+    writeBackError = [...writeBackFailures.entries()]
+      .map(([fieldName, message]) => `${fieldName}：${message}`)
+      .join("；")
+      .slice(0, 500);
+  };
+
+  const mappingKey = {
+    appToken: input.appToken,
+    tableId: input.tableId,
+    recordId: input.recordId,
+  };
+  let mappingBefore = getFeishuProductCardMapping(mappingKey);
+  const extractedPid = resolved.pid;
+  const linkInputError = productLinkInputError({
+    productUrl: resolved.productUrl,
+    extractedPid,
+  });
+  const refreshInputError = [resolved.productName ? "" : "缺少产品名称", linkInputError]
+    .filter(Boolean)
+    .join("；");
+  const effectivePid = linkInputError ? "" : extractedPid;
+  const requestedName = resolved.productName || "";
+  const effectiveName = requestedName || (effectivePid ? "待补产品" : mappingBefore?.lastProductName || "待补产品");
+  const existingProduct = effectivePid ? getProductByPid(effectivePid) : null;
+  const previousVerifiedPid = mappingBefore?.lastProductPid || "";
+  const previousVerifiedUrl = mappingBefore?.lastProductUrl || existingProduct?.productUrl || "";
+  const preservePreviousIdentity = Boolean(linkInputError && previousVerifiedPid);
+  const identityName = preservePreviousIdentity
+    ? mappingBefore?.lastProductName || "待补产品"
+    : effectiveName;
+  const identityPid = preservePreviousIdentity ? previousVerifiedPid : effectivePid;
+  const identityUrl = preservePreviousIdentity ? previousVerifiedUrl : resolved.productUrl;
+  const suppliedDocumentUrl = trustedExistingDocumentUrl(resolved.productDocument);
+  let shellDocumentId = mappingBefore?.documentId || "";
+  let shellDocumentUrl = mappingBefore?.documentUrl || "";
+  if (!shellDocumentId && suppliedDocumentUrl) {
+    const suppliedDocumentId = productDocumentIdFromUrl(suppliedDocumentUrl);
+    if (suppliedDocumentId && claimFeishuProductCardDocument(mappingKey, {
+      documentId: suppliedDocumentId,
+      documentUrl: suppliedDocumentUrl,
+    })) {
+      // Claim before ensureProductCardShell performs any identity/permission
+      // mutation. A legacy URL already owned by another Base row is ignored
+      // and this row receives its own stable shell instead.
+      shellDocumentId = suppliedDocumentId;
+      shellDocumentUrl = suppliedDocumentUrl;
+      mappingBefore = getFeishuProductCardMapping(mappingKey);
+    }
+  }
+  const shell = await ensureProductCardShell(input.client, {
+    recordKey: mappingKey,
+    // Product-card documents are stable per Base record. Falling back to the
+    // product's canonical document here made sequential clicks share one card
+    // while concurrent clicks created two, so the result depended on timing.
+    existingDocumentId: shellDocumentId || null,
+    existingDocumentUrl: shellDocumentUrl || null,
+    name: identityName,
+    productUrl: identityUrl,
+    pid: identityPid,
+    deferIdentity: true,
+  });
+  documentUrl = shell.documentUrl;
+  if (!shellDocumentId) {
+    const claimed = claimFeishuProductCardDocument(mappingKey, {
+      documentId: shell.documentId,
+      documentUrl: shell.documentUrl,
+    });
+    if (!claimed) throw new Error("当前飞书记录的产品手卡与其他记录冲突，已停止关联");
+    mappingBefore = getFeishuProductCardMapping(mappingKey);
+  }
+  productCardWarning = [shell.permissionWarning, shell.ownershipWarning]
+    .filter(Boolean)
+    .map((warning) => safeAutomationFailure(warning))
+    .join("；");
+
+  // Stage one is committed independently: a parser/provider failure can no
+  // longer make the user lose the product-card document that was just made.
+  queuePatch({ [resolved.map.productDocument]: shell.documentUrl });
+  await flushPatch();
+  if (effectivePid && effectivePid !== resolved.suppliedPid) {
+    queuePatch({ [resolved.map.pid]: effectivePid });
+    await flushPatch();
+  }
+  productCardStatus = "手卡已就绪，资料刷新中";
+  queuePatch({ [resolved.map.productCardStatus]: productCardStatus });
+  await flushPatch();
+
+  try {
+    upsertFeishuProductCardMapping({
+      ...mappingKey,
+      documentId: shell.documentId,
+      documentUrl: shell.documentUrl,
+    });
+    // A fresh shell or a confirmed PID switch must not display template/sample
+    // facts or the previous product's functions while the new parse is pending.
+    const shouldClearDerivedBeforeRefresh = !shell.reused
+      || mappingBefore?.documentId !== shell.documentId
+      || !mappingBefore?.managedProductPid
+      || mappingBefore.managedProductPid !== identityPid;
+    if (shouldClearDerivedBeforeRefresh) {
+      const cleared = await syncProductCardManagedFields(input.client, {
+        documentId: shell.documentId,
+        mode: "verified-basic",
+        clearDerived: true,
+        derivedOnly: true,
+      });
+      if (cleared.missingLabels?.length) {
+        throw new Error(`产品手卡模板缺少基础字段：${cleared.missingLabels.join("、")}`);
+      }
+      upsertFeishuProductCardMapping({
+        ...mappingKey,
+        managedProductPid: identityPid,
+      });
+    }
+    const identitySync = await syncProductCardManagedFields(input.client, {
+      documentId: shell.documentId,
+      mode: "identity",
+      name: identityName,
+      productUrl: identityUrl,
+      pid: identityPid,
+    });
+    if (identitySync.missingLabels?.length) {
+      throw new Error(`产品手卡模板缺少基础字段：${identitySync.missingLabels.join("、")}`);
+    }
+    if (refreshInputError) throw new Error(refreshInputError);
+    product = await withProductIdentityLock(effectivePid, () => {
+      const current = getProductByPid(effectivePid);
+      if (current) return current;
+      return createProduct({
         name: effectiveName,
         pid: effectivePid,
+        productUrl: resolved.productUrl,
+        documentId: shell.documentId,
+        documentUrl: shell.documentUrl,
+      });
+    });
+    if (!product) throw new Error("创建产品档案失败");
+    const previouslyMappedProduct = mappingBefore?.productId
+      && mappingBefore.productId !== product.id
+      ? getProduct(mappingBefore.productId)
+      : null;
+    if (previouslyMappedProduct?.documentId === shell.documentId) {
+      // The Base row has switched to another PID and its stable shell is being
+      // repurposed. Detach the old product's compatibility/canonical link so a
+      // later sync of that product cannot overwrite this row's new card.
+      clearProductDocumentLink(previouslyMappedProduct.id);
+    }
+    if (!product.documentId || !product.documentUrl) {
+      product = updateProduct(product.id, {
+        documentId: shell.documentId,
+        documentUrl: shell.documentUrl,
       }) || product;
     }
-    const hasFreshVerifiedProductInfo = Boolean(parsed) && hasUsableProductInfo(product, 1);
-    if (!hasFreshVerifiedProductInfo && !hasUsableProductInfo(product)) {
-      throw new Error("商品资料不足，已停止生成空白产品手卡，请稍后重试");
-    }
-    const result = await ensureProductDocument(input.client, product, {
-      coreFunctions: product.coreFunctions,
-      productParameters: product.productParameters,
-      usageMethod: product.usageMethod,
-      audience: product.targetAudience,
-      scenes: product.usageScenes,
-      sellingPoints: product.sellingPoints,
-      propImages: product.propImages,
+    upsertFeishuProductCardMapping({ ...mappingKey, productId: product.id });
+
+    // Every click performs a new exact-link/PID parse. Cached product facts
+    // never skip this refresh and never certify a failed request.
+    const parsed = await parsePublicProductPage(resolved.productUrl, {
+      productName: effectiveName,
+      pid: effectivePid,
     });
-    documentUrl = result.documentUrl;
-    // The button workflow consumes returned fields. Always return the URL even
-    // when it is unchanged; otherwise an existing PID produces an empty patch
-    // and the clicked row appears to do nothing.
-    // 产品手卡 is a text field in the current Base, so write the raw URL.
-    patch[resolved.map.productDocument] = result.documentUrl;
+    product = updateProduct(product.id, {
+      productUrl: resolved.productUrl,
+      sku: parsed.sku,
+      sellingPoints: product.sellingPoints,
+      targetAudience: parsed.audience,
+      coreFunctions: parsed.coreFunctions,
+      productParameters: parsed.productParameters,
+      usageMethod: parsed.usageMethod,
+      usageScenes: parsed.scenes,
+      sourceTitle: parsed.sourceTitle,
+      sourceDescription: parsed.sourceDescription,
+      sourceImageUrls: parsed.sourceImageUrls,
+      visualEvidence: parsed.visualEvidence,
+      visualAnalysisStatus: parsed.visualAnalysisStatus,
+      visualAnalyzedAt: new Date().toISOString(),
+      name: identityName,
+      pid: effectivePid,
+    }) || product;
+    const synchronized = await syncProductCardManagedFields(input.client, {
+      documentId: shell.documentId,
+      mode: "verified-basic",
+      name: effectiveName,
+      productUrl: resolved.productUrl,
+      pid: effectivePid,
+      sku: parsed.sku,
+      coreFunctions: parsed.coreFunctions,
+      productParameters: parsed.productParameters,
+      usageMethod: parsed.usageMethod,
+      audience: parsed.audience,
+      scenes: parsed.scenes,
+      clearDerived: true,
+    });
+    if (synchronized.missingLabels?.length) {
+      throw new Error(`产品手卡模板缺少基础字段：${synchronized.missingLabels.join("、")}`);
+    }
+    upsertFeishuProductCardMapping({
+      ...mappingKey,
+      productId: product.id,
+      documentId: shell.documentId,
+      documentUrl: shell.documentUrl,
+      lastProductPid: effectivePid,
+      lastProductUrl: resolved.productUrl,
+      lastProductName: effectiveName,
+      managedProductPid: effectivePid,
+    });
+    productCardStatus = productCardWarning
+      ? "手卡已就绪，资料已刷新，但文档权限待修复"
+      : "已完成";
+  } catch (error) {
+    productRefreshError = safeAutomationFailure(error);
+    const identitySuffix = shell.identityWarning ? "；基础信息写入待重试" : "";
+    productCardStatus = `手卡已就绪，资料刷新失败：${productRefreshError}${identitySuffix}`.slice(0, 500);
   }
+  // Give the critical document-link field one final independent attempt before
+  // publishing the terminal status. Never tell the user "已完成" while the row
+  // still has no hand-card link, even if parsing and document sync succeeded.
+  await flushPatch();
+  const documentWriteFailure = writeBackFailures.get(resolved.map.productDocument);
+  if (writeBack && documentWriteFailure) {
+    productCardStatus = `手卡已创建，但表格手卡链接回写待重试：${documentWriteFailure}`.slice(0, 500);
+  }
+  queuePatch({ [resolved.map.productCardStatus]: productCardStatus });
 
   if (resolved.videoUrl) {
     const targetProduct = product || getProductByPid(resolved.pid) || getProduct("system-unclassified");
@@ -295,28 +616,29 @@ export async function handleFeishuAutomation(input: {
     if (existing?.status === "completed") {
       // Reusing a finished URL must not spend API tokens a second time.
       if (writeBack) await completeFeishuAutomation(video.id);
-      patch[resolved.map.status] = "已完成";
-      patch[resolved.map.analysis] = conciseProductDocAnalysis(video);
-      patch[resolved.map.translation] = video.transcriptZh || "暂无中文翻译";
-      if (targetProduct.documentUrl) patch[resolved.map.productDocument] = targetProduct.documentUrl;
+      queuePatch({
+        [resolved.map.status]: "已完成",
+        [resolved.map.analysis]: conciseProductDocAnalysis(video),
+        [resolved.map.translation]: video.transcriptZh || "暂无中文翻译",
+        [resolved.map.productDocument]: shell.documentUrl,
+      });
     } else {
       enqueueVideos([video.id]);
-      patch[resolved.map.status] = "排队中";
+      queuePatch({ [resolved.map.status]: "排队中" });
     }
   }
 
-  if (writeBack && Object.keys(patch).length) {
-    try {
-      await patchBaseRecord(input.client, {
-        appToken: input.appToken,
-        tableId: input.tableId,
-        recordId: input.recordId,
-        fields: patch,
-      });
-    } catch (error) {
-      if (!isBaseRolePermissionError(error)) throw error;
-      writeBackError = error instanceof Error ? error.message : "飞书应用没有 Base 记录写入权限";
-    }
-  }
-  return { ...resolved, productName: effectiveName, pid: effectivePid, patch, documentUrl, writeBackError };
+  await flushPatch();
+  return {
+    ...resolved,
+    productName: effectiveName,
+    pid: effectivePid,
+    patch,
+    documentUrl,
+    documentReady: true,
+    productCardStatus,
+    productCardWarning,
+    productRefreshError,
+    writeBackError,
+  };
 }

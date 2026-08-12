@@ -121,6 +121,46 @@ function safeName(value: string) {
   return sanitizedName(value).slice(0, 90) || "未命名";
 }
 
+export type ProductDocumentStableKey = {
+  appToken: string;
+  tableId: string;
+  recordId: string;
+};
+
+function normalizedProductDocumentStableKey(key: ProductDocumentStableKey) {
+  const appToken = key.appToken.trim();
+  const tableId = key.tableId.trim();
+  const recordId = key.recordId.trim();
+  if (!appToken || !tableId || !recordId) {
+    throw new Error("创建产品手卡文档壳需要完整的 appToken、tableId 和 recordId");
+  }
+  return { appToken, tableId, recordId };
+}
+
+function productDocumentShellSuffix(key: ProductDocumentStableKey) {
+  const normalized = normalizedProductDocumentStableKey(key);
+  const digest = createHash("sha256")
+    .update(`${normalized.appToken}\0${normalized.tableId}\0${normalized.recordId}`)
+    .digest("hex")
+    .slice(0, 24);
+  return `_手卡_${digest}`;
+}
+
+/**
+ * A Base record is available before product parsing succeeds, so its resource
+ * coordinates are the stable identity for a two-stage product-card shell.
+ * The mutable product name is kept outside the hashed suffix and may be absent.
+ */
+export function productDocumentShellStableTitle(
+  productName: string | null | undefined,
+  key: ProductDocumentStableKey,
+) {
+  const suffix = productDocumentShellSuffix(key);
+  const normalizedName = sanitizedName(String(productName || "")) || "待补产品";
+  const prefixLength = Math.max(1, 90 - suffix.length);
+  return `${normalizedName.slice(0, prefixLength)}${suffix}`;
+}
+
 /** Keep the PID suffix intact when a long product name must be truncated. */
 export function productDocumentStableTitle(productName: string, pid: string) {
   const normalizedPid = sanitizedName(pid);
@@ -557,6 +597,203 @@ async function findProductDocumentByTitle(client: Client, folderToken: string, t
   return null;
 }
 
+async function findProductDocumentByTitleSuffix(client: Client, folderToken: string, titleSuffix: string) {
+  let pageToken: string | undefined;
+  do {
+    let response: Awaited<ReturnType<typeof client.drive.v1.file.list>>;
+    try {
+      response = await client.drive.v1.file.list({
+        params: {
+          folder_token: folderToken,
+          page_size: 200,
+          order_by: "EditedTime",
+          direction: "DESC",
+          ...(pageToken ? { page_token: pageToken } : {}),
+        },
+      });
+    } catch (error) {
+      throw productDocumentOperationError("按记录稳定键查找产品手卡失败", error);
+    }
+    productDocumentApiError(response, "按记录稳定键查找产品手卡失败");
+    const matches = response.data?.files?.filter((file) => file.type === "docx"
+      && Boolean(file.token)
+      && Boolean(file.name?.endsWith(titleSuffix))) || [];
+    if (matches.length > 1) throw new Error("同一记录稳定键匹配到多个产品手卡，已停止自动选择");
+    const match = matches[0];
+    if (match?.token) {
+      return {
+        documentId: match.token,
+        documentUrl: match.url || `https://feishu.cn/docx/${match.token}`,
+        title: match.name || `待补产品${titleSuffix}`,
+        type: "docx",
+      };
+    }
+    if (!response.data?.has_more) return null;
+    pageToken = response.data.next_page_token?.trim();
+    if (!pageToken) throw new Error("按记录稳定键查找产品手卡失败：飞书分页结果缺少下一页 Token");
+  } while (pageToken);
+  return null;
+}
+
+function productDocumentTokenFromUrl(documentUrl: string) {
+  try {
+    const url = new URL(documentUrl);
+    const host = url.hostname.toLowerCase();
+    if (url.protocol !== "https:"
+      || !(host === "feishu.cn" || host.endsWith(".feishu.cn")
+        || host === "larksuite.com" || host.endsWith(".larksuite.com"))) return "";
+    return decodeURIComponent(url.pathname.match(/\/docx\/([A-Za-z0-9_-]+)/)?.[1] || "");
+  } catch {
+    return "";
+  }
+}
+
+export type EnsureProductCardShellInput = {
+  recordKey?: ProductDocumentStableKey;
+  existingDocumentId?: string | null;
+  existingDocumentUrl?: string | null;
+  name?: string;
+  productUrl?: string;
+  pid?: string;
+  templateToken?: string;
+  ownerOpenId?: string;
+  /** Let a two-stage caller clear stale derived fields before changing identity. */
+  deferIdentity?: boolean;
+};
+
+function suppliedProductCardDocument(input: EnsureProductCardShellInput) {
+  const documentId = String(input.existingDocumentId || "").trim();
+  const documentUrl = String(input.existingDocumentUrl || "").trim();
+  const urlDocumentId = documentUrl ? productDocumentTokenFromUrl(documentUrl) : "";
+  if (documentUrl && !urlDocumentId) throw new Error("已有产品手卡链接不是有效的飞书 docx 链接");
+  if (documentId && urlDocumentId && documentId !== urlDocumentId) {
+    throw new Error("已有产品手卡的 documentId 与链接 Token 不一致");
+  }
+  const resolvedId = documentId || urlDocumentId;
+  return resolvedId ? {
+    documentId: resolvedId,
+    documentUrl: documentUrl || `https://feishu.cn/docx/${resolvedId}`,
+  } : null;
+}
+
+/**
+ * Stage one of product-card automation. It creates or adopts a stable template
+ * document before any product-page parsing and does not require a PID or URL.
+ */
+export async function ensureProductCardShell(
+  client: Client,
+  input: EnsureProductCardShellInput,
+) {
+  const supplied = suppliedProductCardDocument(input);
+  if (!supplied && !input.recordKey) {
+    throw new Error("创建产品手卡文档壳需要记录稳定键或已有文档 ID/链接");
+  }
+  const stableSuffix = input.recordKey ? productDocumentShellSuffix(input.recordKey) : "";
+  const lockKey = stableSuffix ? `record${stableSuffix}` : `document_${supplied!.documentId}`;
+  return withProductDocumentLock(lockKey, async () => {
+    const settings = getFeishuSettings();
+    const productFolderToken = requiredToken(
+      settings.productFolderToken,
+      "飞书产品文档文件夹配置，请先配置“产品说明文档”文件夹",
+    );
+    const stableTitle = input.recordKey
+      ? productDocumentShellStableTitle(input.name, input.recordKey)
+      : safeName(input.name || "待补产品");
+    let document: { documentId: string; documentUrl: string; title: string; type: string } | null = null;
+    let reused = false;
+    let ownershipWarning = "";
+
+    if (supplied) {
+      try {
+        await getProductDocumentOwner(client, supplied.documentId);
+        document = { ...supplied, title: stableTitle, type: "docx" };
+        reused = true;
+      } catch (error) {
+        if (isMissingProductDocumentError(error)) {
+          if (!input.recordKey) throw error;
+        } else {
+          // Metadata/owner lookup is advisory here. The already-known shell URL
+          // must survive transient Drive and permission errors; the repair is
+          // retried below and the warning remains visible to the caller.
+          document = { ...supplied, title: stableTitle, type: "docx" };
+          reused = true;
+          ownershipWarning = error instanceof Error
+            ? error.message
+            : "读取产品手卡所有者失败";
+        }
+      }
+    }
+    if (!document && input.recordKey) {
+      const existing = await findProductDocumentByTitleSuffix(client, productFolderToken, stableSuffix);
+      document = existing || await copyFeishuTemplateDocument(client, {
+        templateToken: input.templateToken?.trim()
+          || process.env.FEISHU_PRODUCT_TEMPLATE_TOKEN?.trim()
+          || defaultProductTemplateToken,
+        name: stableTitle,
+        folderToken: productFolderToken,
+      });
+      reused = Boolean(existing);
+    }
+    if (!document) throw new Error("创建或复用产品手卡文档壳失败");
+
+    let permissionWarning = "";
+    try { await setCompanyManaged(client, document.documentId); }
+    catch (error) { permissionWarning = error instanceof Error ? error.message : "设置公司内管理权限失败"; }
+    let identityWarning = "";
+    if (!input.deferIdentity) {
+      try {
+        const identitySync = await syncProductCardManagedFields(client, {
+          documentId: document.documentId,
+          mode: "identity",
+          name: input.name || "待补产品",
+          productUrl: input.productUrl || "",
+          pid: input.pid || "",
+        });
+        if (identitySync.missingLabels.length) {
+          identityWarning = `产品手卡模板缺少基础字段：${identitySync.missingLabels.join("、")}`;
+        }
+      } catch (error) {
+        // The shell already exists. Return its URL so callers can persist it and
+        // surface the field-sync failure without losing the newly created card.
+        identityWarning = error instanceof Error ? error.message : "写入产品手卡身份信息失败";
+      }
+    }
+    let migration = {
+      moved: false,
+      ownershipTransferred: false,
+      ownerId: "",
+      ownerMemberType: "" as "" | "openid",
+      ownerSource: "" as "" | "input" | "environment",
+      folderName: "",
+    };
+    try {
+      const owner = await resolveProductFolderOwner(client, productFolderToken, input.ownerOpenId);
+      const ownershipTransferred = await ensureProductDocumentOwner(client, document.documentId, owner);
+      migration = {
+        moved: false,
+        ownershipTransferred,
+        ownerId: owner.ownerId,
+        ownerMemberType: owner.ownerMemberType,
+        ownerSource: owner.ownerSource,
+        folderName: owner.folderName,
+      };
+    } catch (error) {
+      // Ownership can be repaired on the next click. Do not hide a document
+      // that has already been created successfully from the Base row.
+      const repairWarning = error instanceof Error ? error.message : "设置产品手卡所有者失败";
+      ownershipWarning = [ownershipWarning, repairWarning].filter(Boolean).join("；");
+    }
+    return {
+      ...document,
+      reused,
+      permissionWarning,
+      identityWarning,
+      ownershipWarning,
+      migration,
+    };
+  });
+}
+
 async function moveProductDocument(client: Client, documentToken: string, folderToken: string) {
   let response: Awaited<ReturnType<typeof client.drive.v1.file.move>>;
   try {
@@ -864,14 +1101,108 @@ function replaceTemplateText(content: string, values: Record<string, string>) {
   return Object.entries(values).reduce((result, [key, value]) => result.replaceAll(`{{${key}}}`, value || ""), content);
 }
 
+const PRODUCT_CARD_IDENTITY_LABELS = ["商品名称", "产品链接", "商品ID"] as const;
+const PRODUCT_CARD_DERIVED_LABELS = [
+  "产品SKU", "产品主要功能", "产品参数", "使用方法", "适用人群", "使用场景",
+] as const;
+const PRODUCT_CARD_MANAGED_LABELS = [
+  ...PRODUCT_CARD_IDENTITY_LABELS,
+  ...PRODUCT_CARD_DERIVED_LABELS,
+] as const;
+type ProductCardManagedLabel = typeof PRODUCT_CARD_MANAGED_LABELS[number];
+
+export type ProductCardManagedMode = "identity" | "verified-basic";
+
+export type ProductCardManagedFieldsInput = {
+  documentId: string;
+  mode: ProductCardManagedMode;
+  name?: string;
+  productUrl?: string;
+  pid?: string;
+  sku?: string;
+  coreFunctions?: string[];
+  productParameters?: string;
+  usageMethod?: string;
+  audience?: string;
+  scenes?: string;
+  /** Clear omitted derived fields after a fresh, verified parse. */
+  clearDerived?: boolean;
+  /** Restrict a preflight clear to derived labels; identity is handled next. */
+  derivedOnly?: boolean;
+};
+
+const PRODUCT_FIELD_LEADING_DECORATION = String.raw`[ \t\p{Extended_Pictographic}\uFE0F\u200D•·▪▫◦●○★☆]*`;
+
+function escapeRegex(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Match one exact template field at the beginning of the text block. */
+function matchProductFieldLine(content: string, label: string) {
+  const pattern = new RegExp(
+    `^(${PRODUCT_FIELD_LEADING_DECORATION}${escapeRegex(label)}[ \\t]*[:：][ \\t]*)([^\\r\\n]*)$`,
+    "u",
+  );
+  const match = content.match(pattern);
+  return match ? { prefix: match[1], value: match[2], tail: "" } : null;
+}
+
+function matchedManagedProductField(content: string) {
+  for (const label of PRODUCT_CARD_MANAGED_LABELS) {
+    const line = matchProductFieldLine(content, label);
+    if (line) return { label, ...line };
+  }
+  return null;
+}
+
+function hasOwn(value: object, key: PropertyKey) {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
+function productCardManagedValues(input: Omit<ProductCardManagedFieldsInput, "documentId">) {
+  const values = new Map<ProductCardManagedLabel, string>();
+  if (hasOwn(input, "name")) {
+    const displayName = String(input.name || "").replace(/\s+/g, " ").trim();
+    values.set("商品名称", displayName || "待补产品");
+  }
+  if (hasOwn(input, "productUrl")) values.set("产品链接", String(input.productUrl || "").trim());
+  if (hasOwn(input, "pid")) values.set("商品ID", String(input.pid || "").trim());
+  if (input.mode !== "verified-basic") return values;
+
+  const derived: Array<[ProductCardManagedLabel, keyof ProductCardManagedFieldsInput, string]> = [
+    ["产品SKU", "sku", String(input.sku || "").trim()],
+    ["产品主要功能", "coreFunctions", (Array.isArray(input.coreFunctions) ? input.coreFunctions : [])
+      .map((item) => String(item || "").replace(/\s+/g, " ").trim())
+      .filter(Boolean)
+      .slice(0, 5)
+      .join("；")],
+    ["产品参数", "productParameters", String(input.productParameters || "").trim()],
+    ["使用方法", "usageMethod", String(input.usageMethod || "").trim()],
+    ["适用人群", "audience", String(input.audience || "").trim()],
+    ["使用场景", "scenes", String(input.scenes || "").trim()],
+  ];
+  for (const [label, key, value] of derived) {
+    if (input.clearDerived || hasOwn(input, key)) values.set(label, value);
+  }
+  return values;
+}
+
+/** Pure block-level helper used by both the API and dynamic behavior tests. */
+export function syncProductCardManagedBlockText(
+  content: string,
+  input: Omit<ProductCardManagedFieldsInput, "documentId">,
+) {
+  const matched = matchedManagedProductField(content);
+  if (!matched) return content;
+  const values = productCardManagedValues(input);
+  if (!values.has(matched.label)) return content;
+  return `${matched.prefix}${values.get(matched.label) || ""}${matched.tail}`;
+}
+
 function replaceLabeledValue(content: string, label: string, value: string, allowEmpty = false) {
-  if ((!value && !allowEmpty) || !content.includes(label)) return content;
-  const labelIndex = content.indexOf(label);
-  const colonIndex = [content.indexOf("：", labelIndex), content.indexOf(":", labelIndex)]
-    .filter((index) => index >= 0)
-    .sort((a, b) => a - b)[0];
-  const prefixEnd = colonIndex == null ? labelIndex + label.length : colonIndex + 1;
-  return `${content.slice(0, prefixEnd)}${colonIndex == null ? "：" : ""}${value}`;
+  if (!value && !allowEmpty) return content;
+  const matched = matchProductFieldLine(content, label);
+  return matched ? `${matched.prefix}${value}${matched.tail}` : content;
 }
 
 function syncProductFieldText(content: string, values: Record<string, string>) {
@@ -898,20 +1229,19 @@ function syncProductFieldText(content: string, values: Record<string, string>) {
 }
 
 function styledProductFieldElements(content: string, productUrl: string): FeishuTextElement[] {
-  const labels = ["商品名称", "产品链接", "商品ID", "产品主要功能", "产品SKU", "产品参数", "使用方法", "适用人群", "使用场景", "产品卖点"];
-  const label = labels.find((candidate) => content.includes(candidate));
-  if (!label) return [{ text_run: { content } }];
-  const labelIndex = content.indexOf(label);
-  const colonIndex = [content.indexOf("：", labelIndex), content.indexOf(":", labelIndex)]
-    .filter((index) => index >= 0)
-    .sort((a, b) => a - b)[0];
-  const prefixEnd = colonIndex == null ? labelIndex + label.length : colonIndex + 1;
+  const labels = [...PRODUCT_CARD_MANAGED_LABELS, "产品卖点"];
+  const matched = labels
+    .map((label) => ({ label, line: matchProductFieldLine(content, label) }))
+    .find((item) => Boolean(item.line));
+  if (!matched?.line) return [{ text_run: { content } }];
+  const label = matched.label;
+  const prefixEnd = matched.line.prefix.length;
   const elements: FeishuTextElement[] = [];
   if (prefixEnd > 0) {
     elements.push({ text_run: { content: content.slice(0, prefixEnd), text_element_style: { bold: true } } });
   }
   const suffix = content.slice(prefixEnd);
-  if (label === "产品链接" && productUrl) {
+  if (label === "产品链接" && /^https:\/\//i.test(productUrl)) {
     const linkIndex = suffix.indexOf(productUrl);
     if (linkIndex >= 0) {
       if (linkIndex > 0) elements.push({ text_run: { content: suffix.slice(0, linkIndex) } });
@@ -924,6 +1254,74 @@ function styledProductFieldElements(content: string, productUrl: string): Feishu
   }
   if (suffix) elements.push({ text_run: { content: suffix } });
   return elements;
+}
+
+/**
+ * Update only exact, single-line managed template fields. Blocks containing a
+ * mention of a label, a mid-line label, A-E rows, or any other manual content
+ * are deliberately ignored.
+ */
+export async function syncProductCardManagedFields(
+  client: Client,
+  input: ProductCardManagedFieldsInput,
+) {
+  const documentId = requiredToken(input.documentId, "飞书产品文档 Token");
+  const blocks = await listFeishuDocumentBlocks(client, documentId);
+  const values = productCardManagedValues(input);
+  const matchedLabels = new Set<ProductCardManagedLabel>();
+  let updated = 0;
+  const managedBlocks = blocks.flatMap((block) => {
+    const text = block.text as {
+      elements?: Array<{
+        text_run?: {
+          content?: string;
+          text_element_style?: { link?: { url?: string } };
+        };
+      }>;
+    } | undefined;
+    const elements = text?.elements || [];
+    const content = elements.map((element) => element.text_run?.content || "").join("");
+    const matched = matchedManagedProductField(content);
+    return matched && values.has(matched.label) && block.block_id
+      ? [{ block, elements, content, matched }]
+      : [];
+  }).sort((left, right) => {
+    // Identity is always committed before derived facts regardless of the
+    // physical block order in an old/rearranged template.
+    const leftDerived = PRODUCT_CARD_DERIVED_LABELS.includes(left.matched.label as typeof PRODUCT_CARD_DERIVED_LABELS[number]);
+    const rightDerived = PRODUCT_CARD_DERIVED_LABELS.includes(right.matched.label as typeof PRODUCT_CARD_DERIVED_LABELS[number]);
+    return Number(leftDerived) - Number(rightDerived);
+  });
+  for (const { block, elements, content, matched } of managedBlocks) {
+    const isDerived = PRODUCT_CARD_DERIVED_LABELS.includes(matched.label as typeof PRODUCT_CARD_DERIVED_LABELS[number]);
+    if (input.derivedOnly && !isDerived) continue;
+    matchedLabels.add(matched.label);
+    const next = syncProductCardManagedBlockText(content, input);
+    const expectedProductUrl = matched.label === "产品链接" ? values.get("产品链接") || "" : "";
+    const expectedLink = /^https:\/\//i.test(expectedProductUrl) ? expectedProductUrl : "";
+    const currentLinks = elements
+      .map((element) => element.text_run?.text_element_style?.link?.url || "")
+      .filter(Boolean);
+    const linkStyleMatches = matched.label !== "产品链接" || (expectedLink
+      ? currentLinks.length === 1 && currentLinks[0] === expectedLink
+      : currentLinks.length === 0);
+    if (next === content && linkStyleMatches) continue;
+    await updateFeishuTextBlockElements(
+      client,
+      documentId,
+      String(block.block_id),
+      styledProductFieldElements(next, expectedProductUrl),
+    );
+    updated += 1;
+  }
+  const expectedLabels = [...values.keys()].filter((label) => !input.derivedOnly
+    || PRODUCT_CARD_DERIVED_LABELS.includes(label as typeof PRODUCT_CARD_DERIVED_LABELS[number]));
+  return {
+    scanned: blocks.length,
+    updated,
+    matchedLabels: [...matchedLabels],
+    missingLabels: expectedLabels.filter((label) => !matchedLabels.has(label)),
+  };
 }
 
 type EnsureProductDocumentInput = {
@@ -1035,7 +1433,9 @@ async function ensureProductDocumentUnlocked(
     // the field name used by all future tables.
     if (!content) continue;
     const next = syncProductFieldText(content, values);
-    const isProductLink = next.includes("产品链接") && next.includes(currentProduct.productUrl);
+    const matchedField = matchedManagedProductField(next);
+    const isProductLink = matchedField?.label === "产品链接"
+      && matchedField.value === currentProduct.productUrl;
     const hasExpectedLink = text?.elements?.some((element) => element.text_run?.text_element_style?.link?.url === currentProduct.productUrl);
     if ((next !== content || isProductLink && !hasExpectedLink) && block.block_id) {
       await updateFeishuTextBlockElements(

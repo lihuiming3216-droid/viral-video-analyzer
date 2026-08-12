@@ -296,3 +296,28 @@ export interface FeishuDelivery {
   createdAt: string;
   updatedAt: string;
 }
+
+/** Stable association between one Feishu Base row and its product-card document. */
+export interface FeishuProductCardMapping {
+  appToken: string;
+  tableId: string;
+  recordId: string;
+  /** Internal products.id. It remains null until a product has been resolved. */
+  productId: string | null;
+  /** The document can also be attached after the row mapping is first created. */
+  documentId: string | null;
+  documentUrl: string | null;
+  /** Last non-secret product identity received from this Base row. */
+  lastProductPid: string;
+  lastProductUrl: string;
+  lastProductName: string;
+  /** PID whose derived managed fields are currently present in the document. */
+  managedProductPid: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type FeishuProductCardMappingKey = Pick<
+  FeishuProductCardMapping,
+  "appToken" | "tableId" | "recordId"
+>;

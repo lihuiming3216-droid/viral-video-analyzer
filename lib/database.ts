@@ -7,6 +7,8 @@ import { DatabaseSync } from "node:sqlite";
 import type {
   AnalysisResult,
   DashboardPayload,
+  FeishuProductCardMapping,
+  FeishuProductCardMappingKey,
   ManualLabel,
   Product,
   ProviderName,
@@ -211,13 +213,30 @@ function initialize(db: DatabaseSync) {
     );
 
     CREATE TABLE IF NOT EXISTS feishu_automation_jobs (
-      video_id TEXT PRIMARY KEY REFERENCES videos(id) ON DELETE CASCADE,
+      video_id TEXT NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
       app_token TEXT NOT NULL,
       table_id TEXT NOT NULL,
       record_id TEXT NOT NULL,
       field_map_json TEXT NOT NULL DEFAULT '{}',
       created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY(video_id, app_token, table_id, record_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS feishu_product_card_mappings (
+      app_token TEXT NOT NULL,
+      table_id TEXT NOT NULL,
+      record_id TEXT NOT NULL,
+      product_id TEXT REFERENCES products(id) ON DELETE SET NULL,
+      document_id TEXT,
+      document_url TEXT,
+      last_product_pid TEXT NOT NULL DEFAULT '',
+      last_product_url TEXT NOT NULL DEFAULT '',
+      last_product_name TEXT NOT NULL DEFAULT '',
+      managed_product_pid TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY(app_token, table_id, record_id)
     );
 
     CREATE TABLE IF NOT EXISTS feishu_targets (
@@ -343,6 +362,92 @@ function initialize(db: DatabaseSync) {
       db.exec(`ALTER TABLE feishu_settings ADD COLUMN ${name} ${definition}`);
     }
   }
+  // The first automation-job schema used video_id as its sole primary key.
+  // That silently replaced the previous Base row whenever the same video URL
+  // was submitted from another row. Rebuild it with a per-row delivery key;
+  // the INSERT preserves every legacy pending job during an in-place upgrade.
+  const automationJobColumns = db.prepare("PRAGMA table_info(feishu_automation_jobs)").all() as Array<Record<string, unknown>>;
+  const automationJobPrimaryKey = automationJobColumns
+    .filter((column) => Number(column.pk) > 0)
+    .sort((left, right) => Number(left.pk) - Number(right.pk))
+    .map((column) => String(column.name));
+  if (automationJobPrimaryKey.join(",") !== "video_id,app_token,table_id,record_id") {
+    db.exec(`
+      BEGIN IMMEDIATE;
+      CREATE TABLE feishu_automation_jobs_next (
+        video_id TEXT NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+        app_token TEXT NOT NULL,
+        table_id TEXT NOT NULL,
+        record_id TEXT NOT NULL,
+        field_map_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(video_id, app_token, table_id, record_id)
+      );
+      INSERT OR IGNORE INTO feishu_automation_jobs_next(
+        video_id, app_token, table_id, record_id, field_map_json, created_at, updated_at
+      )
+      SELECT video_id, app_token, table_id, record_id, field_map_json, created_at, updated_at
+      FROM feishu_automation_jobs;
+      DROP TABLE feishu_automation_jobs;
+      ALTER TABLE feishu_automation_jobs_next RENAME TO feishu_automation_jobs;
+      COMMIT;
+    `);
+  }
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_feishu_automation_jobs_video
+      ON feishu_automation_jobs(video_id, updated_at);
+  `);
+  // Older installations do not have this mapping table. CREATE TABLE above
+  // handles that case; the column migration also tolerates an early/partial
+  // schema so upgrading never loses an already-associated document.
+  const productCardMappingColumns = db.prepare("PRAGMA table_info(feishu_product_card_mappings)").all() as Array<Record<string, unknown>>;
+  for (const [name, definition] of [
+    ["product_id", "TEXT REFERENCES products(id) ON DELETE SET NULL"],
+    ["document_id", "TEXT"],
+    ["document_url", "TEXT"],
+    ["last_product_pid", "TEXT NOT NULL DEFAULT ''"],
+    ["last_product_url", "TEXT NOT NULL DEFAULT ''"],
+    ["last_product_name", "TEXT NOT NULL DEFAULT ''"],
+    ["managed_product_pid", "TEXT NOT NULL DEFAULT ''"],
+    ["created_at", "TEXT NOT NULL DEFAULT ''"],
+    ["updated_at", "TEXT NOT NULL DEFAULT ''"],
+  ]) {
+    if (!productCardMappingColumns.some((column) => String(column.name) === name)) {
+      db.exec(`ALTER TABLE feishu_product_card_mappings ADD COLUMN ${name} ${definition}`);
+    }
+  }
+  const mappingTimestamp = now();
+  db.prepare(`UPDATE feishu_product_card_mappings
+    SET created_at=CASE WHEN COALESCE(created_at, '')='' THEN ? ELSE created_at END,
+        updated_at=CASE WHEN COALESCE(updated_at, '')='' THEN ? ELSE updated_at END
+    WHERE COALESCE(created_at, '')='' OR COALESCE(updated_at, '')=''`)
+    .run(mappingTimestamp, mappingTimestamp);
+  db.prepare(`WITH ranked_documents AS (
+      SELECT rowid AS mapping_rowid,
+        ROW_NUMBER() OVER (
+          PARTITION BY document_id
+          ORDER BY created_at, app_token, table_id, record_id
+        ) AS document_rank
+      FROM feishu_product_card_mappings
+      WHERE document_id IS NOT NULL AND TRIM(document_id) <> ''
+    )
+    UPDATE feishu_product_card_mappings
+    SET document_id=NULL, document_url=NULL, updated_at=?
+    WHERE rowid IN (
+      SELECT mapping_rowid FROM ranked_documents WHERE document_rank > 1
+    )`).run(mappingTimestamp);
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_feishu_product_card_mapping_row
+      ON feishu_product_card_mappings(app_token, table_id, record_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_feishu_product_card_mapping_document
+      ON feishu_product_card_mappings(document_id)
+      WHERE document_id IS NOT NULL AND TRIM(document_id) <> '';
+    CREATE INDEX IF NOT EXISTS idx_feishu_product_card_mapping_product
+      ON feishu_product_card_mappings(product_id);
+    CREATE INDEX IF NOT EXISTS idx_feishu_product_card_mapping_pid
+      ON feishu_product_card_mappings(last_product_pid);
+  `);
   db.exec("CREATE INDEX IF NOT EXISTS idx_products_pid ON products(pid)");
 
   const timestamp = now();
@@ -380,6 +485,176 @@ export function getDb() {
   return dbGlobal.__viralDb;
 }
 
+function requiredMappingKey(value: unknown, label: string) {
+  const normalized = typeof value === "string" ? value.trim() : "";
+  if (!normalized) throw new Error(`缺少飞书产品手卡映射${label}`);
+  return normalized;
+}
+
+function nullableMappingValue(value: string | null | undefined) {
+  if (value == null) return null;
+  return value.trim() || null;
+}
+
+function productCardMappingFromRow(row: Record<string, unknown>): FeishuProductCardMapping {
+  return {
+    appToken: String(row.app_token),
+    tableId: String(row.table_id),
+    recordId: String(row.record_id),
+    productId: row.product_id ? String(row.product_id) : null,
+    documentId: row.document_id ? String(row.document_id) : null,
+    documentUrl: row.document_url ? String(row.document_url) : null,
+    lastProductPid: String(row.last_product_pid || ""),
+    lastProductUrl: String(row.last_product_url || ""),
+    lastProductName: String(row.last_product_name || ""),
+    managedProductPid: String(row.managed_product_pid || ""),
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+  };
+}
+
+export function getFeishuProductCardMapping(key: FeishuProductCardMappingKey) {
+  const appToken = requiredMappingKey(key.appToken, " App Token");
+  const tableId = requiredMappingKey(key.tableId, " Table ID");
+  const recordId = requiredMappingKey(key.recordId, " Record ID");
+  const row = getDb().prepare(`SELECT * FROM feishu_product_card_mappings
+    WHERE app_token=? AND table_id=? AND record_id=?`)
+    .get(appToken, tableId, recordId) as Record<string, unknown> | undefined;
+  return row ? productCardMappingFromRow(row) : null;
+}
+
+export function upsertFeishuProductCardMapping(
+  input: FeishuProductCardMappingKey & Partial<Pick<
+    FeishuProductCardMapping,
+    "productId" | "documentId" | "documentUrl" | "lastProductPid" | "lastProductUrl" | "lastProductName" | "managedProductPid"
+  >>,
+) {
+  const appToken = requiredMappingKey(input.appToken, " App Token");
+  const tableId = requiredMappingKey(input.tableId, " Table ID");
+  const recordId = requiredMappingKey(input.recordId, " Record ID");
+  const timestamp = now();
+  const productId = nullableMappingValue(input.productId);
+  const documentId = nullableMappingValue(input.documentId);
+  const documentUrl = nullableMappingValue(input.documentUrl);
+  const lastProductPid = input.lastProductPid?.trim() || "";
+  const lastProductUrl = input.lastProductUrl?.trim() || "";
+  const lastProductName = input.lastProductName?.trim() || "";
+  const managedProductPid = input.managedProductPid?.trim() || "";
+  getDb().prepare(`INSERT INTO feishu_product_card_mappings(
+      app_token, table_id, record_id, product_id, document_id, document_url,
+      last_product_pid, last_product_url, last_product_name, managed_product_pid, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(app_token, table_id, record_id) DO UPDATE SET
+      product_id=CASE WHEN ?=1 THEN excluded.product_id ELSE feishu_product_card_mappings.product_id END,
+      document_id=CASE WHEN ?=1 THEN excluded.document_id ELSE feishu_product_card_mappings.document_id END,
+      document_url=CASE WHEN ?=1 THEN excluded.document_url ELSE feishu_product_card_mappings.document_url END,
+      last_product_pid=CASE WHEN ?=1 THEN excluded.last_product_pid ELSE feishu_product_card_mappings.last_product_pid END,
+      last_product_url=CASE WHEN ?=1 THEN excluded.last_product_url ELSE feishu_product_card_mappings.last_product_url END,
+      last_product_name=CASE WHEN ?=1 THEN excluded.last_product_name ELSE feishu_product_card_mappings.last_product_name END,
+      managed_product_pid=CASE WHEN ?=1 THEN excluded.managed_product_pid ELSE feishu_product_card_mappings.managed_product_pid END,
+      updated_at=excluded.updated_at`)
+    .run(
+      appToken, tableId, recordId, productId, documentId, documentUrl,
+      lastProductPid, lastProductUrl, lastProductName, managedProductPid, timestamp, timestamp,
+      input.productId !== undefined ? 1 : 0,
+      input.documentId !== undefined ? 1 : 0,
+      input.documentUrl !== undefined ? 1 : 0,
+      input.lastProductPid !== undefined ? 1 : 0,
+      input.lastProductUrl !== undefined ? 1 : 0,
+      input.lastProductName !== undefined ? 1 : 0,
+      input.managedProductPid !== undefined ? 1 : 0,
+    );
+  return getFeishuProductCardMapping({ appToken, tableId, recordId })!;
+}
+
+export function claimFeishuProductCardDocument(
+  key: FeishuProductCardMappingKey,
+  document: { documentId: string; documentUrl: string },
+) {
+  const appToken = requiredMappingKey(key.appToken, " App Token");
+  const tableId = requiredMappingKey(key.tableId, " Table ID");
+  const recordId = requiredMappingKey(key.recordId, " Record ID");
+  const documentId = document.documentId?.trim();
+  const documentUrl = document.documentUrl?.trim();
+  if (!documentId) throw new Error("缺少待认领的飞书产品手卡文档 ID");
+  if (!documentUrl) throw new Error("缺少待认领的飞书产品手卡文档链接");
+  const db = getDb();
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const current = db.prepare(`SELECT document_id FROM feishu_product_card_mappings
+      WHERE app_token=? AND table_id=? AND record_id=?`)
+      .get(appToken, tableId, recordId) as Record<string, unknown> | undefined;
+    const currentDocumentId = current?.document_id ? String(current.document_id) : "";
+    if (currentDocumentId) {
+      db.exec("COMMIT");
+      return currentDocumentId === documentId;
+    }
+    const occupied = db.prepare(`SELECT 1 AS occupied FROM feishu_product_card_mappings
+      WHERE document_id=? AND NOT (app_token=? AND table_id=? AND record_id=?)
+      LIMIT 1`).get(documentId, appToken, tableId, recordId);
+    if (occupied) {
+      db.exec("ROLLBACK");
+      return false;
+    }
+    const timestamp = now();
+    if (current) {
+      db.prepare(`UPDATE feishu_product_card_mappings
+        SET document_id=?, document_url=?, updated_at=?
+        WHERE app_token=? AND table_id=? AND record_id=?
+          AND (document_id IS NULL OR TRIM(document_id)='')`)
+        .run(documentId, documentUrl, timestamp, appToken, tableId, recordId);
+    } else {
+      db.prepare(`INSERT INTO feishu_product_card_mappings(
+        app_token, table_id, record_id, document_id, document_url, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+        .run(appToken, tableId, recordId, documentId, documentUrl, timestamp, timestamp);
+    }
+    db.exec("COMMIT");
+    return true;
+  } catch (error) {
+    try { db.exec("ROLLBACK"); } catch { /* the transaction has already ended */ }
+    throw error;
+  }
+}
+
+export interface FeishuAutomationJobKey {
+  videoId: string;
+  appToken: string;
+  tableId: string;
+  recordId: string;
+}
+
+export interface FeishuAutomationJob extends FeishuAutomationJobKey {
+  fieldMap: Record<string, string>;
+  createdAt: string;
+  updatedAt: string;
+}
+
+const feishuAutomationFieldMapKeys = new Set([
+  "productUrl", "pid", "productName", "productDocument", "productCardStatus",
+  "videoUrl", "analysis", "translation", "status",
+]);
+
+function safeFeishuAutomationFieldMap(value: Record<string, string> | undefined) {
+  return Object.fromEntries(Object.entries(value || {}).filter(([key, fieldName]) => (
+    feishuAutomationFieldMapKeys.has(key)
+    && typeof fieldName === "string"
+    && fieldName.trim().length > 0
+  )).map(([key, fieldName]) => [key, fieldName.trim()]));
+}
+
+function feishuAutomationJobFromRow(row: Record<string, unknown>): FeishuAutomationJob {
+  return {
+    videoId: String(row.video_id),
+    appToken: String(row.app_token),
+    tableId: String(row.table_id),
+    recordId: String(row.record_id),
+    fieldMap: json<Record<string, string>>(row.field_map_json, {}),
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+  };
+}
+
 export function saveFeishuAutomationJob(input: {
   videoId: string;
   appToken: string;
@@ -391,25 +666,42 @@ export function saveFeishuAutomationJob(input: {
   getDb().prepare(`INSERT INTO feishu_automation_jobs(
     video_id, app_token, table_id, record_id, field_map_json, created_at, updated_at
   ) VALUES (?, ?, ?, ?, ?, ?, ?)
-  ON CONFLICT(video_id) DO UPDATE SET app_token=excluded.app_token, table_id=excluded.table_id,
-    record_id=excluded.record_id, field_map_json=excluded.field_map_json, updated_at=excluded.updated_at`)
-    .run(input.videoId, input.appToken, input.tableId, input.recordId, JSON.stringify(input.fieldMap || {}), timestamp, timestamp);
+  ON CONFLICT(video_id, app_token, table_id, record_id) DO UPDATE SET
+    field_map_json=excluded.field_map_json, updated_at=excluded.updated_at`)
+    .run(
+      input.videoId.trim(), input.appToken.trim(), input.tableId.trim(), input.recordId.trim(),
+      JSON.stringify(safeFeishuAutomationFieldMap(input.fieldMap)), timestamp, timestamp,
+    );
 }
 
 export function getFeishuAutomationJob(videoId: string) {
-  const row = getDb().prepare("SELECT * FROM feishu_automation_jobs WHERE video_id=?").get(videoId) as Record<string, unknown> | undefined;
-  if (!row) return null;
-  return {
-    videoId: String(row.video_id),
-    appToken: String(row.app_token),
-    tableId: String(row.table_id),
-    recordId: String(row.record_id),
-    fieldMap: json<Record<string, string>>(row.field_map_json, {}),
-  };
+  return getFeishuAutomationJobs(videoId)[0] || null;
 }
 
-export function deleteFeishuAutomationJob(videoId: string) {
-  getDb().prepare("DELETE FROM feishu_automation_jobs WHERE video_id=?").run(videoId);
+export function getFeishuAutomationJobs(videoId: string) {
+  const rows = getDb().prepare(`SELECT * FROM feishu_automation_jobs
+    WHERE video_id=? ORDER BY created_at, app_token, table_id, record_id`)
+    .all(videoId) as Array<Record<string, unknown>>;
+  return rows.map(feishuAutomationJobFromRow);
+}
+
+export function listFeishuAutomationJobVideoIds() {
+  const rows = getDb().prepare(`SELECT video_id, MIN(created_at) AS first_created_at
+    FROM feishu_automation_jobs
+    GROUP BY video_id
+    ORDER BY first_created_at, video_id`).all() as Array<Record<string, unknown>>;
+  return rows.map((row) => String(row.video_id));
+}
+
+export function deleteFeishuAutomationJob(key: FeishuAutomationJobKey | string) {
+  if (typeof key === "string") {
+    // Kept for callers from older builds. New completion code always passes a
+    // composite key so one successful row cannot delete another pending row.
+    return getDb().prepare("DELETE FROM feishu_automation_jobs WHERE video_id=?").run(key);
+  }
+  return getDb().prepare(`DELETE FROM feishu_automation_jobs
+    WHERE video_id=? AND app_token=? AND table_id=? AND record_id=?`)
+    .run(key.videoId, key.appToken, key.tableId, key.recordId);
 }
 
 function productFromRow(row: Record<string, unknown>): Product {

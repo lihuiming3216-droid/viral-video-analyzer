@@ -62,7 +62,6 @@ export async function POST(request: NextRequest) {
     const recordId = String(body.recordId || body.record_id || "").trim();
     const fields = payloadFields(body);
     if (!appToken || !tableId || !recordId) return NextResponse.json({ error: "缺少 appToken、tableId 或 recordId" }, { status: 400 });
-    if (!Object.keys(fields).length) return NextResponse.json({ error: "没有收到多维表格字段" }, { status: 400 });
     const fieldMap = payloadFieldMap(body.fieldMap || body.field_map);
     const jobKey = `${appToken}:${tableId}:${recordId}`;
     if (!activeProductJobs.has(jobKey)) {
@@ -72,10 +71,9 @@ export async function POST(request: NextRequest) {
         try {
           const channel = getConnectedFeishuChannel() || await ensureFeishuConnection();
           if (!channel) throw new Error("飞书应用尚未连接");
-          const isProductCardJob = !fields[fieldMap.videoUrl || "视频链接"] && !fields["样片链接"];
-          if (isProductCardJob) {
-            await updateProductCardStatus({ client: channel.rawClient, appToken, tableId, recordId, status: "处理中" });
-          }
+          // The first external write is deliberately the newly created/reused
+          // hand-card URL inside handleFeishuAutomation. Product-page parsing
+          // and even status-column failures must come after the document exists.
           const result = await handleFeishuAutomation({
             client: channel.rawClient,
             appToken,
@@ -87,14 +85,15 @@ export async function POST(request: NextRequest) {
             // HTTP action has already received its immediate acknowledgement.
             writeBack: true,
           });
-          if (isProductCardJob) {
-            await updateProductCardStatus({ client: channel.rawClient, appToken, tableId, recordId, status: "已完成" });
-          }
           console.info("[feishu-automation] completed", {
             recordId,
             pid: result.pid,
             productName: result.productName,
             documentUrl: result.documentUrl,
+            documentReady: result.documentReady,
+            productCardStatus: result.productCardStatus,
+            productCardWarning: result.productCardWarning,
+            productRefreshError: result.productRefreshError,
             durationMs: Date.now() - startedAt,
             writeBackError: result.writeBackError,
           });
@@ -109,6 +108,7 @@ export async function POST(request: NextRequest) {
                 tableId,
                 recordId,
                 status: `失败：${message}`,
+                fieldName: fieldMap.productCardStatus,
               });
             }
           } catch (writeBackError) {

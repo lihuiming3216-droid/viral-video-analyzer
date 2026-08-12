@@ -227,7 +227,8 @@ test("Feishu automation supports direct Base write-back", async () => {
     readFile(new URL("app/api/feishu/automation/route.ts", root), "utf8"),
   ]);
   assert.match(automation, /writeBack\s*=\s*input\.writeBack === true/);
-  assert.match(automation, /if \(writeBack && Object\.keys\(patch\)\.length\)/);
+  assert.match(automation, /const flushPatch = async \(\) =>/);
+  assert.match(automation, /await flushPatch\(\)/);
   assert.match(route, /writeBack: true/);
   assert.match(route, /productDocument/);
   assert.match(route, /writeBackError/);
@@ -243,8 +244,10 @@ test("Feishu button automation acknowledges immediately and writes back in the b
   assert.match(route, /\{ status: 202 \}/);
   assert.match(route, /activeProductJobs/);
   assert.doesNotMatch(automation, /canRelinkExistingDocument|cachedFallbackEligible|hasVerifiedCache/);
-  assert.match(automation, /parsed = parsed \|\| await parsePublicProductPage/);
-  assert.match(automation, /patch\[resolved\.map\.productDocument\] = result\.documentUrl/);
+  assert.match(automation, /ensureProductCardShell/);
+  assert.match(automation, /Every click performs a new exact-link\/PID parse/);
+  assert.match(automation, /parsePublicProductPage\(resolved\.productUrl/);
+  assert.match(automation, /\[resolved\.map\.productDocument\]: shell\.documentUrl/);
 });
 
 test("generated Feishu documents grant company editors collaborator management", async () => {
@@ -289,7 +292,8 @@ test("product cards use verified TikTok evidence and resync reused documents", a
   assert.match(parser, /产品主要功能/);
   assert.match(parser, /JSON 键名必须严格使用/);
   assert.match(parser, /SKU 不得填写 PID 或商品ID/);
-  assert.match(parser, /skuWithoutLabel !== clean\(productId\)/);
+  assert.match(parser, /SKU is copied only from the exact-PID router model/);
+  assert.match(parser, /sku: base\.sku/);
   assert.match(parser, /type: "image_url"/);
   assert.match(parser, /MAX_PRODUCT_IMAGES = 8/);
   assert.match(parser, /playwright-core/);
@@ -305,15 +309,14 @@ test("product cards use verified TikTok evidence and resync reused documents", a
   assert.match(parser, /exactSourceMatched/);
   assert.match(parser, /sellingPoints: ""/);
   assert.match(parser, /sourceImageUrls: \[\]/);
-  assert.match(automation, /!product\.visualAnalyzedAt/);
-  assert.match(automation, /productUrlChanged/);
   assert.match(automation, /const productUrl = urlField/);
   assert.match(automation, /const pid = extractProductIdFromUrl\(productUrl\)/);
-  assert.match(automation, /if \(!resolved\.productUrl \|\| !resolved\.productName\)/);
-  assert.match(automation, /产品链接必须是 TikTok 链接/);
+  assert.match(automation, /ensureProductCardShell\(input\.client/);
+  assert.match(automation, /手卡已就绪，资料刷新中/);
+  assert.match(automation, /手卡已就绪，资料刷新失败/);
+  assert.match(automation, /syncProductCardManagedFields/);
+  assert.match(automation, /clearDerived: true/);
   assert.doesNotMatch(automation, /productUrlFromPid\(pid\)/);
-  assert.match(automation, /const forceProductRefresh = !resolved\.videoUrl/);
-  assert.match(automation, /patch\[resolved\.map\.productDocument\] = result\.documentUrl/);
   assert.doesNotMatch(automation, /patch\[resolved\.map\.productUrl\]/);
   assert.doesNotMatch(automation, /hyperlinkFieldValue/);
   assert.match(automation, /visualAnalyzedAt: new Date\(\)\.toISOString\(\)/);
@@ -326,7 +329,12 @@ test("product cards use verified TikTok evidence and resync reused documents", a
   assert.match(database, /visual_analysis_status/);
   assert.match(database, /visual_analyzed_at/);
   assert.match(database, /input\.visualAnalyzedAt === undefined/);
-  assert.match(automation, /已停止生成空白产品手卡/);
+  assert.match(database, /feishu_product_card_mappings/);
+  assert.match(database, /upsertFeishuProductCardMapping/);
+  assert.match(document, /ensureProductCardShell/);
+  assert.match(document, /syncProductCardManagedFields/);
+  assert.match(document, /PRODUCT_CARD_IDENTITY_LABELS/);
+  assert.match(document, /PRODUCT_CARD_DERIVED_LABELS/);
   assert.match(document, /syncProductFieldText/);
   assert.match(document, /\["产品卖点", "", true\]/);
   assert.match(document, /text_element_style: \{ link: \{ url: productUrl \} \}/);

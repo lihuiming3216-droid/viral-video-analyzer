@@ -1584,6 +1584,20 @@ function canonicalProductCaptureUrl(productUrl: string) {
   return url.toString();
 }
 
+function canonicalTrustedProductNavigationUrl(sourceUrl: string, productId: string) {
+  if (!isTrustedProductNavigationUrl(sourceUrl, productId)) return "";
+  try {
+    const url = new URL(sourceUrl);
+    if (url.hostname.toLowerCase() === "shop.tiktokw.us") {
+      url.hostname = "shop.tiktok.com";
+    }
+    if (!isExactTikTokProductSource(url.toString(), productId)) return "";
+    return canonicalProductCaptureUrl(url.toString());
+  } catch {
+    return "";
+  }
+}
+
 export async function collectProductPageWithDriver(
   driver: ProductPageCollectionDriver,
   productUrl: string,
@@ -1606,7 +1620,8 @@ export async function collectProductPageWithDriver(
     return unavailableCollectionResult("page_unavailable");
   }
   const finalUrl = navigation.finalUrl || productUrl;
-  if (!navigation.ok || navigation.status >= 400 || !isExactTikTokProductSource(finalUrl, pid)) {
+  const canonicalFinalUrl = canonicalTrustedProductNavigationUrl(finalUrl, pid);
+  if (!navigation.ok || navigation.status >= 400 || !canonicalFinalUrl) {
     return unavailableCollectionResult("page_unavailable");
   }
 
@@ -1705,7 +1720,7 @@ export async function collectProductPageWithDriver(
   if (isProductSecurityChallenge(title, description, collected.securityText || collected.text)) {
     return unavailableCollectionResult("page_unavailable");
   }
-  const structured = structuredProductEvidence(collected.html, finalUrl);
+  const structured = structuredProductEvidence(collected.html, canonicalFinalUrl);
   // Navigation succeeded, so a missing exact-PID router model is incomplete
   // product evidence rather than a false "page could not be opened" report.
   if (!structured) return unavailableCollectionResult("page_incomplete", {
@@ -1765,7 +1780,7 @@ export async function collectProductPageWithDriver(
     });
   }
 
-  const canonicalUrl = canonicalProductCaptureUrl(finalUrl);
+  const canonicalUrl = canonicalFinalUrl;
   const captureId = clean(options.captureId) || `product-page-${pid}-${Date.now().toString(36)}`;
   const images: CapturedProductImage[] = usable.map((item) => ({
     id: `product-image-${item.index + 1}`,

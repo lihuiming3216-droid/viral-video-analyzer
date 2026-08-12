@@ -187,20 +187,68 @@ test("provider refusals and incomplete Responses outputs remain distinct", async
   );
 });
 
-test("zero images and missing credentials are distinguished before provider use", async () => {
+test("complete exact-PID text can be analyzed without product images", async () => {
   process.env.OPENAI_API_KEY = "test-openai-key-that-is-long-enough";
-  const noImages = { ...capture(), images: [], coverage: {
+  const base = capture();
+  const noImagesWithoutDigest = { ...base, images: [], coverage: {
     identity: "exact", details: "converged", scroll: "converged", expectedImageCount: 0, usableImageCount: 0,
   } };
-  await assert.rejects(
-    analyzer.analyzeProductCaptureWithOpenAI(noImages),
-    (error) => error.code === "invalid_capture" && /图片/.test(error.message),
-  );
+  delete noImagesWithoutDigest.sourceDigest;
+  const noImages = {
+    ...noImagesWithoutDigest,
+    sourceDigest: analyzer.createProductCaptureDigest(noImagesWithoutDigest),
+  };
+  globalThis.__openAIProductHooks = {
+    fetchWithProxy: async () => new Response(JSON.stringify({ status: "incomplete", output: [] }), { status: 200 }),
+  };
+  await assert.rejects(analyzer.analyzeProductCaptureWithOpenAI(noImages),
+    (error) => error.code === "incomplete",
+    "zero images must reach the provider when complete trusted text is present");
+
   delete process.env.OPENAI_API_KEY;
   await assert.rejects(
     analyzer.analyzeProductCaptureWithOpenAI(capture()),
     (error) => error.code === "not_configured",
   );
+});
+
+test("text-only blood-pressure details can fill all four fields with controlled templates", async () => {
+  process.env.OPENAI_API_KEY = "test-openai-key-that-is-long-enough";
+  const withoutDigest = {
+    captureId: "capture-bp-text",
+    pid: "1732333539141128282",
+    canonicalUrl: "https://shop.tiktok.com/us/pdp/blood-pressure-monitor/1732333539141128282",
+    productNameHint: "血压仪大号",
+    fragments: [
+      { id: "router-title", kind: "router_text", text: "Arm-in Automatic Upper Arm Blood Pressure Monitor, No Cuff" },
+      { id: "scoped-dom-details", kind: "scoped_dom", text: "Slide your arm into the upper arm blood pressure monitor and press one button to start measuring. Perfect for seniors. Ideal for shared family use and daily home monitoring." },
+    ],
+    images: [],
+    coverage: { identity: "exact", details: "converged", scroll: "converged", expectedImageCount: 0, usableImageCount: 0 },
+  };
+  const input = { ...withoutDigest, sourceDigest: analyzer.createProductCaptureDigest(withoutDigest) };
+  const inferredFromText = (valueZh, exactQuote) => ({
+    valueZh,
+    basis: "ai_inference",
+    evidenceRefs: [{ sourceType: "scoped_dom", sourceId: "scoped-dom-details", exactQuote }],
+  });
+  globalThis.__openAIProductHooks = {
+    fetchWithProxy: async () => responseFor({
+      captureId: input.captureId,
+      pid: input.pid,
+      sourceDigest: input.sourceDigest,
+      coreFunctions: { facts: [inferredFromText("用于测量血压", "blood pressure monitor")] },
+      usageMethod: { facts: [inferredFromText("将手臂伸入臂筒后测量", "Slide your arm into the upper arm blood pressure monitor")] },
+      audience: { facts: [inferredFromText("需要日常血压监测的用户", "Perfect for seniors")] },
+      scenes: { facts: [inferredFromText("家庭血压监测场景", "daily home monitoring")] },
+    }),
+  };
+  const result = await analyzer.analyzeProductCaptureWithOpenAI(input);
+  assert.equal(result.coreFunctions.facts[0].valueZh, "用于测量血压");
+  assert.equal(result.usageMethod.facts[0].basis, "ai_inference");
+  assert.equal(result.usageMethod.facts[0].valueZh, "将手臂伸入臂筒后测量");
+  assert.equal(result.audience.facts[0].valueZh, "需要日常血压监测的用户");
+  assert.equal(result.scenes.facts[0].valueZh, "家庭血压监测场景");
 });
 
 test("capture identity, digest, image bytes, and evidence kinds are server validated", async () => {

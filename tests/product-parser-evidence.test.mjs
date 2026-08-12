@@ -362,7 +362,7 @@ test("a sealed capture produces all four managed fields and labels only inferred
   ]);
 });
 
-test("capture distinguishes incomplete pages from zero usable exact-product images", async () => {
+test("capture permits complete text-only pages but still rejects incomplete or empty evidence", async () => {
   const url = `https://shop.tiktok.com/us/pdp/${cameraPid}`;
   const imageUrl = "https://p16-oec-va.ibyteimg.com/camera.webp";
   const html = structuredCameraPage({ images: [{ url_list: [imageUrl] }] });
@@ -385,8 +385,10 @@ test("capture distinguishes incomplete pages from zero usable exact-product imag
   const noImagesResult = await parser.collectProductPageWithDriver(noImages.driver, url, {
     maxRounds: 3, waitMilliseconds: 0,
   });
-  assert.equal(noImagesResult.errorCode, "all_product_images_unavailable");
+  assert.equal(noImagesResult.errorCode, "");
   assert.equal(noImagesResult.diagnostics.usableImageCount, 0);
+  assert.equal(noImagesResult.capture.images.length, 0);
+  assert.equal(noImagesResult.capture.fragments.some((fragment) => fragment.kind === "router_text"), true);
 
   const incompleteAndNoImages = collectionDriver({
     html,
@@ -396,8 +398,16 @@ test("capture distinguishes incomplete pages from zero usable exact-product imag
   const combinedFailure = await parser.collectProductPageWithDriver(incompleteAndNoImages.driver, url, {
     maxRounds: 3, waitMilliseconds: 0,
   });
-  assert.equal(combinedFailure.errorCode, "all_product_images_unavailable",
-    "zero usable images has the stable image-specific classification even when scrolling is incomplete");
+  assert.equal(combinedFailure.errorCode, "page_incomplete",
+    "an incomplete detail capture must not proceed merely because text exists");
+
+  const emptyTextHtml = structuredCameraPage({ descriptionTexts: [], productProperties: [], images: [] });
+  const emptyText = collectionDriver({ html: emptyTextHtml, snapshots: [stable, stable, stable], imageResults: new Map() });
+  const emptyTextResult = await parser.collectProductPageWithDriver(emptyText.driver, url, {
+    maxRounds: 3, waitMilliseconds: 0,
+  });
+  assert.equal(emptyTextResult.errorCode, "all_product_images_unavailable",
+    "a title alone with no image is still insufficient evidence");
 });
 
 test("capture waits for all lazy detail controls before counting three stable rounds", async () => {

@@ -366,12 +366,13 @@ function baseInfo(
   hints: ProductParseHints,
   sourceImageUrls: string[],
   sku = "",
+  productParameters = "",
 ): ParsedProductInfo {
   return {
     productName: clean(hints.productName) || title,
     sku,
     coreFunctions: [],
-    productParameters: "",
+    productParameters,
     usageMethod: "",
     audience: "",
     scenes: "",
@@ -457,7 +458,7 @@ function productInfoFromTrustedSlug(
     ...base,
     sku: "",
     coreFunctions,
-    productParameters: parameters.join("；"),
+    productParameters: base.productParameters || parameters.join("；"),
     scenes: scenes.join("；"),
     sourceTitle: clean(options.sourceTitle) || clean(trustedSlug),
     sourceDescription: "",
@@ -477,18 +478,215 @@ function parsedValue(parsed: Partial<ParsedProductInfo>, aliases: string[]) {
 
 function evidenceList(parsed: ParsedProductModel, field: keyof ProductEvidenceQuotes) {
   const quotes = parsed.evidenceQuotes?.[field];
-  return Array.isArray(quotes) ? quotes.map(clean).filter(Boolean) : [];
+  // Preserve empty entries so malformed arrays cannot shift later quotes onto
+  // earlier claims and accidentally pass the strict index-by-index binding.
+  return Array.isArray(quotes) ? quotes.map(clean) : [];
 }
 
-function quotesExistInSource(quotes: string[], sourceText: string) {
-  const source = clean(sourceText).toLowerCase();
-  return Boolean(quotes.length) && quotes.every((quote) => source.includes(clean(quote).toLowerCase()));
+function normalizedEvidence(value: unknown) {
+  return clean(value).normalize("NFKC").toLowerCase();
+}
+
+function quoteExistsInSource(quote: string, sourceText: string) {
+  const needle = normalizedEvidence(quote);
+  const source = normalizedEvidence(sourceText);
+  if (needle.length < 3 || !/[\p{L}\p{N}]/u.test(needle)) return false;
+  let index = source.indexOf(needle);
+  while (index >= 0) {
+    const before = index > 0 ? source[index - 1] : "";
+    const after = source[index + needle.length] || "";
+    const startsWithWord = /^[a-z0-9]/i.test(needle);
+    const endsWithWord = /[a-z0-9]$/i.test(needle);
+    if ((!startsWithWord || !/[a-z0-9]/i.test(before))
+      && (!endsWithWord || !/[a-z0-9]/i.test(after))) return true;
+    index = source.indexOf(needle, index + 1);
+  }
+  return false;
+}
+
+function fieldClaims(value: unknown) {
+  return cleanFieldValue(value)
+    .split(/[；;\n]+/)
+    .map(clean)
+    .filter(Boolean);
+}
+
+const CLAIM_EVIDENCE_RULES: Array<{ claim: RegExp; evidence: RegExp }> = [
+  { claim: /(?:无需|免)(?:付费|订阅)|无月费/, evidence: /\b(?:non[- ]subscription|no\s+(?:monthly\s+)?(?:fees?|subscription)|without\s+(?:a\s+)?subscription)\b/i },
+  { claim: /\bAI\b|人工智能/i, evidence: /\bAI\b|artificial intelligence/i },
+  { claim: /人(?=[/、，,与和]|检测)|人员|人体|人形|人物/, evidence: /\b(?:human|person|people)\b/i },
+  { claim: /宠物/, evidence: /\b(?:pet|dog|cat)s?\b/i },
+  { claim: /哭声|哭泣/, evidence: /\bcry(?:ing)?\b/i },
+  { claim: /检测|侦测/, evidence: /\bdetect(?:ion|s|ed|ing)?\b/i },
+  { claim: /自定义|自设/, evidence: /\bcustom(?:ize|ized|izable|ization)?\b/i },
+  { claim: /(?:检测|监控)?区域/, evidence: /\b(?:zone|area|region)s?\b/i },
+  { claim: /红外/, evidence: /\b(?:IR|infrared)\b/i },
+  { claim: /夜视/, evidence: /\bnight\s+vision\b/i },
+  { claim: /全景/, evidence: /\bpanoramic\b|\b360\s*[°-]?\s*(?:pan|coverage|view)?\b/i },
+  { claim: /云台|平移|俯仰/, evidence: /\bpan(?:\s*(?:and|&|\/)\s*tilt)?\b|\btilt\b/i },
+  { claim: /双向/, evidence: /\b(?:2|two)[- ]?way\b|\bfull[- ]duplex\b/i },
+  { claim: /全双工/, evidence: /\bfull[- ]duplex\b/i },
+  { claim: /音频|语音/, evidence: /\baudio\b|\bvoice\b/i },
+  { claim: /通话|呼叫/, evidence: /\b(?:call|speak|talk)(?:ing)?\b/i },
+  { claim: /本地/, evidence: /\blocal(?:ly)?\b/i },
+  { claim: /云端|云存储/, evidence: /\bcloud\b/i },
+  { claim: /存储|保存/, evidence: /\b(?:stor(?:age|e)|save(?:d|s|ing)?)\b/i },
+  { claim: /手机/, evidence: /\bphone\b|\bmobile\b/i },
+  { claim: /应用|App\b/i, evidence: /\bapp(?:lication)?\b/i },
+  { claim: /连接/, evidence: /\bconnect(?:ion|ed|s|ing)?\b/i },
+  { claim: /Wi[- ]?Fi/i, evidence: /\bwi[- ]?fi\b/i },
+  { claim: /一键|点击|轻触/, evidence: /\b(?:one[- ](?:tap|touch)|tap(?:\s+once)?|click|press)\b/i },
+  { claim: /开启|打开|启动/, evidence: /\b(?:turn\s+on|enable|start|activate)(?:s|d|ed|ing)?\b/i },
+  { claim: /睡眠模式/, evidence: /\bsleep\s+mode\b/i },
+  { claim: /关闭(?:监控)?/, evidence: /\bturn\s+off\b|\bdisable\b|\bshut\s+off\b/i },
+  { claim: /支持|可用/, evidence: /\b(?:support(?:s|ed|ing)?|works?\s+with|compatible)\b/i },
+  { claim: /室内/, evidence: /\bindoor\b/i },
+  { claim: /家庭|家中|居家/, evidence: /\b(?:home|household|family)\b/i },
+  { claim: /安防|安全监控/, evidence: /\bsecurity\b/i },
+  { claim: /婴儿|婴幼儿|宝宝/, evidence: /\b(?:baby|babies|infant)s?\b/i },
+  { claim: /前门/, evidence: /\bfront\s+door\b/i },
+  { claim: /看护|监护|监控/, evidence: /\b(?:monitor|watch|check\s+in|camera|coverage)\b/i },
+  { claim: /智能/, evidence: /\b(?:smart|AI|intelligent)\b/i },
+  { claim: /增强/, evidence: /\b(?:enhanced|improved)\b/i },
+  { claim: /实时/, evidence: /\b(?:real[- ]time|live)\b/i },
+  { claim: /清晰/, evidence: /\b(?:clear|sharp)\b/i },
+  { claim: /平滑/, evidence: /\bsmooth\b/i },
+  { claim: /覆盖/, evidence: /\b(?:coverage|cover(?:s|ed|ing)?)\b/i },
+  { claim: /分辨率/, evidence: /\b(?:resolution|\d+(?:\.\d+)?\s*[km]p?)\b/i },
+  { claim: /超高清|超清/, evidence: /\b(?:ultra\s+hd|uhd)\b/i },
+  { claim: /高清/, evidence: /\b(?:hd|high\s+definition)\b/i },
+  { claim: /电源|供电/, evidence: /\b(?:power|powered)\b/i },
+  { claim: /有线/, evidence: /\b(?:wired|corded)\b/i },
+  { claim: /电动/, evidence: /\b(?:electric|powered)\b/i },
+  { claim: /插头/, evidence: /\bplug\b/i },
+  { claim: /美标/, evidence: /\b(?:US|American)(?:\s+standard)?\s+plug\b/i },
+  { claim: /输入电压|电压/, evidence: /\b(?:input\s+voltage|voltage|volts?)\b/i },
+  { claim: /材质/, evidence: /\bmaterial\b/i },
+  { claim: /硅胶/, evidence: /\bsilicone\b/i },
+  { claim: /ABS\b/i, evidence: /\bABS\b/i },
+  { claim: /型号/, evidence: /\b(?:model|C\d[A-Z0-9-]*)\b/i },
+  { claim: /兼容|适配|适用于/, evidence: /\b(?:compatible|compatibility|for)\b/i },
+  { claim: /防水/, evidence: /\bwaterproof\b|\bwater[- ]resistant\b/i },
+  { claim: /防震|抗震/, evidence: /\bshockproof\b|\bshock[- ]resistant\b/i },
+  { claim: /抗菌/, evidence: /\banti[- ]?bacterial\b|\bantimicrobial\b/i },
+  { claim: /电池/, evidence: /\bbatter(?:y|ies)\b/i },
+  { claim: /续航/, evidence: /\b(?:runtime|battery\s+life|endurance)\b/i },
+  { claim: /快充/, evidence: /\b(?:fast|quick|rapid)[- ]?charg(?:e|ed|er|ing)\b/i },
+  { claim: /充电/, evidence: /\bcharg(?:e|ed|er|ing)\b/i },
+  { claim: /加热|发热/, evidence: /\bheat(?:ed|ing)?\b|\bwarm(?:ing)?\b/i },
+  { claim: /震动|振动/, evidence: /\bvibrat(?:e|ing|ion)\b/i },
+  { claim: /蓝牙/, evidence: /\bbluetooth\b/i },
+  { claim: /无线/, evidence: /\bwireless\b/i },
+];
+
+function numericFactsMatch(claim: string, quote: string) {
+  const normalizedClaim = normalizedEvidence(claim).replace(/度/g, "°");
+  const evidence = normalizedEvidence(quote).replace(/degrees?/g, "°");
+  const numbers = normalizedClaim.match(/\d+(?:\.\d+)?/g) || [];
+  if (!numbers.every((number) => {
+    const escaped = number.replace(".", "\\.");
+    return new RegExp(`(?:^|[^\\d.])${escaped}(?![\\d.])`).test(evidence);
+  })) return false;
+  const specifications = [...normalizedClaim.matchAll(/(\d+(?:\.\d+)?)\s*(ghz|mhz|khz|mah|mp|kp|k|w|v|gb|tb|mb|mm|cm|kg|ft|inch(?:es)?|°)\b/g)]
+    .map((match) => ({ number: match[1], unit: match[2] }));
+  return specifications.every(({ number, unit }) => {
+    const escaped = number.replace(".", "\\.");
+    return new RegExp(`(?:^|[^\\d.])${escaped}\\s*${unit}(?![a-z])`, "i").test(evidence);
+  });
+}
+
+function asciiFactsMatch(claim: string, quote: string) {
+  const compact = (value: string) => normalizedEvidence(value).replace(/[^a-z0-9.]+/g, "");
+  const evidence = compact(quote);
+  const withoutSpecifications = normalizedEvidence(claim)
+    .replace(/\d+(?:\.\d+)?\s*(?:ghz|mhz|khz|mah|mp|kp|k|w|v|gb|tb|mb|mm|cm|kg|ft|inch(?:es)?|°)/gi, " ");
+  const tokens = withoutSpecifications.match(/[a-z][a-z0-9.-]+/gi) || [];
+  return tokens.every((token) => evidence.includes(compact(token)));
+}
+
+function claimHasOnlyMappedMeaning(claim: string, quote: string) {
+  if (!asciiFactsMatch(claim, quote)) return false;
+  let residue = claim.normalize("NFKC");
+  for (const rule of CLAIM_EVIDENCE_RULES) {
+    const flags = [...new Set(`${rule.claim.flags.replace(/[gy]/g, "")}g`)].join("");
+    residue = residue.replace(new RegExp(rule.claim.source, flags), " ");
+  }
+  residue = residue
+    .replace(/\d+(?:\.\d+)?(?:\s*[-~至]\s*\d+(?:\.\d+)?)?\s*(?:GHz|MHz|kHz|mAh|MP|KP|K|W|V|GB|TB|MB|mm|cm|kg|ft|inch(?:es)?|°|度)?/gi, " ")
+    .replace(/[A-Za-z][A-Za-z0-9._/-]*/g, " ")
+    .replace(/(?:视频捕捉|连接技术|电源类型|插头类型|输入电压|产品|商品|设备|功能|能力|选项|模式|通过|即可|进行|采用|适用|提供|用于|使用|的|与|和|及|并|或|为)/g, " ")
+    .replace(/[^\p{L}\p{N}]+/gu, "");
+  return !/[\u3400-\u9fff]/u.test(residue);
+}
+
+function quoteAffirmsClaim(claim: string, quote: string) {
+  const beneficialAbsence = /(?:无需|免)(?:付费|订阅)|无月费/.test(claim)
+    && /\b(?:non[- ]subscription|no\s+(?:monthly\s+)?(?:fees?|subscription)|without\s+(?:paying|a\s+subscription))\b/i.test(quote);
+  const chineseNegation = /(?:不|无|未|免|无需|非)/.test(claim);
+  const englishNegation = /\b(?:no|not|without|unsupported|disabled|unavailable|incompatible|cannot|can't|won't|will\s+not|doesn't|does\s+not|isn't|is\s+not|aren't|are\s+not|fails?\s+to|doesn't\s+work|does\s+not\s+work|not[- ]included|not[- ]supported)\b/i.test(quote)
+    || /\bnon[- ](?!subscription\b)/i.test(quote);
+  // The hand card intentionally omits negative attributes. The sole accepted
+  // absence claim is the explicit no-subscription/no-monthly-fee benefit.
+  if (chineseNegation && !beneficialAbsence) return false;
+  return !englishNegation || beneficialAbsence;
+}
+
+function claimMeaningIsSupported(
+  claim: string,
+  quote: string,
+  field: keyof ProductEvidenceQuotes,
+) {
+  if (!numericFactsMatch(claim, quote)) return false;
+  if (!quoteAffirmsClaim(claim, quote)) return false;
+  let matchedRule = false;
+  for (const rule of CLAIM_EVIDENCE_RULES) {
+    rule.claim.lastIndex = 0;
+    if (!rule.claim.test(claim)) continue;
+    matchedRule = true;
+    rule.evidence.lastIndex = 0;
+    if (!rule.evidence.test(quote)) return false;
+  }
+  // Unknown model-authored concepts are rejected instead of being accepted
+  // merely because the model supplied some unrelated real page quote.
+  if (!matchedRule) return false;
+  if (!claimHasOnlyMappedMeaning(claim, quote)) return false;
+  if (field === "usageMethod") {
+    if (!/(?:连接|点击|轻触|按|开启|关闭|安装|使用|放置|设置|选择|插入|移除|充电|保存|查看|通话|呼叫|佩戴|涂抹|拉|推|旋转|调节)/.test(claim)) return false;
+    if (!/\b(?:connect|tap|click|press|turn|install|use|place|set|select|choose|insert|remove|charge|save|view|access|call|speak|wear|apply|pull|push|rotate|adjust)(?:s|ed|ing)?\b/i.test(quote)) return false;
+  }
+  if (field === "audience") {
+    const audienceRules = [
+      { claim: /家庭|家中/, evidence: /\b(?:famil(?:y|ies)|households?|home\s+(?:users?|owners?))\b/i },
+      { claim: /宠物主人/, evidence: /\bpet\s+owners?\b/i },
+      { claim: /父母|家长/, evidence: /\bparents?\b/i },
+      { claim: /独居/, evidence: /\b(?:living\s+alone|people\s+who\s+live\s+alone|single[- ]person)\b/i },
+      { claim: /用户/, evidence: /\b(?:users?|customers?|owners?|parents?)\b/i },
+    ];
+    const matched = audienceRules.filter((rule) => rule.claim.test(claim));
+    if (!matched.length || matched.some((rule) => !rule.evidence.test(quote))) return false;
+  }
+  return true;
+}
+
+function supportedClaimField(
+  value: unknown,
+  quotes: string[],
+  sourceText: string,
+  field: keyof ProductEvidenceQuotes,
+) {
+  const claims = fieldClaims(value);
+  if (!claims.length || claims.length !== quotes.length) return "";
+  const valid = claims.every((claim, index) => {
+    const quote = quotes[index];
+    return quoteExistsInSource(quote, sourceText)
+      && claimMeaningIsSupported(claim, quote, field);
+  });
+  return valid ? claims.join("；") : "";
 }
 
 function normalizeParsed(
   parsed: ParsedProductModel,
   base: ParsedProductInfo,
-  productId: string,
   evidenceText: string,
   options: { allowVisualEvidence?: boolean } = {},
 ): ParsedProductInfo {
@@ -496,29 +694,39 @@ function normalizeParsed(
   const functions = Array.isArray(rawFunctions)
     ? rawFunctions
     : String(rawFunctions || "").split(/[；;\n]+/);
-  const rawSku = clean(parsedValue(parsed, ["sku", "SKU", "产品SKU"]));
-  const skuWithoutLabel = rawSku.replace(/^(?:SKU|PID|商品ID|产品ID)\s*[:：#-]?\s*/i, "");
   const sourceTitle = base.sourceTitle || clean(parsedValue(parsed, ["sourceTitle", "title", "页面标题"]));
   const sourceDescription = base.sourceDescription || clean(parsedValue(parsed, ["sourceDescription", "description", "页面描述"]));
   const visualEvidence = options.allowVisualEvidence === false
     ? ""
     : clean(parsedValue(parsed, ["visualEvidence", "图片证据", "视觉证据", "图片分析"]));
-  const source = [evidenceText || `${sourceTitle}\n${sourceDescription}`, visualEvidence].filter(Boolean).join("\n");
-  const supportedFunctions = functions
-    .map((value, index) => ({ value: cleanFunction(value), quote: evidenceList(parsed, "coreFunctions")[index] || "" }))
-    .filter((item) => /[\u3400-\u9fff]/.test(item.value) && quotesExistInSource([item.quote], source))
-    .map((item) => item.value);
+  // Model-authored visualEvidence is useful as a human-readable observation,
+  // but it can never certify another model-authored fact. Only exact-PID page
+  // text may satisfy evidenceQuotes.
+  const source = evidenceText || `${sourceTitle}\n${sourceDescription}`;
+  const functionQuotes = evidenceList(parsed, "coreFunctions");
+  const normalizedFunctions = functions.map(cleanFunction).filter(Boolean);
+  const supportedFunctions = normalizedFunctions.length === functionQuotes.length
+    && normalizedFunctions.every((value, index) => /[\u3400-\u9fff]/.test(value)
+      && quoteExistsInSource(functionQuotes[index], source)
+      && claimMeaningIsSupported(value, functionQuotes[index], "coreFunctions"))
+    ? normalizedFunctions
+    : [];
   const supportedString = (value: unknown, field: keyof ProductEvidenceQuotes) => {
-    const normalized = cleanFieldValue(value);
-    return /[\u3400-\u9fff]/.test(normalized) && quotesExistInSource(evidenceList(parsed, field), source) ? normalized : "";
+    const normalized = supportedClaimField(value, evidenceList(parsed, field), source, field);
+    return /[\u3400-\u9fff]/.test(normalized) ? normalized : "";
   };
   return {
     ...base,
     sourceTitle,
     sourceDescription,
-    sku: base.sku || (rawSku && skuWithoutLabel !== clean(productId) && quotesExistInSource(evidenceList(parsed, "sku"), source) ? rawSku : ""),
+    // SKU is copied only from the exact-PID router model. A free-form model
+    // value plus an unrelated real quote is not a trustworthy identifier.
+    sku: base.sku,
     coreFunctions: [...new Set(supportedFunctions)].slice(0, 5),
-    productParameters: supportedString(parsedValue(parsed, ["productParameters", "产品参数"]), "productParameters") || base.productParameters,
+    // Product parameters come only from the exact-PID router model's explicit
+    // property label/value pairs. Free-form AI text cannot bind a value to the
+    // wrong product attribute or an accessory mentioned in the same sentence.
+    productParameters: base.productParameters,
     usageMethod: supportedString(parsedValue(parsed, ["usageMethod", "使用方法"]), "usageMethod"),
     audience: supportedString(parsedValue(parsed, ["audience", "适用人群", "目标人群"]), "audience"),
     scenes: supportedString(parsedValue(parsed, ["scenes", "使用场景", "适用场景"]), "scenes"),
@@ -534,6 +742,7 @@ type ProductPageResult = {
   text: string;
   imageUrls: string[];
   sku: string;
+  productParameters?: string;
   error: string;
   structured: boolean;
   corroboratingText: string;
@@ -607,24 +816,64 @@ function descriptionEvidence(value: unknown) {
   return { texts, imageUrls };
 }
 
+function deterministicStructuredParameters(properties: Array<{ name: string; values: string[] }>) {
+  const parameters: string[] = [];
+  const add = (label: string, value: string) => {
+    const normalized = clean(value).slice(0, 120);
+    if (normalized && !parameters.some((item) => item.startsWith(`${label}：`))) {
+      parameters.push(`${label}：${normalized}`);
+    }
+  };
+  for (const property of properties) {
+    const name = property.name.toLowerCase();
+    const value = property.values.map(clean).filter(Boolean).join("、");
+    if (!value) continue;
+    if (name === "video capture resolution") add("视频捕捉分辨率", value);
+    else if (name === "connectivity technology" || name === "connectivity protocol") add("连接技术", value);
+    else if (name === "power source") {
+      const translated = /^corded electric$/i.test(value)
+        ? "有线电动"
+        : /^battery(?: powered)?$/i.test(value) ? "电池供电" : value;
+      add("电源类型", translated);
+    } else if (name === "plug type") {
+      const translated = /^us plug$/i.test(value)
+        ? "美标插头"
+        : /^eu plug$/i.test(value) ? "欧标插头"
+          : /^uk plug$/i.test(value) ? "英标插头" : value;
+      add("插头类型", translated);
+    } else if (/^input voltage(?:\(v\))?$/.test(name)) {
+      add("输入电压", /^\d+(?:\.\d+)?(?:\s*[-~]\s*\d+(?:\.\d+)?)?$/.test(value) ? `${value}V` : value);
+    } else if (name === "material") {
+      const translated = /^silicone$/i.test(value) ? "硅胶" : value;
+      add("材质", translated);
+    } else if (name === "model") add("型号", value);
+    else if (name === "compatible devices") {
+      const translated = /^smartphones?$/i.test(value) ? "智能手机" : value;
+      add("兼容设备", translated);
+    }
+  }
+  return parameters.slice(0, 8).join("；");
+}
+
 function structuredProductEvidence(html: string, productUrl: string) {
   const productId = productIdFromOfficialTikTokPath(productUrl);
   const model = productModelFromRouterData(embeddedJson(html, "__MODERN_ROUTER_DATA__"), productId);
   if (!model || clean(model.product_id) !== productId || !clean(model.name)) return null;
 
   const description = descriptionEvidence(model.description);
-  const properties = (Array.isArray(model.product_properties) ? model.product_properties : [])
+  const propertyRecords = (Array.isArray(model.product_properties) ? model.product_properties : [])
     .map((item) => {
-      if (!item || typeof item !== "object") return "";
+      if (!item || typeof item !== "object") return null;
       const property = item as Record<string, unknown>;
       const propertyName = clean(property.property_name);
-      if (/(?:CA Prop|Aerosol|Dangerous|Hazardous|Magnetic Field|Country of origin|Batter(?:y|ies)|Cells?\?)/i.test(propertyName)) return "";
+      if (/(?:CA Prop|Aerosol|Dangerous|Hazardous|Magnetic Field|Country of origin|Batter(?:y|ies)|Cells?\?)/i.test(propertyName)) return null;
       const values = (Array.isArray(property.property_values) ? property.property_values : [])
         .map((value) => value && typeof value === "object" ? clean((value as Record<string, unknown>).property_value_name) : "")
         .filter(Boolean);
-      return values.length ? `${propertyName}：${values.join("、")}` : "";
+      return values.length ? { name: propertyName, values } : null;
     })
-    .filter(Boolean);
+    .filter((item): item is { name: string; values: string[] } => Boolean(item));
+  const properties = propertyRecords.map((property) => `${property.name}：${property.values.join("、")}`);
   const skus = (Array.isArray(model.skus) ? model.skus : [])
     .map((item) => item && typeof item === "object" ? clean((item as Record<string, unknown>).sku_name) : "")
     .filter((value, index, all) => Boolean(value) && all.indexOf(value) === index);
@@ -650,6 +899,7 @@ function structuredProductEvidence(html: string, productUrl: string) {
       .slice(0, 11_000),
     imageUrls: imageUrls.slice(0, MAX_PRODUCT_IMAGES),
     sku: skus.join("；"),
+    productParameters: deterministicStructuredParameters(propertyRecords),
     structured: true,
     corroboratingText: title,
   };
@@ -1105,7 +1355,7 @@ export async function parsePublicProductPage(
   // product. Retry only that transient response; permanent errors still fail
   // immediately so a button click cannot occupy a worker unnecessarily.
   const page = await readProductPageWithRetry(canonicalUrl);
-  const base = baseInfo(page.title, page.description, hints, page.imageUrls, page.sku);
+  const base = baseInfo(page.title, page.description, hints, page.imageUrls, page.sku, page.productParameters);
   const searchMode = !page.text;
   let searchResult: Awaited<ReturnType<typeof qwenFindExactProductSources>> | null = null;
   let searchError = "";
@@ -1147,12 +1397,14 @@ export async function parsePublicProductPage(
   // seller-controlled slug into free-form product claims.
   const providerFailures: ProviderFailure[] = [];
   let providerReturnedModel = false;
+  let visualProviderSucceeded = false;
   const initialUsedVisualModel = !searchMode && page.imageUrls.length > 0;
   const attemptProductModel = async (label: string, request: () => Promise<ParsedProductModel>) => {
     const startedAt = Date.now();
     try {
       const result = await request();
       providerReturnedModel = true;
+      if (label === "Qwen 图片抽取") visualProviderSucceeded = true;
       console.info("[product-parser] provider attempt", {
         pid: productId,
         stage: label,
@@ -1179,20 +1431,14 @@ export async function parsePublicProductPage(
       : await attemptProductModel("Qwen 文本抽取", () => qwenExtract(prompt));
   let normalized = searchMode
     ? trustedSearchEvidence ? productInfoFromTrustedSlug(evidenceBase, trustedSearchEvidence) : null
-    : parsed ? normalizeParsed(parsed, base, productId, page.text) : null;
-  let visualAnalysisStatus: ParsedProductInfo["visualAnalysisStatus"] = !searchMode
-    && normalized
-    && hasUsableProductInfo(normalized)
-    && hasReliableVisualEvidence(normalized.visualEvidence)
-    && page.imageUrls.length
-    ? "completed"
-    : "unavailable";
+    : parsed ? normalizeParsed(parsed, base, page.text) : null;
+  let visualAnalysisStatus: ParsedProductInfo["visualAnalysisStatus"] = "unavailable";
 
   if (!searchMode
     && needsCompletenessRetry(normalized, page.text)
     && (providerReturnedModel || (initialUsedVisualModel && !directDeterministicUsable))) {
     parsed = await attemptProductModel("Qwen 文本重试", () => qwenExtract(prompt));
-    const candidate = parsed ? normalizeParsed(parsed, base, productId, page.text) : null;
+    const candidate = parsed ? normalizeParsed(parsed, base, page.text) : null;
     normalized = preferMoreCompleteProductInfo(normalized, candidate);
   }
 
@@ -1245,7 +1491,16 @@ export async function parsePublicProductPage(
   }
   if (searchMode) {
     normalized = { ...normalized, sourceImageUrls: [], visualEvidence: "" };
-    visualAnalysisStatus = "unavailable";
   }
+  // Recompute after the optional text retry and deterministic fallback. A
+  // completed status means an actual visual request succeeded and its final
+  // retained observation is non-empty; text-only output cannot manufacture it.
+  visualAnalysisStatus = !searchMode
+    && initialUsedVisualModel
+    && visualProviderSucceeded
+    && hasReliableVisualEvidence(normalized.visualEvidence)
+    && normalized.sourceImageUrls.length > 0
+    ? "completed"
+    : "unavailable";
   return { ...normalized, sellingPoints: "", visualAnalysisStatus };
 }

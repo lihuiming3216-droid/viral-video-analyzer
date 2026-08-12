@@ -71,6 +71,7 @@ function structuredCameraPage(options = {}) {
     "2.5K Ultra HD + Night Vision",
     "Smart AI Detection",
     "Full Duplex 2-Way Audio",
+    "Quickly connect to your 2.4GHz WiFi with the Phone App",
   ];
   const model = {
     product_id: options.productId ?? cameraPid,
@@ -79,15 +80,21 @@ function structuredCameraPage(options = {}) {
     images: options.images ?? [{
       url_list: ["https://p16-oec-va.ibyteimg.com/tos-maliva-i-o3syd03w52/camera.webp"],
     }],
-    product_properties: [
+    product_properties: options.productProperties ?? [
       { property_name: "Video Capture Resolution", property_values: [{ property_value_name: "2.5K" }] },
+      { property_name: "Connectivity Technology", property_values: [{ property_value_name: "2.4GHz WiFi" }] },
+      { property_name: "Power Source", property_values: [{ property_value_name: "Corded Electric" }] },
+      { property_name: "Plug Type", property_values: [{ property_value_name: "US plug" }] },
+      { property_name: "Input Voltage(V)", property_values: [{ property_value_name: "110-220" }] },
+      { property_name: "Material", property_values: [{ property_value_name: "ABS" }] },
+      { property_name: "Model", property_values: [{ property_value_name: "CM-C2LU" }] },
       { property_name: "Special Features", property_values: [
         { property_value_name: "Night Vision" },
         { property_value_name: "2-Way Audio" },
         { property_value_name: "AI Detection" },
       ] },
     ],
-    skus: [{ sku_name: "CAM-TEST" }],
+    skus: options.skus ?? [{ sku_name: "CAM-TEST" }],
   };
   return `<html><head><meta property="og:title" content="${metaTitle}"><title>${metaTitle}</title></head><body><script id="__MODERN_ROUTER_DATA__" type="application/json">${JSON.stringify({ loaderData: { product_model: model } })}</script></body></html>`;
 }
@@ -205,7 +212,7 @@ test("a valid direct AI result takes priority over deterministic camera facts", 
           sku: "",
           coreFunctions: ["宠物看护"],
           productParameters: "分辨率：4MP",
-          usageMethod: "通过手机应用查看",
+          usageMethod: "通过手机App连接2.4GHz Wi-Fi",
           audience: "",
           scenes: "",
           sellingPoints: "",
@@ -214,7 +221,7 @@ test("a valid direct AI result takes priority over deterministic camera facts", 
             sku: [],
             coreFunctions: ["Pet/Dog/Cat Camera"],
             productParameters: ["4MP"],
-            usageMethod: ["Phone App"],
+            usageMethod: ["Quickly connect to your 2.4GHz WiFi with the Phone App"],
             audience: [],
             scenes: [],
           },
@@ -227,9 +234,251 @@ test("a valid direct AI result takes priority over deterministic camera facts", 
   const result = await parser.parsePublicProductPage(cameraUrl, { productName: "室内摄像头", pid: cameraPid });
   assert.equal(chatCalls, 1);
   assert.deepEqual(result.coreFunctions, ["宠物看护"]);
-  assert.equal(result.productParameters, "分辨率：4MP");
-  assert.equal(result.usageMethod, "通过手机应用查看");
+  assert.match(result.productParameters, /视频捕捉分辨率：2\.5K/);
+  assert.doesNotMatch(result.productParameters, /4MP/);
+  assert.equal(result.usageMethod, "通过手机App连接2.4GHz Wi-Fi");
   assert.doesNotMatch(JSON.stringify(result), /室内安防监控|AI检测|双向语音|夜视/);
+});
+
+test("AI fields require one trusted page quote per atomic claim and cannot self-certify", async () => {
+  const scenarios = [
+    {
+      usageMethod: "通过手机App连接2.4GHz Wi-Fi；自定义检测区域",
+      usageQuotes: ["Quickly connect to your 2.4GHz WiFi with the Phone App"],
+      visualEvidence: "",
+    },
+    {
+      usageMethod: "自定义检测区域",
+      usageQuotes: ["Custom Detection Zones"],
+      visualEvidence: "Custom Detection Zones",
+    },
+    {
+      usageMethod: "通过手机App连接2.4GHz Wi-Fi",
+      usageQuotes: ["", "Quickly connect to your 2.4GHz WiFi with the Phone App"],
+      visualEvidence: "",
+    },
+  ];
+  for (const scenario of scenarios) {
+    globalThis.__productParserTestHooks = {
+      fetchWithProxy: async (url) => {
+        if (String(url).includes("/chat/completions")) {
+          return qwenProductResponse({
+            sourceTitle: "",
+            sourceDescription: "",
+            sku: "",
+            coreFunctions: ["宠物看护"],
+            productParameters: "分辨率：4MP",
+            usageMethod: scenario.usageMethod,
+            audience: "需要远程查看家中情况的独居者",
+            scenes: "室内家庭安防",
+            sellingPoints: "",
+            visualEvidence: scenario.visualEvidence,
+            evidenceQuotes: {
+              sku: [],
+              coreFunctions: ["Pet/Dog/Cat Camera"],
+              productParameters: ["4MP"],
+              usageMethod: scenario.usageQuotes,
+              audience: ["Quickly connect to your 2.4GHz WiFi with the Phone App"],
+              scenes: [cameraPageTitle],
+            },
+          });
+        }
+        return new Response(structuredCameraPage(), { status: 200 });
+      },
+    };
+
+    const result = await parser.parsePublicProductPage(cameraUrl, { productName: "室内摄像头", pid: cameraPid });
+    assert.deepEqual(result.coreFunctions, ["宠物看护"]);
+    assert.match(result.productParameters, /视频捕捉分辨率：2\.5K/);
+    assert.doesNotMatch(result.productParameters, /4MP/);
+    assert.equal(result.scenes, "室内家庭安防");
+    assert.equal(result.usageMethod, "", "a mismatched or self-authored quote must clear the whole field");
+    assert.equal(result.audience, "", "remote access cannot imply a person living alone");
+  }
+});
+
+test("visual completion status is recomputed after a grounded text retry", async () => {
+  let chatCalls = 0;
+  globalThis.__productParserTestHooks = {
+    fetchWithProxy: async (url) => {
+      if (String(url).includes("/chat/completions")) {
+        chatCalls += 1;
+        if (chatCalls === 1) {
+          return qwenProductResponse({
+            coreFunctions: [],
+            productParameters: "",
+            usageMethod: "",
+            audience: "",
+            scenes: "",
+            visualEvidence: "Visible image label: 2.4GHz Wi-Fi",
+            evidenceQuotes: {},
+          });
+        }
+        return qwenProductResponse({
+          coreFunctions: ["宠物看护"],
+          productParameters: "分辨率：4MP",
+          usageMethod: "通过手机App连接2.4GHz Wi-Fi",
+          audience: "",
+          scenes: "",
+          visualEvidence: "",
+          evidenceQuotes: {
+            coreFunctions: ["Pet/Dog/Cat Camera"],
+            productParameters: ["4MP"],
+            usageMethod: ["Quickly connect to your 2.4GHz WiFi with the Phone App"],
+          },
+        });
+      }
+      return new Response(structuredCameraPage(), { status: 200 });
+    },
+  };
+
+  const result = await parser.parsePublicProductPage(cameraUrl, { productName: "室内摄像头", pid: cameraPid });
+  assert.equal(chatCalls, 2);
+  assert.equal(result.visualAnalysisStatus, "completed");
+  assert.match(result.visualEvidence, /2\.4GHz Wi-Fi/);
+});
+
+test("unknown, compound, negated, and partial-numeric claims cannot borrow real quotes", async () => {
+  for (const scenario of [
+    { productParameters: "颜色：蓝色", quote: "2.5K Ultra HD + Night Vision" },
+    { productParameters: "分辨率：蓝色", quote: "2.5K Ultra HD + Night Vision" },
+    { productParameters: "分辨率：2K", quote: "2.5K Ultra HD + Night Vision" },
+    { productParameters: "支持Wi-Fi：5GHz", quote: "5GHz Wi-Fi is not supported" },
+    { productParameters: "支持Wi-Fi：5GHz", quote: "5GHz Wi-Fi won't work" },
+    { productParameters: "室内防火", quote: cameraPageTitle },
+    { productParameters: "材质：硅胶", quote: "Material: ABS" },
+    { productParameters: "支持快充", quote: "Charging supported" },
+    { productParameters: "电池续航", quote: "Battery: Lithium" },
+    { productParameters: "智能监控", quote: "Pet camera" },
+    { productParameters: "增强夜视", quote: "Night Vision" },
+    { productParameters: "实时监控", quote: "Pet camera" },
+    { productParameters: "清晰夜视", quote: "Night Vision" },
+    { productParameters: "平滑云台", quote: "Pan Tilt" },
+  ]) {
+    globalThis.__productParserTestHooks = {
+      fetchWithProxy: async (url) => {
+        if (String(url).includes("/chat/completions")) {
+          return qwenProductResponse({
+            coreFunctions: ["宠物看护"],
+            productParameters: scenario.productParameters,
+            usageMethod: "通过手机App连接2.4GHz Wi-Fi",
+            audience: "",
+            scenes: "",
+            visualEvidence: "",
+            evidenceQuotes: {
+              coreFunctions: ["Pet/Dog/Cat Camera"],
+              productParameters: [scenario.quote],
+              usageMethod: ["Quickly connect to your 2.4GHz WiFi with the Phone App"],
+            },
+          });
+        }
+        return new Response(structuredCameraPage(), { status: 200 });
+      },
+    };
+    const result = await parser.parsePublicProductPage(cameraUrl, { productName: "室内摄像头", pid: cameraPid });
+    assert.notEqual(result.productParameters, scenario.productParameters);
+    assert.doesNotMatch(JSON.stringify(result), /颜色：蓝色|分辨率：蓝色|分辨率：2K(?:\D|$)|支持Wi-Fi：5GHz|室内防火|材质：硅胶|支持快充|电池续航|智能监控|增强夜视|实时监控|清晰夜视|平滑云台/);
+  }
+});
+
+test("product parameters are deterministically bound to exact router property pairs", async () => {
+  const maliciousDescription = [
+    "Material: ABS. Compatible with silicone mats.",
+    "Power Source: Battery. Corded electric accessory sold separately.",
+    "Plug Type: EU plug. US plug adapter sold separately.",
+  ];
+  globalThis.__productParserTestHooks = {
+    fetchWithProxy: async (url) => {
+      if (String(url).includes("/chat/completions")) {
+        return qwenProductResponse({
+          coreFunctions: ["宠物看护"],
+          productParameters: "材质：硅胶；电源类型：有线电动；插头类型：美标插头",
+          usageMethod: "通过手机App连接2.4GHz Wi-Fi",
+          audience: "",
+          scenes: "",
+          visualEvidence: "",
+          evidenceQuotes: {
+            coreFunctions: ["Pet/Dog/Cat Camera"],
+            productParameters: maliciousDescription,
+            usageMethod: ["Quickly connect to your 2.4GHz WiFi with the Phone App"],
+          },
+        });
+      }
+      return new Response(structuredCameraPage({
+        descriptionTexts: [
+          "Pet/Dog/Cat Camera",
+          "Quickly connect to your 2.4GHz WiFi with the Phone App",
+          ...maliciousDescription,
+        ],
+        productProperties: [
+          { property_name: "Material", property_values: [{ property_value_name: "ABS" }] },
+          { property_name: "Power Source", property_values: [{ property_value_name: "Battery Powered" }] },
+          { property_name: "Plug Type", property_values: [{ property_value_name: "EU plug" }] },
+        ],
+      }), { status: 200 });
+    },
+  };
+  const result = await parser.parsePublicProductPage(cameraUrl, { productName: "室内摄像头", pid: cameraPid });
+  assert.equal(result.productParameters, "材质：ABS；电源类型：电池供电；插头类型：欧标插头");
+  assert.doesNotMatch(result.productParameters, /硅胶|有线电动|美标/);
+});
+
+test("an off instruction cannot certify the opposite on instruction", async () => {
+  globalThis.__productParserTestHooks = {
+    fetchWithProxy: async (url) => {
+      if (String(url).includes("/chat/completions")) {
+        return qwenProductResponse({
+          coreFunctions: ["宠物看护"],
+          productParameters: "分辨率：4MP",
+          usageMethod: "一键开启监控",
+          audience: "",
+          scenes: "",
+          visualEvidence: "",
+          evidenceQuotes: {
+            coreFunctions: ["Pet/Dog/Cat Camera"],
+            productParameters: ["4MP"],
+            usageMethod: ["Tap once to instantly turn off the camera"],
+          },
+        });
+      }
+      return new Response(structuredCameraPage({
+        descriptionTexts: [
+          "2.5K Ultra HD + Night Vision",
+          "Pet/Dog/Cat Camera",
+          "Tap once to instantly turn off the camera",
+        ],
+      }), { status: 200 });
+    },
+  };
+  const result = await parser.parsePublicProductPage(cameraUrl, { productName: "室内摄像头", pid: cameraPid });
+  assert.notEqual(result.usageMethod, "一键开启监控");
+});
+
+test("an AI-generated SKU cannot borrow an unrelated exact-page quote", async () => {
+  globalThis.__productParserTestHooks = {
+    fetchWithProxy: async (url) => {
+      if (String(url).includes("/chat/completions")) {
+        return qwenProductResponse({
+          sku: "FAKE-SKU",
+          coreFunctions: ["宠物看护"],
+          productParameters: "分辨率：4MP",
+          usageMethod: "通过手机App连接2.4GHz Wi-Fi",
+          audience: "",
+          scenes: "",
+          visualEvidence: "",
+          evidenceQuotes: {
+            sku: ["Pet/Dog/Cat Camera"],
+            coreFunctions: ["Pet/Dog/Cat Camera"],
+            productParameters: ["4MP"],
+            usageMethod: ["Quickly connect to your 2.4GHz WiFi with the Phone App"],
+          },
+        });
+      }
+      return new Response(structuredCameraPage({ skus: [] }), { status: 200 });
+    },
+  };
+  const result = await parser.parsePublicProductPage(cameraUrl, { productName: "室内摄像头", pid: cameraPid });
+  assert.equal(result.sku, "");
 });
 
 test("the production camera URL falls back safely when direct Qwen times out", async () => {
@@ -250,7 +499,7 @@ test("the production camera URL falls back safely when direct Qwen times out", a
   const result = await parser.parsePublicProductPage(cameraUrl, { productName: "室内摄像头", pid: cameraPid });
   assert.deepEqual(chatModes, ["visual"], "a usable deterministic candidate must prevent a redundant text retry");
   assert.deepEqual(result.coreFunctions, ["室内安防监控", "AI检测", "双向语音", "夜视"]);
-  assert.equal(result.productParameters, "分辨率：2.5K");
+  assert.match(result.productParameters, /视频捕捉分辨率：2\.5K/);
   assert.equal(result.scenes, "室内");
   assert.equal(result.sku, "");
   assert.equal(result.sourceDescription, "");
@@ -272,7 +521,7 @@ test("a valid but evidence-insufficient Qwen response uses the same camera fallb
   const result = await parser.parsePublicProductPage(cameraUrl, { productName: "室内摄像头", pid: cameraPid });
   assert.equal(chatCalls, 2);
   assert.deepEqual(result.coreFunctions, ["室内安防监控", "AI检测", "双向语音", "夜视"]);
-  assert.equal(result.productParameters, "分辨率：2.5K");
+  assert.match(result.productParameters, /视频捕捉分辨率：2\.5K/);
   assert.equal(result.scenes, "室内");
 });
 
@@ -290,7 +539,7 @@ test("camera fallback respects scoped negations without suppressing no-subscript
     { productName: "室内摄像头", pid: cameraPid },
   );
   assert.deepEqual(negated.coreFunctions, ["室内安防监控"]);
-  assert.equal(negated.productParameters, "分辨率：2.5K");
+  assert.match(negated.productParameters, /视频捕捉分辨率：2\.5K/);
   assert.equal(negated.scenes, "室内");
 
   const noSubscriptionSlug = "2-5k-indoor-security-camera-no-subscription-night-vision";
@@ -401,6 +650,7 @@ test("direct fallback ignores conflicting meta titles and fuzzy 2 5K router text
       return new Response(structuredCameraPage({
         pageTitle: fuzzyTitle,
         metaTitle: "CINMOORE 2.5K Indoor Security Camera with AI Detection - TikTok Shop",
+        productProperties: [],
       }), { status: 200 });
     },
   };

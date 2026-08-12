@@ -322,6 +322,14 @@ test("browser navigation permits only a same-PID official view endpoint as an in
   ]) assert.equal(parser.isTrustedProductNavigationHopUrl(sourceUrl, cameraPid), false, sourceUrl);
 });
 
+test("persistent browser recovery retries only an unavailable capture", () => {
+  assert.equal(parser.shouldRetryProductPageCapture(null), true);
+  assert.equal(parser.shouldRetryProductPageCapture({ errorCode: "page_unavailable" }), true);
+  assert.equal(parser.shouldRetryProductPageCapture({ errorCode: "page_incomplete" }), false);
+  assert.equal(parser.shouldRetryProductPageCapture({ errorCode: "all_product_images_unavailable" }), false);
+  assert.equal(parser.shouldRetryProductPageCapture({ errorCode: "", capture: {} }), false);
+});
+
 test("anonymous product fetch follows only trusted same-PID redirects", async () => {
   const url = `https://shop.tiktokw.us/us/pdp/${cameraPid}`;
   const trusted = `https://shop.tiktok.com/us/pdp/camera/${cameraPid}`;

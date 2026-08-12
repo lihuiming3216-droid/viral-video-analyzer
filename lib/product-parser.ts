@@ -152,6 +152,26 @@ function isTrustedProductNavigationUrl(sourceUrl: string, productId: string) {
   }
 }
 
+/**
+ * A same-PID TikTok view endpoint may be an intermediate browser hop, but it
+ * is never eligible as the final evidence URL. Final capture validation still
+ * requires an exact PDP through canonicalTrustedProductNavigationUrl().
+ */
+export function isTrustedProductNavigationHopUrl(sourceUrl: string, productId: string) {
+  if (isTrustedProductNavigationUrl(sourceUrl, productId)) return true;
+  try {
+    const url = new URL(sourceUrl);
+    if (url.protocol !== "https:" || url.username || url.password || url.port) return false;
+    if (url.hostname.toLowerCase() !== "www.tiktok.com") return false;
+    const productPath = officialTikTokProductPath(url);
+    if (!productPath || productPath.kind !== "view" || productPath.pid !== clean(productId)) return false;
+    return PRODUCT_ID_QUERY_KEYS.every((key) => url.searchParams.getAll(key)
+      .every((queryPid) => clean(queryPid) === clean(productId)));
+  } catch {
+    return false;
+  }
+}
+
 function isObviouslyPrivateNetworkUrl(sourceUrl: string) {
   try {
     const url = new URL(sourceUrl);
@@ -2169,7 +2189,7 @@ export function createProductPageCollectionDriver(page: Page): ProductPageCollec
         await page.route("**/*", async (route, request) => {
           const requestUrl = request.url();
           if (isObviouslyPrivateNetworkUrl(requestUrl)
-            || (request.isNavigationRequest() && !isTrustedProductNavigationUrl(requestUrl, expectedPid))) {
+            || (request.isNavigationRequest() && !isTrustedProductNavigationHopUrl(requestUrl, expectedPid))) {
             await route.abort("blockedbyclient");
             return;
           }

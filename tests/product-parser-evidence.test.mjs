@@ -262,6 +262,49 @@ test("collection rejects a final navigation outside the exact official PDP", asy
   assert.equal(probed, false);
 });
 
+test("collection accepts the trusted TikTok storefront alias and seals a canonical exact-PID capture", async () => {
+  const url = `https://shop.tiktok.com/us/pdp/${cameraPid}?source=anchor`;
+  const imageUrl = "https://p16-oec-va.ibyteimg.com/tos-maliva-i-o3syd03w52/camera.webp";
+  const stable = { atBottom: true, scrollHeight: 1800, detailHash: "same", productImageKeys: [imageUrl] };
+  const fake = collectionDriver({
+    html: structuredCameraPage(),
+    snapshots: [stable, stable, stable],
+    imageResults: new Map([[imageUrl, { dataUrl: "data:image/webp;base64,UklGRgQAAABXRUJQ" }]]),
+  });
+  fake.driver.navigate = async () => ({
+    ok: true,
+    finalUrl: `https://shop.tiktokw.us/us/pdp/${cameraPid}?source=anchor`,
+    status: 200,
+  });
+
+  const result = await parser.collectProductPageWithDriver(fake.driver, url, {
+    maxRounds: 3,
+    waitMilliseconds: 0,
+  });
+
+  assert.equal(result.errorCode, "");
+  assert.equal(result.capture.pid, cameraPid);
+  assert.equal(result.capture.canonicalUrl, `https://shop.tiktok.com/us/pdp/${cameraPid}`);
+});
+
+test("collection rejects trusted-host aliases with a conflicting PID or a non-official path", async () => {
+  const url = `https://shop.tiktok.com/us/pdp/${cameraPid}?source=anchor`;
+  const stable = { atBottom: true, scrollHeight: 1800, detailHash: "same", productImageKeys: [] };
+  for (const finalUrl of [
+    `https://shop.tiktokw.us/us/pdp/${cameraPid}?pid=1732364299482009896`,
+    `https://shop.tiktokw.us/us/product/${cameraPid}`,
+  ]) {
+    const fake = collectionDriver({
+      html: structuredCameraPage(),
+      snapshots: [stable, stable, stable],
+      imageResults: new Map(),
+    });
+    fake.driver.navigate = async () => ({ ok: true, finalUrl, status: 200 });
+    const result = await parser.collectProductPageWithDriver(fake.driver, url, { waitMilliseconds: 0 });
+    assert.equal(result.errorCode, "page_unavailable", finalUrl);
+  }
+});
+
 test("anonymous product fetch follows only trusted same-PID redirects", async () => {
   const url = `https://shop.tiktokw.us/us/pdp/${cameraPid}`;
   const trusted = `https://shop.tiktok.com/us/pdp/camera/${cameraPid}`;

@@ -171,6 +171,26 @@ export function productDocumentStableTitle(productName: string, pid: string) {
   return `${normalizedName.slice(0, prefixLength)}${suffix}`;
 }
 
+/** Rename a Docx without changing any template or user-authored blocks. */
+export async function renameProductCardDocument(
+  client: Client,
+  documentId: string,
+  productName: string,
+  pid: string,
+) {
+  const title = productDocumentStableTitle(productName, pid);
+  const response = await client.docx.v1.documentBlock.patch({
+    path: { document_id: documentId, block_id: documentId },
+    data: {
+      update_text_elements: {
+        elements: [{ text_run: { content: title } }],
+      },
+    },
+  });
+  productDocumentApiError(response, "重命名产品手卡失败");
+  return title;
+}
+
 function md(value: string | null | undefined) {
   return String(value || "—").replace(/([\\`*_{}\[\]()#+.!|>~-])/g, "\\$1");
 }

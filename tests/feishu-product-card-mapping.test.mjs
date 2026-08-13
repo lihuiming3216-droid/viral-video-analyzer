@@ -148,7 +148,7 @@ test("Base row product-card mappings migrate and upsert without requiring a PID"
   }
 });
 
-test("duplicate legacy document mappings are repaired and future claims are atomic", async () => {
+test("multiple Base rows may share the same PID document mapping", async () => {
   const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "viral-card-claim-"));
   const dataRoot = path.join(temporaryRoot, ".data");
   await mkdir(dataRoot, { recursive: true });
@@ -182,15 +182,14 @@ test("duplicate legacy document mappings are repaired and future claims are atom
   try {
     const earliest = database.getFeishuProductCardMapping({ appToken: "app", tableId: "table", recordId: "row-earliest" });
     const later = database.getFeishuProductCardMapping({ appToken: "app", tableId: "table", recordId: "row-later" });
-    assert.equal(earliest.documentId, "duplicate-doc", "the oldest row keeps the shared document claim");
-    assert.equal(later.documentId, null);
-    assert.equal(later.documentUrl, null, "repair only clears the losing row's document association");
+    assert.equal(earliest.documentId, "duplicate-doc");
+    assert.equal(later.documentId, "duplicate-doc", "same-PID rows retain the shared document mapping");
 
     const laterKey = { appToken: "app", tableId: "table", recordId: "row-later" };
     assert.equal(database.claimFeishuProductCardDocument(laterKey, {
       documentId: "duplicate-doc",
       documentUrl: "https://feishu.cn/docx/duplicate-doc",
-    }), false, "another row cannot claim an occupied document");
+    }), true, "another row may associate the same PID document");
     assert.equal(database.claimFeishuProductCardDocument(laterKey, {
       documentId: "later-doc",
       documentUrl: "https://feishu.cn/docx/later-doc",
@@ -202,8 +201,8 @@ test("duplicate legacy document mappings are repaired and future claims are atom
     assert.equal(database.claimFeishuProductCardDocument(laterKey, {
       documentId: "different-doc",
       documentUrl: "https://feishu.cn/docx/different-doc",
-    }), false, "a row with a document cannot silently switch claims");
-    assert.equal(database.getFeishuProductCardMapping(laterKey).documentId, "later-doc");
+    }), true, "a row mapping may be refreshed from the authoritative PID lookup");
+    assert.equal(database.getFeishuProductCardMapping(laterKey).documentId, "different-doc");
 
     const newKey = { appToken: "app", tableId: "table", recordId: "new-row" };
     assert.equal(database.claimFeishuProductCardDocument(newKey, {
@@ -214,8 +213,8 @@ test("duplicate legacy document mappings are repaired and future claims are atom
 
     const documentIndex = database.getDb().prepare(`SELECT sql FROM sqlite_master
       WHERE type='index' AND name='idx_feishu_product_card_mapping_document'`).get();
-    assert.match(String(documentIndex.sql), /UNIQUE INDEX/i);
-    assert.match(String(documentIndex.sql), /WHERE document_id IS NOT NULL/i);
+    assert.doesNotMatch(String(documentIndex.sql), /UNIQUE INDEX/i);
+    assert.match(String(documentIndex.sql), /ON feishu_product_card_mappings\(document_id\)/i);
   } finally {
     database.getDb().close();
     delete globalThis.__viralDb;

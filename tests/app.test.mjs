@@ -252,9 +252,9 @@ test("Feishu button creates a manual template card in the background without pro
   assert.match(route, /Every accepted click schedules one refresh/);
   assert.match(automation, /product-card-record:/);
   assert.doesNotMatch(automation, /canRelinkExistingDocument|cachedFallbackEligible|hasVerifiedCache/);
-  assert.match(automation, /ensureProductCardShell/);
+  assert.match(automation, /ensureProductCardByPid/);
   assert.match(automation, /Product-link analysis is intentionally disabled/);
-  assert.match(automation, /renameProductCardDocument/);
+  assert.match(automation, /exact `_PID` title suffix/);
   assert.doesNotMatch(automation, /parsePublicProductPage/);
   assert.match(automation, /\[resolved\.map\.productDocument\]: shell\.documentUrl/);
 });
@@ -272,7 +272,7 @@ test("generated Feishu documents grant company editors collaborator management",
   assert.match(permissionRoute, /getCompanyDocumentPermission/);
 });
 
-test("product cards use complete TikTok captures, OpenAI analysis, and safe document resync", async () => {
+test("product cards are created only by the Feishu button and identified by exact PID titles", async () => {
   const [parser, openaiAnalyzer, automation, document, database, ensureDocument, tiktokProduct] = await Promise.all([
     readFile(new URL("lib/product-parser.ts", root), "utf8"),
     readFile(new URL("lib/openai-product-analyzer.ts", root), "utf8"),
@@ -329,9 +329,10 @@ test("product cards use complete TikTok captures, OpenAI analysis, and safe docu
   assert.match(openaiAnalyzer, /titleHasAccessorySubject/);
   assert.match(openaiAnalyzer, /role: "developer"/);
   assert.match(automation, /const productUrl = urlField/);
-  assert.match(automation, /pid: suppliedPid \|\| extractedPid/);
-  assert.match(automation, /ensureProductCardShell\(input\.client/);
-  assert.match(automation, /renameProductCardDocument\(input\.client, shell\.documentId, effectiveName, effectivePid\)/);
+  assert.match(automation, /pid: suppliedPid/);
+  assert.doesNotMatch(automation, /extractProductIdFromUrl/);
+  assert.match(automation, /ensureProductCardByPid\(input\.client/);
+  assert.match(automation, /pid: effectivePid/);
   assert.match(automation, /手卡已就绪，请手动填写/);
   assert.doesNotMatch(automation, /parsePublicProductPage/);
   assert.doesNotMatch(automation, /syncProductCardManagedFields/);
@@ -339,11 +340,8 @@ test("product cards use complete TikTok captures, OpenAI analysis, and safe docu
   assert.doesNotMatch(automation, /patch\[resolved\.map\.productUrl\]/);
   assert.doesNotMatch(automation, /hyperlinkFieldValue/);
   assert.doesNotMatch(automation, /mergeVerifiedProductFacts/);
-  assert.match(ensureDocument, /forceProductParse === true/);
-  assert.match(ensureDocument, /const productUrl = String\(body\.productUrl \|\| ""\)\.trim\(\)/);
-  assert.match(ensureDocument, /isExactTikTokProductSource\(productUrl, pid\)/);
-  assert.doesNotMatch(ensureDocument, /canonicalTikTokProductUrl/);
-  assert.doesNotMatch(ensureDocument, /coreFunctions: \[\],[\s\S]*visualAnalyzedAt: null/);
+  assert.match(ensureDocument, /产品手卡只能通过飞书表格按钮生成或关联/);
+  assert.match(ensureDocument, /status: 410/);
   assert.match(database, /source_image_urls_json/);
   assert.match(database, /visual_analysis_status/);
   assert.match(database, /visual_analyzed_at/);
@@ -351,6 +349,9 @@ test("product cards use complete TikTok captures, OpenAI analysis, and safe docu
   assert.match(database, /feishu_product_card_mappings/);
   assert.match(database, /upsertFeishuProductCardMapping/);
   assert.match(document, /ensureProductCardShell/);
+  assert.match(document, /ensureProductCardByPid/);
+  assert.match(document, /findProductDocumentByPid/);
+  assert.match(document, /发现重复 PID 文档/);
   assert.match(document, /syncProductCardManagedFields/);
   assert.match(document, /PRODUCT_CARD_IDENTITY_LABELS/);
   assert.match(document, /PRODUCT_CARD_DERIVED_LABELS/);

@@ -2,16 +2,15 @@ import "server-only";
 
 import type { Client } from "@larksuiteoapi/node-sdk";
 import {
-  claimFeishuProductCardDocument, clearProductDocumentLink, createProduct, createVideo,
+  createProduct, createVideo,
   deleteFeishuAutomationJob, getFeishuAutomationJobs,
   getFeishuProductCardMapping, getProduct, getProductByPid, getVideo, getVideoBySourceUrl,
   listFeishuAutomationJobVideoIds, saveFeishuAutomationJob, updateProduct, updateVideo,
   upsertFeishuProductCardMapping,
 } from "@/lib/database";
 import { ensureFeishuConnection, getConnectedFeishuChannel } from "@/lib/feishu/runtime";
-import { ensureProductCardShell, renameProductCardDocument } from "@/lib/feishu/document";
+import { ensureProductCardByPid } from "@/lib/feishu/document";
 import { enqueueVideos } from "@/lib/queue";
-import { extractProductIdFromUrl } from "@/lib/product-parser";
 import { conciseProductDocAnalysis } from "@/lib/product-doc-analysis";
 
 export interface FeishuAutomationFieldMap {
@@ -67,9 +66,8 @@ function withProductCardRecordLock<T>(
   input: { appToken: string; tableId: string; recordId: string },
   operation: () => Promise<T> | T,
 ) {
-  // The Base coordinates, rather than PID, are the stable identity of a hand
-  // card. Holding this lock across template adoption, rename, mapping, and Base
-  // write-back prevents two clicks from creating competing row documents.
+  // Serialize repeated clicks for one Base row. Document creation itself also
+  // holds a PID lock so different rows with the same PID share one card.
   const stableKey = JSON.stringify([
     input.appToken.trim(),
     input.tableId.trim(),
@@ -139,16 +137,15 @@ export function resolveAutomationFields(
 ) {
   const map = { ...defaultFeishuAutomationFieldMap, ...inputMap };
   const productUrl = urlField(fields, map.productUrl, ["商品链接", "产品链接"]);
-  const extractedPid = extractProductIdFromUrl(productUrl);
   const suppliedPid = field(fields, map.pid, ["PID", "pid", "商品ID/PID"]);
   const documentField = inputMap.productDocument
     || ("产品手卡" in fields ? "产品手卡" : "产品文档" in fields ? "产品文档" : map.productDocument);
   return {
     map: { ...map, productDocument: documentField },
-    // Product-link analysis is disabled. Keep the link only as optional
-    // metadata, and prefer the explicit Base PID for document naming.
+    // Product-link analysis is disabled. The explicit Base PID is the only
+    // document identity; a number found inside an unrelated URL is never used.
     productUrl,
-    pid: suppliedPid || extractedPid,
+    pid: suppliedPid,
     suppliedPid,
     productName: field(fields, map.productName, ["商品名称", "产品名", "productName", "product_name"]),
     productDocument: urlField(fields, documentField, [map.productDocument, "产品手卡", "产品文档"]),
@@ -185,30 +182,6 @@ export async function updateProductCardStatus(input: {
     recordId: input.recordId,
     fields: { [input.fieldName?.trim() || "手卡状态"]: input.status.slice(0, 500) },
   });
-}
-
-function trustedExistingDocumentUrl(value: string) {
-  if (!value) return "";
-  try {
-    const url = new URL(value);
-    const host = url.hostname.toLowerCase();
-    return url.protocol === "https:"
-      && (host === "feishu.cn" || host.endsWith(".feishu.cn")
-        || host === "larksuite.com" || host.endsWith(".larksuite.com"))
-      && /^\/docx\/[A-Za-z0-9_-]+\/?$/.test(url.pathname)
-      ? value
-      : "";
-  } catch {
-    return "";
-  }
-}
-
-function productDocumentIdFromUrl(value: string) {
-  try {
-    return decodeURIComponent(new URL(value).pathname.match(/^\/docx\/([A-Za-z0-9_-]+)\/?$/)?.[1] || "");
-  } catch {
-    return "";
-  }
 }
 
 function safeAutomationFailure(error: unknown) {
@@ -390,43 +363,20 @@ async function handleFeishuAutomationUnlocked(input: FeishuAutomationInput) {
     tableId: input.tableId,
     recordId: input.recordId,
   };
-  let mappingBefore = getFeishuProductCardMapping(mappingKey);
   const effectivePid = resolved.pid.trim();
   const effectiveName = resolved.productName.trim();
   if (!effectiveName) throw new Error("缺少产品名称，无法按“产品名称_PID”命名手卡");
   if (!effectivePid) throw new Error("缺少商品 PID，无法按“产品名称_PID”命名手卡");
+  if (!/^\d+$/.test(effectivePid)) throw new Error("商品 PID 格式不正确，必须只包含数字");
 
-  const suppliedDocumentUrl = trustedExistingDocumentUrl(resolved.productDocument);
-  let shellDocumentId = mappingBefore?.documentId || "";
-  let shellDocumentUrl = mappingBefore?.documentUrl || "";
-  if (!shellDocumentId && suppliedDocumentUrl) {
-    const suppliedDocumentId = productDocumentIdFromUrl(suppliedDocumentUrl);
-    if (suppliedDocumentId && claimFeishuProductCardDocument(mappingKey, {
-      documentId: suppliedDocumentId,
-      documentUrl: suppliedDocumentUrl,
-    })) {
-      shellDocumentId = suppliedDocumentId;
-      shellDocumentUrl = suppliedDocumentUrl;
-      mappingBefore = getFeishuProductCardMapping(mappingKey);
-    }
-  }
-
-  const shell = await ensureProductCardShell(input.client, {
-    recordKey: mappingKey,
-    existingDocumentId: shellDocumentId || null,
-    existingDocumentUrl: shellDocumentUrl || null,
+  // Only an explicit Feishu button click reaches this handler. The product
+  // folder and exact `_PID` title suffix are authoritative; row fields and
+  // cached mappings never select or create a document.
+  const shell = await ensureProductCardByPid(input.client, {
     name: effectiveName,
-    deferIdentity: true,
+    pid: effectivePid,
   });
   documentUrl = shell.documentUrl;
-  if (!shellDocumentId) {
-    const claimed = claimFeishuProductCardDocument(mappingKey, {
-      documentId: shell.documentId,
-      documentUrl: shell.documentUrl,
-    });
-    if (!claimed) throw new Error("当前飞书记录的产品手卡与其他记录冲突，已停止关联");
-    mappingBefore = getFeishuProductCardMapping(mappingKey);
-  }
 
   productCardWarning = [shell.permissionWarning, shell.ownershipWarning]
     .filter(Boolean)
@@ -434,9 +384,8 @@ async function handleFeishuAutomationUnlocked(input: FeishuAutomationInput) {
     .join("；");
 
   // Product-link analysis is intentionally disabled. The button now only
-  // creates/adopts the row's template document, renames it, and returns it for
+  // creates/adopts the PID's template document, renames it, and returns it for
   // manual editing. No template block or user-authored content is modified.
-  await renameProductCardDocument(input.client, shell.documentId, effectiveName, effectivePid);
   queuePatch({ [resolved.map.productDocument]: shell.documentUrl });
   await flushPatch();
 
@@ -447,9 +396,8 @@ async function handleFeishuAutomationUnlocked(input: FeishuAutomationInput) {
         name: effectiveName,
         pid: effectivePid,
         productUrl: resolved.productUrl,
-        ...(!current.documentId || !current.documentUrl
-          ? { documentId: shell.documentId, documentUrl: shell.documentUrl }
-          : {}),
+        documentId: shell.documentId,
+        documentUrl: shell.documentUrl,
       }) || current;
     }
     return createProduct({
@@ -462,13 +410,6 @@ async function handleFeishuAutomationUnlocked(input: FeishuAutomationInput) {
   });
   if (!product) throw new Error("创建产品档案失败");
 
-  const previouslyMappedProduct = mappingBefore?.productId
-    && mappingBefore.productId !== product.id
-    ? getProduct(mappingBefore.productId)
-    : null;
-  if (previouslyMappedProduct?.documentId === shell.documentId) {
-    clearProductDocumentLink(previouslyMappedProduct.id);
-  }
   upsertFeishuProductCardMapping({
     ...mappingKey,
     productId: product.id,

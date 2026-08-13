@@ -251,15 +251,15 @@ test("a lost copy response is recovered by stable-title adoption", async () => {
   assert.equal(recovered.reused, true);
 });
 
-test("long product names keep distinct PID suffixes and never adopt another PID's document", async () => {
+test("long product names remain exact and never adopt another PID's document", async () => {
   const longName = "相同超长商品名称前缀".repeat(20);
   const firstPid = "1732507663809155961";
   const secondPid = "1732507663809155962";
   const firstTitle = documentModule.productDocumentStableTitle(longName, firstPid);
   const secondTitle = documentModule.productDocumentStableTitle(longName, secondPid);
 
-  assert.equal(firstTitle.length, 90);
-  assert.equal(secondTitle.length, 90);
+  assert.equal(firstTitle, `${longName}_${firstPid}`);
+  assert.equal(secondTitle, `${longName}_${secondPid}`);
   assert.ok(firstTitle.endsWith(`_${firstPid}`));
   assert.ok(secondTitle.endsWith(`_${secondPid}`));
   assert.notEqual(firstTitle, secondTitle);

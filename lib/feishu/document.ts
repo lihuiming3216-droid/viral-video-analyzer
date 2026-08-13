@@ -161,14 +161,13 @@ export function productDocumentShellStableTitle(
   return `${normalizedName.slice(0, prefixLength)}${suffix}`;
 }
 
-/** Keep the PID suffix intact when a long product name must be truncated. */
+/** The manual-card contract requires the Docx title to be exactly 产品名称_PID. */
 export function productDocumentStableTitle(productName: string, pid: string) {
-  const normalizedPid = sanitizedName(pid);
+  const normalizedPid = pid.trim();
   if (!normalizedPid) throw new Error("创建产品文档前必须有 PID");
-  const suffix = `_${normalizedPid}`;
-  const normalizedName = sanitizedName(productName) || "未命名";
-  const prefixLength = Math.max(1, 90 - suffix.length);
-  return `${normalizedName.slice(0, prefixLength)}${suffix}`;
+  const normalizedName = productName.trim();
+  if (!normalizedName) throw new Error("创建产品文档前必须有产品名称");
+  return `${normalizedName}_${normalizedPid}`;
 }
 
 /** Rename a Docx without changing any template or user-authored blocks. */
@@ -655,6 +654,52 @@ async function findProductDocumentByTitleSuffix(client: Client, folderToken: str
   return null;
 }
 
+async function findProductDocumentByPid(
+  client: Client,
+  folderToken: string,
+  pid: string,
+) {
+  const normalizedPid = sanitizedName(pid);
+  if (!normalizedPid) throw new Error("查找产品手卡前必须有 PID");
+  const suffix = `_${normalizedPid}`;
+  const matches: Array<{ documentId: string; documentUrl: string; title: string; type: string }> = [];
+  let pageToken: string | undefined;
+  do {
+    let response: Awaited<ReturnType<typeof client.drive.v1.file.list>>;
+    try {
+      response = await client.drive.v1.file.list({
+        params: {
+          folder_token: folderToken,
+          page_size: 200,
+          order_by: "EditedTime",
+          direction: "DESC",
+          ...(pageToken ? { page_token: pageToken } : {}),
+        },
+      });
+    } catch (error) {
+      throw productDocumentOperationError("按 PID 查找产品手卡失败", error);
+    }
+    productDocumentApiError(response, "按 PID 查找产品手卡失败");
+    for (const file of response.data?.files || []) {
+      const title = file.name?.trim() || "";
+      if (file.type !== "docx" || !file.token || !title.endsWith(suffix) || title.length <= suffix.length) continue;
+      matches.push({
+        documentId: file.token,
+        documentUrl: file.url || `https://feishu.cn/docx/${file.token}`,
+        title,
+        type: "docx",
+      });
+    }
+    if (!response.data?.has_more) break;
+    pageToken = response.data.next_page_token?.trim();
+    if (!pageToken) throw new Error("按 PID 查找产品手卡失败：飞书分页结果缺少下一页 Token");
+  } while (pageToken);
+  if (matches.length > 1) {
+    throw new Error(`发现重复 PID 文档（${normalizedPid}），请人工处理后重试`);
+  }
+  return matches[0] || null;
+}
+
 function productDocumentTokenFromUrl(documentUrl: string) {
   try {
     const url = new URL(documentUrl);
@@ -680,6 +725,85 @@ export type EnsureProductCardShellInput = {
   /** Let a two-stage caller clear stale derived fields before changing identity. */
   deferIdentity?: boolean;
 };
+
+export type EnsureProductCardByPidInput = {
+  name: string;
+  pid: string;
+  templateToken?: string;
+  ownerOpenId?: string;
+};
+
+/**
+ * The Feishu button is the sole product-card creation entrypoint. A card is
+ * identified only by the exact `_PID` title suffix in the configured product
+ * folder. Row mappings are caches and are deliberately not consulted here.
+ */
+export async function ensureProductCardByPid(
+  client: Client,
+  input: EnsureProductCardByPidInput,
+) {
+  const name = input.name.trim();
+  const pid = input.pid.trim();
+  if (!name) throw new Error("缺少产品名称，无法按“产品名称_PID”命名手卡");
+  if (!pid) throw new Error("缺少商品 PID，无法按“产品名称_PID”命名手卡");
+  if (!/^\d+$/.test(pid)) throw new Error("商品 PID 格式不正确，必须只包含数字");
+  const title = productDocumentStableTitle(name, pid);
+  return withProductDocumentLock(`pid_${sanitizedName(pid)}`, async () => {
+    const settings = getFeishuSettings();
+    const productFolderToken = requiredToken(
+      settings.productFolderToken,
+      "飞书产品文档文件夹配置，请先配置“产品说明文档”文件夹",
+    );
+    const existing = await findProductDocumentByPid(client, productFolderToken, pid);
+    const document = existing || await copyFeishuTemplateDocument(client, {
+      templateToken: input.templateToken?.trim()
+        || process.env.FEISHU_PRODUCT_TEMPLATE_TOKEN?.trim()
+        || defaultProductTemplateToken,
+      name: title,
+      folderToken: productFolderToken,
+    });
+
+    // Existing documents are also normalized so the title is always exactly
+    // `产品名称_PID`. This patch changes only the Docx title, never its body.
+    await renameProductCardDocument(client, document.documentId, name, pid);
+
+    let permissionWarning = "";
+    try { await setCompanyManaged(client, document.documentId); }
+    catch (error) { permissionWarning = error instanceof Error ? error.message : "设置公司内管理权限失败"; }
+    let ownershipWarning = "";
+    let migration = {
+      moved: false,
+      ownershipTransferred: false,
+      ownerId: "",
+      ownerMemberType: "" as "" | "openid",
+      ownerSource: "" as "" | "input" | "environment",
+      folderName: "",
+    };
+    try {
+      const owner = await resolveProductFolderOwner(client, productFolderToken, input.ownerOpenId);
+      const ownershipTransferred = await ensureProductDocumentOwner(client, document.documentId, owner);
+      migration = {
+        moved: false,
+        ownershipTransferred,
+        ownerId: owner.ownerId,
+        ownerMemberType: owner.ownerMemberType,
+        ownerSource: owner.ownerSource,
+        folderName: owner.folderName,
+      };
+    } catch (error) {
+      ownershipWarning = error instanceof Error ? error.message : "设置产品手卡所有者失败";
+    }
+    return {
+      ...document,
+      title,
+      reused: Boolean(existing),
+      permissionWarning,
+      identityWarning: "",
+      ownershipWarning,
+      migration,
+    };
+  });
+}
 
 function suppliedProductCardDocument(input: EnsureProductCardShellInput) {
   const documentId = String(input.existingDocumentId || "").trim();
@@ -908,8 +1032,9 @@ export async function copyFeishuTemplateDocument(
   input: { templateToken: string; name: string; folderToken?: string },
 ) {
   const templateToken = input.templateToken.trim();
-  const name = safeName(input.name);
+  const name = input.name.trim();
   if (!templateToken) throw new Error("缺少飞书模板文档 Token");
+  if (!name) throw new Error("缺少飞书模板文档名称");
 
   let response: {
     code?: number;

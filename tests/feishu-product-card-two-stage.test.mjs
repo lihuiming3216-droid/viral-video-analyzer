@@ -361,7 +361,13 @@ function shellClient() {
       throw new Error(`unexpected request: ${url}`);
     },
     docx: {
-      v1: { documentBlock: { patch: async () => ({ code: 0 }) } },
+      v1: { documentBlock: { patch: async ({ path, data }) => {
+        if (state.file && path.document_id === state.file.token && path.block_id === state.file.token
+          && data.update_text_elements) {
+          state.file.name = data.update_text_elements.elements[0].text_run.content;
+        }
+        return { code: 0 };
+      } } },
     },
     drive: {
       v2: { permissionPublic: { patch: async () => ({ code: 0 }) } },
@@ -439,6 +445,55 @@ test("a stable Base record creates and reuses a shell without a PID or valid pro
   await assert.rejects(
     documentModule.ensureProductCardShell(client, { name: "没有稳定键" }),
     /需要记录稳定键或已有文档/,
+  );
+});
+
+test("PID lookup shares one card across rows and always normalizes productName_PID", async () => {
+  globalThis.__productCardDocumentTestHooks = {
+    getFeishuSettings: () => ({ productFolderToken: "folder-token" }),
+  };
+  const { client, state } = shellClient();
+  const pid = "1731234567890123456";
+  const created = await documentModule.ensureProductCardByPid(client, {
+    name: "血压仪大号",
+    pid,
+    ownerOpenId: "ou_owner",
+  });
+  assert.equal(created.reused, false);
+  assert.equal(created.title, `血压仪大号_${pid}`);
+  assert.equal(state.file.name, `血压仪大号_${pid}`);
+  assert.equal(state.copyCount, 1);
+
+  const reused = await documentModule.ensureProductCardByPid(client, {
+    name: "血压仪新名称",
+    pid,
+    ownerOpenId: "ou_owner",
+  });
+  assert.equal(reused.reused, true);
+  assert.equal(reused.documentId, created.documentId);
+  assert.equal(state.file.name, `血压仪新名称_${pid}`);
+  assert.equal(state.copyCount, 1, "the second Base row must reuse the exact PID document");
+});
+
+test("duplicate documents with the same complete PID stop instead of guessing", async () => {
+  globalThis.__productCardDocumentTestHooks = {
+    getFeishuSettings: () => ({ productFolderToken: "folder-token" }),
+  };
+  const { client } = shellClient();
+  const pid = "1731234567890123456";
+  client.drive.v1.file.list = async () => ({
+    code: 0,
+    data: {
+      has_more: false,
+      files: [
+        { token: "first", name: `产品A_${pid}`, type: "docx" },
+        { token: "second", name: `产品B_${pid}`, type: "docx" },
+      ],
+    },
+  });
+  await assert.rejects(
+    documentModule.ensureProductCardByPid(client, { name: "产品A", pid, ownerOpenId: "ou_owner" }),
+    /发现重复 PID 文档/,
   );
 });
 

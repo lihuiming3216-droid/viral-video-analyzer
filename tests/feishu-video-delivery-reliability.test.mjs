@@ -53,8 +53,7 @@ async function loadAutomationModule() {
     export const upsertFeishuProductCardMapping = () => null;
     export const ensureFeishuConnection = (...args) => hooks().ensureFeishuConnection?.(...args) || null;
     export const getConnectedFeishuChannel = (...args) => hooks().getConnectedFeishuChannel?.(...args) || null;
-    export const ensureProductCardShell = () => null;
-    export const renameProductCardDocument = () => "产品_PID";
+    export const ensureProductCardByPid = () => null;
     export const syncProductCardManagedFields = () => null;
     export const enqueueVideos = () => undefined;
     export const extractProductIdFromUrl = () => "";

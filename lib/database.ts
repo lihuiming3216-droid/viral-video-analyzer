@@ -437,26 +437,12 @@ function initialize(db: DatabaseSync) {
         updated_at=CASE WHEN COALESCE(updated_at, '')='' THEN ? ELSE updated_at END
     WHERE COALESCE(created_at, '')='' OR COALESCE(updated_at, '')=''`)
     .run(mappingTimestamp, mappingTimestamp);
-  db.prepare(`WITH ranked_documents AS (
-      SELECT rowid AS mapping_rowid,
-        ROW_NUMBER() OVER (
-          PARTITION BY document_id
-          ORDER BY created_at, app_token, table_id, record_id
-        ) AS document_rank
-      FROM feishu_product_card_mappings
-      WHERE document_id IS NOT NULL AND TRIM(document_id) <> ''
-    )
-    UPDATE feishu_product_card_mappings
-    SET document_id=NULL, document_url=NULL, updated_at=?
-    WHERE rowid IN (
-      SELECT mapping_rowid FROM ranked_documents WHERE document_rank > 1
-    )`).run(mappingTimestamp);
   db.exec(`
+    DROP INDEX IF EXISTS idx_feishu_product_card_mapping_document;
     CREATE UNIQUE INDEX IF NOT EXISTS idx_feishu_product_card_mapping_row
       ON feishu_product_card_mappings(app_token, table_id, record_id);
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_feishu_product_card_mapping_document
-      ON feishu_product_card_mappings(document_id)
-      WHERE document_id IS NOT NULL AND TRIM(document_id) <> '';
+    CREATE INDEX IF NOT EXISTS idx_feishu_product_card_mapping_document
+      ON feishu_product_card_mappings(document_id);
     CREATE INDEX IF NOT EXISTS idx_feishu_product_card_mapping_product
       ON feishu_product_card_mappings(product_id);
     CREATE INDEX IF NOT EXISTS idx_feishu_product_card_mapping_pid
@@ -609,24 +595,11 @@ export function claimFeishuProductCardDocument(
     const current = db.prepare(`SELECT document_id FROM feishu_product_card_mappings
       WHERE app_token=? AND table_id=? AND record_id=?`)
       .get(appToken, tableId, recordId) as Record<string, unknown> | undefined;
-    const currentDocumentId = current?.document_id ? String(current.document_id) : "";
-    if (currentDocumentId) {
-      db.exec("COMMIT");
-      return currentDocumentId === documentId;
-    }
-    const occupied = db.prepare(`SELECT 1 AS occupied FROM feishu_product_card_mappings
-      WHERE document_id=? AND NOT (app_token=? AND table_id=? AND record_id=?)
-      LIMIT 1`).get(documentId, appToken, tableId, recordId);
-    if (occupied) {
-      db.exec("ROLLBACK");
-      return false;
-    }
     const timestamp = now();
     if (current) {
       db.prepare(`UPDATE feishu_product_card_mappings
         SET document_id=?, document_url=?, updated_at=?
-        WHERE app_token=? AND table_id=? AND record_id=?
-          AND (document_id IS NULL OR TRIM(document_id)='')`)
+        WHERE app_token=? AND table_id=? AND record_id=?`)
         .run(documentId, documentUrl, timestamp, appToken, tableId, recordId);
     } else {
       db.prepare(`INSERT INTO feishu_product_card_mappings(

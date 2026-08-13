@@ -240,7 +240,7 @@ test("Feishu automation supports direct Base write-back", async () => {
   assert.match(route, /writeBackError/);
 });
 
-test("Feishu button automation acknowledges immediately and writes back in the background", async () => {
+test("Feishu button creates a manual template card in the background without product-link analysis", async () => {
   const [automation, route] = await Promise.all([
     readFile(new URL("lib/feishu/automation.ts", root), "utf8"),
     readFile(new URL("app/api/feishu/automation/route.ts", root), "utf8"),
@@ -253,8 +253,9 @@ test("Feishu button automation acknowledges immediately and writes back in the b
   assert.match(automation, /product-card-record:/);
   assert.doesNotMatch(automation, /canRelinkExistingDocument|cachedFallbackEligible|hasVerifiedCache/);
   assert.match(automation, /ensureProductCardShell/);
-  assert.match(automation, /Every click performs a new exact-link\/PID parse/);
-  assert.match(automation, /parsePublicProductPage\(resolved\.productUrl/);
+  assert.match(automation, /Product-link analysis is intentionally disabled/);
+  assert.match(automation, /renameProductCardDocument/);
+  assert.doesNotMatch(automation, /parsePublicProductPage/);
   assert.match(automation, /\[resolved\.map\.productDocument\]: shell\.documentUrl/);
 });
 
@@ -328,18 +329,16 @@ test("product cards use complete TikTok captures, OpenAI analysis, and safe docu
   assert.match(openaiAnalyzer, /titleHasAccessorySubject/);
   assert.match(openaiAnalyzer, /role: "developer"/);
   assert.match(automation, /const productUrl = urlField/);
-  assert.match(automation, /const pid = extractProductIdFromUrl\(productUrl\)/);
+  assert.match(automation, /pid: suppliedPid \|\| extractedPid/);
   assert.match(automation, /ensureProductCardShell\(input\.client/);
-  assert.match(automation, /手卡已就绪，资料刷新中/);
-  assert.match(automation, /productCardFailureStatus/);
-  assert.match(automation, /资料\$\{analysisFailure \? "分析" : "刷新"\}失败/);
-  assert.match(automation, /syncProductCardManagedFields/);
-  assert.match(automation, /clearDerived: true/);
+  assert.match(automation, /renameProductCardDocument\(input\.client, shell\.documentId, effectiveName, effectivePid\)/);
+  assert.match(automation, /手卡已就绪，请手动填写/);
+  assert.doesNotMatch(automation, /parsePublicProductPage/);
+  assert.doesNotMatch(automation, /syncProductCardManagedFields/);
   assert.doesNotMatch(automation, /productUrlFromPid\(pid\)/);
   assert.doesNotMatch(automation, /patch\[resolved\.map\.productUrl\]/);
   assert.doesNotMatch(automation, /hyperlinkFieldValue/);
-  assert.match(automation, /mergeVerifiedProductFacts/);
-  assert.match(automation, /verifiedAt: new Date\(\)\.toISOString\(\)/);
+  assert.doesNotMatch(automation, /mergeVerifiedProductFacts/);
   assert.match(ensureDocument, /forceProductParse === true/);
   assert.match(ensureDocument, /const productUrl = String\(body\.productUrl \|\| ""\)\.trim\(\)/);
   assert.match(ensureDocument, /isExactTikTokProductSource\(productUrl, pid\)/);

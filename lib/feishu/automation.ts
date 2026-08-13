@@ -5,15 +5,14 @@ import {
   claimFeishuProductCardDocument, clearProductDocumentLink, createProduct, createVideo,
   deleteFeishuAutomationJob, getFeishuAutomationJobs,
   getFeishuProductCardMapping, getProduct, getProductByPid, getVideo, getVideoBySourceUrl,
-  listFeishuAutomationJobVideoIds, mergeVerifiedProductFacts, saveFeishuAutomationJob, updateProduct, updateVideo,
+  listFeishuAutomationJobVideoIds, saveFeishuAutomationJob, updateProduct, updateVideo,
   upsertFeishuProductCardMapping,
 } from "@/lib/database";
 import { ensureFeishuConnection, getConnectedFeishuChannel } from "@/lib/feishu/runtime";
-import { ensureProductCardShell, syncProductCardManagedFields } from "@/lib/feishu/document";
+import { ensureProductCardShell, renameProductCardDocument } from "@/lib/feishu/document";
 import { enqueueVideos } from "@/lib/queue";
-import { extractProductIdFromUrl, isExactTikTokProductSource, parsePublicProductPage } from "@/lib/product-parser";
+import { extractProductIdFromUrl } from "@/lib/product-parser";
 import { conciseProductDocAnalysis } from "@/lib/product-doc-analysis";
-import { isTikTokUrl } from "@/lib/tiktok-product";
 
 export interface FeishuAutomationFieldMap {
   productUrl: string;
@@ -69,8 +68,8 @@ function withProductCardRecordLock<T>(
   operation: () => Promise<T> | T,
 ) {
   // The Base coordinates, rather than PID, are the stable identity of a hand
-  // card. Holding this lock across read -> parse -> DB merge -> document sync
-  // prevents two clicks on one row from publishing different partial snapshots.
+  // card. Holding this lock across template adoption, rename, mapping, and Base
+  // write-back prevents two clicks from creating competing row documents.
   const stableKey = JSON.stringify([
     input.appToken.trim(),
     input.tableId.trim(),
@@ -140,17 +139,16 @@ export function resolveAutomationFields(
 ) {
   const map = { ...defaultFeishuAutomationFieldMap, ...inputMap };
   const productUrl = urlField(fields, map.productUrl, ["商品链接", "产品链接"]);
-  const pid = extractProductIdFromUrl(productUrl);
+  const extractedPid = extractProductIdFromUrl(productUrl);
   const suppliedPid = field(fields, map.pid, ["PID", "pid", "商品ID/PID"]);
   const documentField = inputMap.productDocument
     || ("产品手卡" in fields ? "产品手卡" : "产品文档" in fields ? "产品文档" : map.productDocument);
   return {
     map: { ...map, productDocument: documentField },
-    // The exact PDP URL is the source of truth. Generic /view/product links
-    // are less reliable on the production server, so never replace a supplied
-    // product link with a URL reconstructed from PID.
+    // Product-link analysis is disabled. Keep the link only as optional
+    // metadata, and prefer the explicit Base PID for document naming.
     productUrl,
-    pid,
+    pid: suppliedPid || extractedPid,
     suppliedPid,
     productName: field(fields, map.productName, ["商品名称", "产品名", "productName", "product_name"]),
     productDocument: urlField(fields, documentField, [map.productDocument, "产品手卡", "产品文档"]),
@@ -222,139 +220,6 @@ function safeAutomationFailure(error: unknown) {
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 360) || "资料刷新失败";
-}
-
-function productRefreshFailureCode(error: unknown) {
-  if (!error || typeof error !== "object" || !("code" in error)) return "";
-  return String((error as { code?: unknown }).code || "").trim().toLowerCase();
-}
-
-export function productCardFailureStatus(input: {
-  error: unknown;
-  retainedVerifiedSnapshot?: boolean;
-  identityWarning?: string;
-}) {
-  const code = productRefreshFailureCode(input.error);
-  // These three terminal states are deliberately short and stable: they are
-  // operational outcomes for the Base row, not provider diagnostics. The
-  // product-card link has already been written before any of them can occur.
-  if ([
-    "page_unavailable",
-    "page_network_error",
-    "page_timeout",
-    "security_challenge",
-    "browser_unavailable",
-    "browser_launch_failed",
-    "browser_navigation_timeout",
-  ].includes(code)) return "无法打开页面";
-  if ([
-    "all_product_images_unavailable",
-    "no_product_images_declared",
-  ].includes(code)) return "无法获取图片信息";
-  if ([
-    "page_incomplete",
-    "details_expand_failed",
-    "scroll_incomplete",
-    "invalid_capture",
-  ].includes(code)) return "商品信息获取不完整";
-
-  const failure = safeAutomationFailure(input.error);
-  const retainedSuffix = input.retainedVerifiedSnapshot ? "；已保留上次通过安全校验的资料" : "";
-  const identitySuffix = input.identityWarning ? "；基础信息写入待重试" : "";
-  const analysisFailure = [
-    "not_configured",
-    "timeout",
-    "authentication",
-    "quota_or_rate_limit",
-    "provider_error",
-    "refusal",
-    "incomplete",
-    "invalid_response",
-    "insufficient_safe_facts",
-  ].includes(code);
-  return `手卡已就绪，资料${analysisFailure ? "分析" : "刷新"}失败：${failure}${retainedSuffix}${identitySuffix}`.slice(0, 500);
-}
-
-function factItems(value: string) {
-  return String(value || "")
-    .split(/[；;\n]+/)
-    .map((item) => item.replace(/\s+/g, " ").trim())
-    .filter(Boolean);
-}
-
-function factIdentity(value: string) {
-  return value
-    .replace(/（AI推断）/g, "")
-    .normalize("NFKC")
-    .toLowerCase()
-    .trim();
-}
-
-function mergeFactItems(existing: string, verified: string) {
-  const facts = new Map<string, string>();
-  for (const item of [...factItems(existing), ...factItems(verified)]) {
-    const identity = factIdentity(item);
-    if (!identity) continue;
-    const current = facts.get(identity);
-    // The same claim may first appear as an inference and later gain direct
-    // evidence. Keep one copy and prefer the directly supported wording.
-    if (!current || (current.includes("（AI推断）") && !item.includes("（AI推断）"))) {
-      facts.set(identity, item);
-    }
-  }
-  return [...facts.values()].join("；");
-}
-
-function mergeParameterFacts(existing: string, verified: string) {
-  const incoming = factItems(verified);
-  const incomingKeys = new Set(incoming.map((item) => item.split(/[：:]/, 1)[0].trim())
-    .filter(Boolean)
-    .map((key) => key.normalize("NFKC").toLowerCase()));
-  const retained = factItems(existing).filter((item) => {
-    const key = item.split(/[：:]/, 1)[0].trim().normalize("NFKC").toLowerCase();
-    return !key || !incomingKeys.has(key);
-  });
-  return mergeFactItems(retained.join("；"), verified);
-}
-
-function mergeCoreFunctions(existing: string[], verified: string[]) {
-  const facts = new Map<string, string>();
-  for (const value of [...(existing || []), ...(verified || [])]) {
-    const item = String(value || "").replace(/\s+/g, " ").trim();
-    const identity = factIdentity(item);
-    if (!identity) continue;
-    const current = facts.get(identity);
-    if (!current || (current.includes("（AI推断）") && !item.includes("（AI推断）"))) {
-      facts.set(identity, item);
-    }
-  }
-  return [...facts.values()].slice(0, 8);
-}
-
-function parsedVerificationSummary(parsed: Awaited<ReturnType<typeof parsePublicProductPage>>) {
-  return parsed.verification || null;
-}
-
-/**
- * New parser responses distinguish direct evidence from accepted, labelled AI
- * inference. Older parser versions only have `verified*`, whose historical
- * meaning was safe-to-write, so retain that compatibility fallback.
- */
-function acceptedVerificationSummary(verification: NonNullable<ReturnType<typeof parsedVerificationSummary>>) {
-  return {
-    factCount: verification.acceptedFactCount ?? verification.safeFactCount ?? verification.verifiedFactCount,
-    fields: new Set(verification.acceptedFields || verification.verifiedFields),
-  };
-}
-
-function productLinkInputError(input: { productUrl: string; extractedPid: string }) {
-  if (!input.productUrl) return "缺少产品链接";
-  if (!isTikTokUrl(input.productUrl)) return "产品链接必须是 HTTPS TikTok 链接";
-  if (!input.extractedPid) return "产品链接中没有可识别的商品 PID";
-  if (!isExactTikTokProductSource(input.productUrl, input.extractedPid)) {
-    return "产品链接必须是 HTTPS TikTok 官方商品详情页，且链接中的 PID 不能冲突";
-  }
-  return "";
 }
 
 export async function completeFeishuAutomation(videoId: string) {
@@ -491,7 +356,6 @@ async function handleFeishuAutomationUnlocked(input: FeishuAutomationInput) {
   let productRefreshError = "";
   let productCardWarning = "";
   let productCardStatus = "";
-  let retainedVerifiedSnapshot = false;
   let product = null as ReturnType<typeof getProductByPid>;
 
   const queuePatch = (fields: Record<string, unknown>) => {
@@ -527,26 +391,11 @@ async function handleFeishuAutomationUnlocked(input: FeishuAutomationInput) {
     recordId: input.recordId,
   };
   let mappingBefore = getFeishuProductCardMapping(mappingKey);
-  const extractedPid = resolved.pid;
-  const linkInputError = productLinkInputError({
-    productUrl: resolved.productUrl,
-    extractedPid,
-  });
-  const refreshInputError = [resolved.productName ? "" : "缺少产品名称", linkInputError]
-    .filter(Boolean)
-    .join("；");
-  const effectivePid = linkInputError ? "" : extractedPid;
-  const requestedName = resolved.productName || "";
-  const effectiveName = requestedName || (effectivePid ? "待补产品" : mappingBefore?.lastProductName || "待补产品");
-  const existingProduct = effectivePid ? getProductByPid(effectivePid) : null;
-  const previousVerifiedPid = mappingBefore?.lastProductPid || "";
-  const previousVerifiedUrl = mappingBefore?.lastProductUrl || existingProduct?.productUrl || "";
-  const preservePreviousIdentity = Boolean(linkInputError && previousVerifiedPid);
-  const identityName = preservePreviousIdentity
-    ? mappingBefore?.lastProductName || "待补产品"
-    : effectiveName;
-  const identityPid = preservePreviousIdentity ? previousVerifiedPid : effectivePid;
-  const identityUrl = preservePreviousIdentity ? previousVerifiedUrl : resolved.productUrl;
+  const effectivePid = resolved.pid.trim();
+  const effectiveName = resolved.productName.trim();
+  if (!effectiveName) throw new Error("缺少产品名称，无法按“产品名称_PID”命名手卡");
+  if (!effectivePid) throw new Error("缺少商品 PID，无法按“产品名称_PID”命名手卡");
+
   const suppliedDocumentUrl = trustedExistingDocumentUrl(resolved.productDocument);
   let shellDocumentId = mappingBefore?.documentId || "";
   let shellDocumentUrl = mappingBefore?.documentUrl || "";
@@ -556,24 +405,17 @@ async function handleFeishuAutomationUnlocked(input: FeishuAutomationInput) {
       documentId: suppliedDocumentId,
       documentUrl: suppliedDocumentUrl,
     })) {
-      // Claim before ensureProductCardShell performs any identity/permission
-      // mutation. A legacy URL already owned by another Base row is ignored
-      // and this row receives its own stable shell instead.
       shellDocumentId = suppliedDocumentId;
       shellDocumentUrl = suppliedDocumentUrl;
       mappingBefore = getFeishuProductCardMapping(mappingKey);
     }
   }
+
   const shell = await ensureProductCardShell(input.client, {
     recordKey: mappingKey,
-    // Product-card documents are stable per Base record. Falling back to the
-    // product's canonical document here made sequential clicks share one card
-    // while concurrent clicks created two, so the result depended on timing.
     existingDocumentId: shellDocumentId || null,
     existingDocumentUrl: shellDocumentUrl || null,
-    name: identityName,
-    productUrl: identityUrl,
-    pid: identityPid,
+    name: effectiveName,
     deferIdentity: true,
   });
   documentUrl = shell.documentUrl;
@@ -585,300 +427,63 @@ async function handleFeishuAutomationUnlocked(input: FeishuAutomationInput) {
     if (!claimed) throw new Error("当前飞书记录的产品手卡与其他记录冲突，已停止关联");
     mappingBefore = getFeishuProductCardMapping(mappingKey);
   }
+
   productCardWarning = [shell.permissionWarning, shell.ownershipWarning]
     .filter(Boolean)
     .map((warning) => safeAutomationFailure(warning))
     .join("；");
 
-  // Stage one is committed independently: a parser/provider failure can no
-  // longer make the user lose the product-card document that was just made.
+  // Product-link analysis is intentionally disabled. The button now only
+  // creates/adopts the row's template document, renames it, and returns it for
+  // manual editing. No template block or user-authored content is modified.
+  await renameProductCardDocument(input.client, shell.documentId, effectiveName, effectivePid);
   queuePatch({ [resolved.map.productDocument]: shell.documentUrl });
   await flushPatch();
-  if (effectivePid && effectivePid !== resolved.suppliedPid) {
-    queuePatch({ [resolved.map.pid]: effectivePid });
-    await flushPatch();
-  }
-  productCardStatus = "手卡已就绪，资料刷新中";
-  queuePatch({ [resolved.map.productCardStatus]: productCardStatus });
-  await flushPatch();
 
-  try {
-    upsertFeishuProductCardMapping({
-      ...mappingKey,
-      documentId: shell.documentId,
-      documentUrl: shell.documentUrl,
-    });
-    const mappedProductBefore = mappingBefore?.productId
-      ? getProduct(mappingBefore.productId)
-      : null;
-    // Validate the complete managed area before changing even one block. This
-    // prevents an old/non-template document from being half rewritten before
-    // a missing label is discovered.
-    const preflight = await syncProductCardManagedFields(input.client, {
-      documentId: shell.documentId,
-      mode: "verified-basic",
-      preflightOnly: true,
-    });
-    if (preflight.missingLabels?.length) {
-      throw new Error(`产品手卡模板缺少基础字段：${preflight.missingLabels.join("、")}`);
-    }
-    if (preflight.duplicateLabels?.length) {
-      throw new Error(`产品手卡模板存在重复基础字段：${preflight.duplicateLabels.join("、")}`);
-    }
-
-    const preflightValues = preflight.currentValues || {};
-    const documentManagedPid = String(preflightValues["商品ID"] || "").trim();
-    const documentHasDerivedFacts = [
-      "产品SKU", "产品主要功能", "产品参数", "使用方法", "适用人群", "使用场景",
-    ].some((label) => Boolean(String(preflightValues[label as keyof typeof preflightValues] || "").trim()));
-    const confirmedPidSwitch = Boolean(identityPid && [
-      mappingBefore?.managedProductPid,
-      mappingBefore?.lastProductPid,
-      mappedProductBefore?.pid,
-      documentManagedPid,
-    ].some((previousPid) => Boolean(previousPid && previousPid !== identityPid)));
-    const unknownDocumentFactOwner = Boolean(
-      identityPid && !documentManagedPid && documentHasDerivedFacts,
-    );
-    const recoveredDifferentDocument = Boolean(
-      mappingBefore?.documentId && mappingBefore.documentId !== shell.documentId,
-    );
-    // Never clear an existing same-PID card merely because it predates the new
-    // mapping marker. That was the cause of historical cards becoming empty
-    // before a provider request later failed. A newly copied template must
-    // still have every example value removed, and a recovered/different-PID
-    // document must drop old facts before its new identity is written.
-    const mustIsolatePreviousProduct = !shell.reused
-      || recoveredDifferentDocument
-      || confirmedPidSwitch
-      || unknownDocumentFactOwner;
-    if (mustIsolatePreviousProduct) {
-      const cleared = await syncProductCardManagedFields(input.client, {
-        documentId: shell.documentId,
-        mode: "verified-basic",
-        clearDerived: true,
-        derivedOnly: true,
-      });
-      if (cleared.missingLabels?.length) {
-        throw new Error(`产品手卡模板缺少基础字段：${cleared.missingLabels.join("、")}`);
-      }
-      // An empty managed area is safe to bind to the new identity even when a
-      // later provider request fails. Never set this marker merely because the
-      // three identity blocks were patched: historical derived facts may still
-      // belong to a different PID until they are isolated or restored.
-      if (identityPid) {
-        upsertFeishuProductCardMapping({ ...mappingKey, managedProductPid: identityPid });
-      }
-    }
-    const identitySync = await syncProductCardManagedFields(input.client, {
-      documentId: shell.documentId,
-      mode: "identity",
-      name: identityName,
-      productUrl: identityUrl,
-      pid: identityPid,
-    });
-    if (identitySync.missingLabels?.length) {
-      throw new Error(`产品手卡模板缺少基础字段：${identitySync.missingLabels.join("、")}`);
-    }
-    // Link/PID identity is independently verifiable before AI extraction. Save
-    // it now so a later bad temporary link can retain the same complete tuple.
-    // managedProductPid is deliberately omitted until the derived area was
-    // isolated, restored from a trusted DB snapshot, or finally synchronized.
-    upsertFeishuProductCardMapping({
-      ...mappingKey,
-      lastProductPid: identityPid,
-      lastProductUrl: identityUrl,
-      lastProductName: identityName,
-    });
-    if (refreshInputError) throw new Error(refreshInputError);
-    product = await withProductIdentityLock(effectivePid, () => {
-      const current = getProductByPid(effectivePid);
-      if (current) return current;
-      return createProduct({
+  product = await withProductIdentityLock(effectivePid, () => {
+    const current = getProductByPid(effectivePid);
+    if (current) {
+      return updateProduct(current.id, {
         name: effectiveName,
         pid: effectivePid,
         productUrl: resolved.productUrl,
-        documentId: shell.documentId,
-        documentUrl: shell.documentUrl,
-      });
-    });
-    if (!product) throw new Error("创建产品档案失败");
-    const previouslyMappedProduct = mappingBefore?.productId
-      && mappingBefore.productId !== product.id
-      ? mappedProductBefore || getProduct(mappingBefore.productId)
-      : null;
-    if (previouslyMappedProduct?.documentId === shell.documentId) {
-      // The Base row has switched to another PID and its stable shell is being
-      // repurposed. Detach the old product's compatibility/canonical link so a
-      // later sync of that product cannot overwrite this row's new card.
-      clearProductDocumentLink(previouslyMappedProduct.id);
-    }
-    if (!product.documentId || !product.documentUrl) {
-      product = updateProduct(product.id, {
-        documentId: shell.documentId,
-        documentUrl: shell.documentUrl,
-      }) || product;
-    }
-    upsertFeishuProductCardMapping({ ...mappingKey, productId: product.id });
-
-    retainedVerifiedSnapshot = product.verifiedPid === effectivePid
-      && Boolean(product.evidenceVersion)
-      && Boolean(
-        product.sku
-        || product.coreFunctions.length
-        || product.productParameters
-        || product.usageMethod
-        || product.targetAudience
-        || product.usageScenes,
-      );
-    if (retainedVerifiedSnapshot) {
-      const restored = await syncProductCardManagedFields(input.client, {
-        documentId: shell.documentId,
-        mode: "verified-basic",
-        sku: product.sku,
-        coreFunctions: product.coreFunctions,
-        productParameters: product.productParameters,
-        usageMethod: product.usageMethod,
-        audience: product.targetAudience,
-        scenes: product.usageScenes,
-        clearDerived: true,
-      });
-      if (restored.missingLabels?.length) {
-        throw new Error(`产品手卡模板缺少基础字段：${restored.missingLabels.join("、")}`);
-      }
-      upsertFeishuProductCardMapping({ ...mappingKey, managedProductPid: effectivePid });
-    }
-
-    // Every click performs a new exact-link/PID parse. Cached product facts
-    // never skip this refresh and never certify a failed request.
-    const parsed = await parsePublicProductPage(resolved.productUrl, {
-      productName: effectiveName,
-      pid: effectivePid,
-    });
-    const verification = parsedVerificationSummary(parsed);
-    const accepted = verification ? acceptedVerificationSummary(verification) : null;
-    if (!verification
-      || !accepted
-      || accepted.factCount <= 0
-      || !verification.evidenceVersion
-      || !isExactTikTokProductSource(verification.sourceUrl, effectivePid)) {
-      throw new Error("商品资料解析失败：没有取得任何逐条可验证的商品事实");
-    }
-    const parsedProductId = product.id;
-    product = await withProductIdentityLock(effectivePid, () => {
-      // Parsing deliberately happens outside this short lock. Re-read the
-      // latest certified snapshot only after parsing, then derive the merge
-      // input and commit it atomically so concurrent Base rows cannot replace
-      // one another's partial facts with a stale pre-parse snapshot.
-      let current = getProductByPid(effectivePid)
-        || getProduct(parsedProductId)
-        || product!;
-      const acceptedFields = acceptedVerificationSummary(verification).fields;
-      const parsedSku = acceptedFields.has("sku") ? parsed.sku : "";
-      const parsedCoreFunctions = acceptedFields.has("coreFunctions") ? parsed.coreFunctions : [];
-      const parsedProductParameters = acceptedFields.has("productParameters") ? parsed.productParameters : "";
-      const parsedUsageMethod = acceptedFields.has("usageMethod") ? parsed.usageMethod : "";
-      const parsedAudience = acceptedFields.has("audience") ? parsed.audience : "";
-      const parsedScenes = acceptedFields.has("scenes") ? parsed.scenes : "";
-      // Only facts certified by the same validation policy may be merged
-      // incrementally. A new evidence version must re-establish each fact with
-      // the current sealed capture; otherwise an older validator's false
-      // positive would be silently promoted into the new policy.
-      const sameVerifiedProduct = current.verifiedPid === effectivePid
-        && current.evidenceVersion === verification.evidenceVersion;
-      const mergedCoreFunctions = parsedCoreFunctions.length
-        ? mergeCoreFunctions(sameVerifiedProduct ? current.coreFunctions : [], parsedCoreFunctions)
-        : undefined;
-      const mergedProductParameters = parsedProductParameters
-        ? mergeParameterFacts(sameVerifiedProduct ? current.productParameters : "", parsedProductParameters)
-        : undefined;
-      const mergedUsageMethod = parsedUsageMethod
-        ? mergeFactItems(sameVerifiedProduct ? current.usageMethod : "", parsedUsageMethod)
-        : undefined;
-      const mergedAudience = parsedAudience
-        ? mergeFactItems(sameVerifiedProduct ? current.targetAudience : "", parsedAudience)
-        : undefined;
-      const mergedScenes = parsedScenes
-        ? mergeFactItems(sameVerifiedProduct ? current.usageScenes : "", parsedScenes)
-        : undefined;
-      current = updateProduct(current.id, {
-        productUrl: resolved.productUrl,
-        name: identityName,
-        pid: effectivePid,
+        ...(!current.documentId || !current.documentUrl
+          ? { documentId: shell.documentId, documentUrl: shell.documentUrl }
+          : {}),
       }) || current;
-      return mergeVerifiedProductFacts(current.id, {
-        pid: effectivePid,
-        sourceUrl: verification.sourceUrl,
-        evidenceVersion: verification.evidenceVersion,
-        verifiedAt: new Date().toISOString(),
-        sku: parsedSku || (sameVerifiedProduct ? current.sku : undefined),
-        coreFunctions: mergedCoreFunctions || (sameVerifiedProduct ? current.coreFunctions : undefined),
-        productParameters: mergedProductParameters || (sameVerifiedProduct ? current.productParameters : undefined),
-        usageMethod: mergedUsageMethod || (sameVerifiedProduct ? current.usageMethod : undefined),
-        targetAudience: mergedAudience || (sameVerifiedProduct ? current.targetAudience : undefined),
-        usageScenes: mergedScenes || (sameVerifiedProduct ? current.usageScenes : undefined),
-        sourceTitle: parsed.sourceTitle || (sameVerifiedProduct ? current.sourceTitle : undefined),
-        sourceDescription: parsed.sourceDescription || (sameVerifiedProduct ? current.sourceDescription : undefined),
-        sourceImageUrls: parsed.sourceImageUrls.length
-          ? parsed.sourceImageUrls
-          : sameVerifiedProduct ? current.sourceImageUrls : undefined,
-        visualEvidence: parsed.visualEvidence || (sameVerifiedProduct ? current.visualEvidence : undefined),
-        visualAnalysisStatus: parsed.visualAnalysisStatus === "completed"
-          ? "completed"
-          : sameVerifiedProduct && current.visualAnalysisStatus === "completed" ? "completed" : undefined,
-        factProvenance: verification.factProvenance,
-      });
-    });
-    const synchronized = await syncProductCardManagedFields(input.client, {
-      documentId: shell.documentId,
-      mode: "verified-basic",
-      name: effectiveName,
-      productUrl: resolved.productUrl,
-      pid: effectivePid,
-      // The database helper has already merged this click's atomic facts with
-      // the same PID/version snapshot. Synchronize that complete certified
-      // snapshot, not only the fields returned by this one provider attempt.
-      // This also replaces unversioned legacy/template facts only after at
-      // least one new fact has passed verification; parse failures never clear
-      // the existing card.
-      sku: product.sku,
-      coreFunctions: product.coreFunctions,
-      productParameters: product.productParameters,
-      usageMethod: product.usageMethod,
-      audience: product.targetAudience,
-      scenes: product.usageScenes,
-      clearDerived: true,
-    });
-    if (synchronized.missingLabels?.length) {
-      throw new Error(`产品手卡模板缺少基础字段：${synchronized.missingLabels.join("、")}`);
     }
-    upsertFeishuProductCardMapping({
-      ...mappingKey,
-      productId: product.id,
+    return createProduct({
+      name: effectiveName,
+      pid: effectivePid,
+      productUrl: resolved.productUrl,
       documentId: shell.documentId,
       documentUrl: shell.documentUrl,
-      lastProductPid: effectivePid,
-      lastProductUrl: resolved.productUrl,
-      lastProductName: effectiveName,
-      managedProductPid: effectivePid,
     });
-    if (verification.status === "partial") {
-      const missing = verification.missingFields.length;
-      const acceptedFactCount = acceptedVerificationSummary(verification).factCount;
-      productCardStatus = `部分完成：已写入 ${acceptedFactCount} 条可信资料${missing ? `，${missing} 项暂无可验证证据` : ""}`;
-    } else {
-      productCardStatus = productCardWarning
-        ? "手卡已就绪，资料已刷新，但文档权限待修复"
-        : "已完成";
-    }
-  } catch (error) {
-    productRefreshError = safeAutomationFailure(error);
-    productCardStatus = productCardFailureStatus({
-      error,
-      retainedVerifiedSnapshot,
-      identityWarning: shell.identityWarning,
-    });
+  });
+  if (!product) throw new Error("创建产品档案失败");
+
+  const previouslyMappedProduct = mappingBefore?.productId
+    && mappingBefore.productId !== product.id
+    ? getProduct(mappingBefore.productId)
+    : null;
+  if (previouslyMappedProduct?.documentId === shell.documentId) {
+    clearProductDocumentLink(previouslyMappedProduct.id);
   }
+  upsertFeishuProductCardMapping({
+    ...mappingKey,
+    productId: product.id,
+    documentId: shell.documentId,
+    documentUrl: shell.documentUrl,
+    lastProductPid: effectivePid,
+    lastProductUrl: resolved.productUrl,
+    lastProductName: effectiveName,
+    managedProductPid: "",
+  });
+
+  productCardStatus = productCardWarning
+    ? "手卡已就绪，请手动填写；文档权限待修复"
+    : "手卡已就绪，请手动填写";
+  productRefreshError = "";
   // Give the critical document-link field one final independent attempt before
   // publishing the terminal status. Never tell the user "已完成" while the row
   // still has no hand-card link, even if parsing and document sync succeeded.

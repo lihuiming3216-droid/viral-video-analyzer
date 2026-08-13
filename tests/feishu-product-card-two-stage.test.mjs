@@ -39,6 +39,31 @@ async function loadDocumentModule() {
 
 const documentModule = await loadDocumentModule();
 
+test("manual product cards are renamed exactly to productName_PID without touching template blocks", async () => {
+  const patches = [];
+  const client = {
+    docx: { v1: { documentBlock: { patch: async (payload) => {
+      patches.push(payload);
+      return { code: 0 };
+    } } } },
+  };
+  const title = await documentModule.renameProductCardDocument(
+    client,
+    "document-token",
+    "血压仪大号",
+    "1731234567890123456",
+  );
+  assert.equal(title, "血压仪大号_1731234567890123456");
+  assert.deepEqual(patches, [{
+    path: { document_id: "document-token", block_id: "document-token" },
+    data: {
+      update_text_elements: {
+        elements: [{ text_run: { content: "血压仪大号_1731234567890123456" } }],
+      },
+    },
+  }]);
+});
+
 function textBlock(id, content, link = "") {
   return {
     block_id: id,

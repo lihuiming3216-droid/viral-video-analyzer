@@ -156,6 +156,27 @@ export function resolveAutomationFields(
   };
 }
 
+/**
+ * Fill only the product-card inputs that an older Feishu button payload may
+ * omit. Never merge the whole live Base row: doing so could accidentally send
+ * an unrelated sample-video field through the video-analysis branch.
+ */
+export function hydrateAutomationProductFields(
+  fields: Record<string, unknown>,
+  latestFields: Record<string, unknown>,
+  inputMap: Partial<FeishuAutomationFieldMap> = {},
+) {
+  const current = resolveAutomationFields(fields, inputMap);
+  const latest = resolveAutomationFields(latestFields, inputMap);
+  const hydrated = { ...fields };
+  if (!current.productName && latest.productName) hydrated[current.map.productName] = latest.productName;
+  if (!current.pid && latest.pid) hydrated[current.map.pid] = latest.pid;
+  if (!current.productDocument && latest.productDocument) {
+    hydrated[current.map.productDocument] = latest.productDocument;
+  }
+  return hydrated;
+}
+
 async function patchBaseRecord(
   client: Client,
   input: { appToken: string; tableId: string; recordId: string; fields: Record<string, unknown> },

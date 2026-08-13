@@ -47,6 +47,23 @@ async function loadAutomationModule() {
 const automation = await loadAutomationModule();
 const pid = "1732364299482009895";
 
+test("legacy button payload hydrates only current-row product-card fields", () => {
+  const hydrated = automation.hydrateAutomationProductFields(
+    { 产品名称: "血压仪大号" },
+    {
+      产品名称: "血压仪大号",
+      PID: pid,
+      产品手卡: { text: "打开", link: "https://tenant.feishu.cn/docx/manual-doc" },
+      样片链接: "https://www.tiktok.com/t/should-not-enter-video-branch/",
+      视频分析: "人工内容",
+    },
+  );
+  assert.equal(automation.resolveAutomationFields(hydrated).pid, pid);
+  assert.equal(automation.resolveAutomationFields(hydrated).productDocument, "https://tenant.feishu.cn/docx/manual-doc");
+  assert.equal("样片链接" in hydrated, false);
+  assert.equal("视频分析" in hydrated, false);
+});
+
 test("manual-only click copies and renames the template without requiring a product link", async () => {
   const ensureCalls = [];
   const created = {

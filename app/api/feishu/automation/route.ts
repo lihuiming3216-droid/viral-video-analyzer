@@ -1,6 +1,12 @@
 import { after, NextRequest, NextResponse } from "next/server";
 import { ensureFeishuConnection, getConnectedFeishuChannel } from "@/lib/feishu/runtime";
-import { handleFeishuAutomation, updateProductCardStatus, type FeishuAutomationFieldMap } from "@/lib/feishu/automation";
+import {
+  handleFeishuAutomation,
+  hydrateAutomationProductFields,
+  resolveAutomationFields,
+  updateProductCardStatus,
+  type FeishuAutomationFieldMap,
+} from "@/lib/feishu/automation";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -57,6 +63,32 @@ function safeBackgroundError(error: unknown) {
     .slice(0, 360) || "飞书自动化处理失败";
 }
 
+async function hydrateMissingProductCardFields(input: {
+  client: { request<T>(options: Record<string, unknown>): Promise<T> };
+  appToken: string;
+  tableId: string;
+  recordId: string;
+  fields: Record<string, unknown>;
+  fieldMap: Partial<FeishuAutomationFieldMap>;
+}) {
+  const current = resolveAutomationFields(input.fields, input.fieldMap);
+  if (current.productName && current.pid) return input.fields;
+
+  const response = await input.client.request<{
+    code?: number;
+    msg?: string;
+    data?: { record?: { fields?: Record<string, unknown> } };
+  }>({
+    url: `/open-apis/bitable/v1/apps/${encodeURIComponent(input.appToken)}/tables/${encodeURIComponent(input.tableId)}/records/${encodeURIComponent(input.recordId)}`,
+    method: "GET",
+  });
+  if (response.code && response.code !== 0) {
+    throw new Error(response.msg || "读取飞书当前行产品名称和 PID 失败");
+  }
+  const latestFields = response.data?.record?.fields || {};
+  return hydrateAutomationProductFields(input.fields, latestFields, input.fieldMap);
+}
+
 export async function POST(request: NextRequest) {
   try {
     const contentType = request.headers.get("content-type") || "";
@@ -77,9 +109,18 @@ export async function POST(request: NextRequest) {
     // so concurrent clicks serialize without silently dropping a click.
     after(async () => {
       const startedAt = Date.now();
+      let jobFields = fields;
       try {
         const channel = getConnectedFeishuChannel() || await ensureFeishuConnection();
         if (!channel) throw new Error("飞书应用尚未连接");
+        jobFields = await hydrateMissingProductCardFields({
+          client: channel.rawClient,
+          appToken,
+          tableId,
+          recordId,
+          fields,
+          fieldMap,
+        });
         // The first external write is deliberately the newly created/reused
         // hand-card URL inside handleFeishuAutomation. Product-page parsing
         // and even status-column failures must come after the document exists.
@@ -88,7 +129,7 @@ export async function POST(request: NextRequest) {
           appToken,
           tableId,
           recordId,
-          fields,
+          fields: jobFields,
           fieldMap,
           // Background jobs must write the result themselves. The Feishu HTTP
           // action has already received its immediate acknowledgement.
@@ -110,7 +151,7 @@ export async function POST(request: NextRequest) {
         const message = safeBackgroundError(error);
         try {
           const channel = getConnectedFeishuChannel() || await ensureFeishuConnection();
-          if (channel && !fields[fieldMap.videoUrl || "视频链接"] && !fields["样片链接"]) {
+          if (channel && !jobFields[fieldMap.videoUrl || "视频链接"] && !jobFields["样片链接"]) {
             await updateProductCardStatus({
               client: channel.rawClient,
               appToken,

@@ -251,6 +251,46 @@ test("text-only blood-pressure details can fill all four fields with controlled 
   assert.equal(result.scenes.facts[0].valueZh, "家庭血压监测场景");
 });
 
+test("text-only monitor uses the server-controlled category template when the model omits fields", async () => {
+  process.env.OPENAI_API_KEY = "test-openai-key-that-is-long-enough";
+  const input = {
+    captureId: "capture-monitor-text-only",
+    pid: "1729405471069737262",
+    canonicalUrl: "https://shop.tiktok.com/us/pdp/portable-monitor/1729405471069737262",
+    productNameHint: "便携屏",
+    fragments: [
+      { id: "router-title", kind: "router_text", text: "ARZOPA 16.1 Portable Gaming Monitor 1080P FHD 144Hz" },
+      { id: "scoped-dom-details", kind: "scoped_dom", text: "Portable external second screen for laptop, PC, console and travel use." },
+    ],
+    images: [],
+    coverage: {
+      identity: "exact",
+      details: "converged",
+      scroll: "converged",
+      expectedImageCount: 0,
+      usableImageCount: 0,
+    },
+  };
+  input.sourceDigest = analyzer.createProductCaptureDigest(input);
+  globalThis.__openAIProductHooks = {
+    fetchWithProxy: async () => responseFor({
+      captureId: input.captureId,
+      pid: input.pid,
+      sourceDigest: input.sourceDigest,
+      coreFunctions: { facts: [] },
+      usageMethod: { facts: [] },
+      audience: { facts: [] },
+      scenes: { facts: [] },
+    }),
+  };
+
+  const result = await analyzer.analyzeProductCaptureWithOpenAI(input);
+  assert.equal(analyzer.formatProductFactsForCard(result.coreFunctions), "辅助显示画面（AI推断）");
+  assert.equal(analyzer.formatProductFactsForCard(result.usageMethod), "连接设备后查看画面（AI推断）");
+  assert.equal(analyzer.formatProductFactsForCard(result.audience), "需要扩展显示的用户（AI推断）");
+  assert.equal(analyzer.formatProductFactsForCard(result.scenes), "桌面或出行显示场景（AI推断）");
+});
+
 test("capture identity, digest, image bytes, and evidence kinds are server validated", async () => {
   process.env.OPENAI_API_KEY = "test-openai-key-that-is-long-enough";
   const valid = capture();

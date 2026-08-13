@@ -1444,6 +1444,32 @@ function validatedFact(
   return { valueZh, basis, evidenceRefs };
 }
 
+function controlledTextFallbackFact(
+  input: OpenAIProductCaptureInput,
+  field: ProductAnalysisField,
+): OpenAIProductFact | null {
+  // This fallback is intentionally limited to complete text-only PDPs. With
+  // images available the model must still select and ground every fact. Some
+  // TikTok sellers publish product videos plus rich detail text but no gallery
+  // image; a model omission must not discard the server-authored category
+  // template that was already authorized by the exact-PID router title.
+  if (input.images.length) return null;
+  const valueZh = controlledInferenceTemplates(input)[field][0];
+  if (!valueZh) return null;
+  const title = input.fragments.find((fragment) => fragment.kind === "router_text"
+    && /(?:^|[-_])title(?:$|[-_])/i.test(fragment.id))
+    || input.fragments.find((fragment) => fragment.kind === "router_text");
+  const exactQuote = clean(title?.text, 500);
+  if (!title || !meaningfulExactQuote(exactQuote)) return null;
+  const sourceType = title.kind === "router_property" ? "router_property"
+    : title.kind === "scoped_dom" ? "scoped_dom" : "router_text";
+  return validatedFact({
+    valueZh,
+    basis: "ai_inference",
+    evidenceRefs: [{ sourceType, sourceId: title.id, exactQuote }],
+  }, input, field);
+}
+
 function validateModelResult(raw: ModelProductAnalysis, input: OpenAIProductCaptureInput, model: string) {
   if (clean(raw?.captureId, 200) !== input.captureId
     || clean(raw?.pid, 64) !== input.pid
@@ -1461,6 +1487,8 @@ function validateModelResult(raw: ModelProductAnalysis, input: OpenAIProductCapt
     const facts = (Array.isArray(raw?.[field]?.facts) ? raw[field].facts : [])
       .map((fact) => validatedFact(fact, input, field))
       .filter((fact): fact is OpenAIProductFact => Boolean(fact));
+    const fallback = facts.length ? null : controlledTextFallbackFact(input, field);
+    if (fallback) facts.push(fallback);
     const unique = [...new Map(facts.map((fact) => [fact.valueZh.normalize("NFKC").toLowerCase(), fact])).values()];
     result[field] = { facts: unique.slice(0, field === "coreFunctions" ? 5 : 4) };
     if (!result[field].facts.length) {

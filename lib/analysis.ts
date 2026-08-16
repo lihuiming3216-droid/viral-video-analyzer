@@ -4,7 +4,7 @@ import { getProduct, getVideo, replaceScenes, updateVideo } from "@/lib/database
 import { clampScore, formatTime } from "@/lib/json-utils";
 import { getLearningContext, learnFromVideo } from "@/lib/learning";
 import { getProviderConfig } from "@/lib/provider-config";
-import { analyzeVideoWithQwen, transcribeAudioWithQwen } from "@/lib/providers/qwen";
+import { analyzeVideoWithQwen } from "@/lib/providers/qwen";
 import { fetchTikTok, tokScriptTranscriptFailure } from "@/lib/providers/tokscript";
 import type { AnalysisResult, AnalysisScene, Product, ScoreSet } from "@/lib/types";
 import { transcriptAndTranslationAgree } from "@/lib/transcript-validation";
@@ -13,8 +13,8 @@ import {
   createSceneClip,
   downloadMedia,
   extractVideoAssets,
+  prepareLocalVideoForQwen,
   resolveMediaPath,
-  splitAudioForQwenAsr,
   type ExtractedScene,
 } from "@/lib/video-processing";
 
@@ -92,8 +92,6 @@ function normalizeAnalysis(value: Partial<AnalysisResult>, sceneCount: number, t
 function buildPrompt(input: {
   product: Product;
   scenes: ExtractedScene[];
-  transcript: string;
-  transcriptSegments: Array<{ start: number; end: number; text: string }>;
   learningContext: unknown;
   mode: "full" | "product_doc";
 }) {
@@ -116,13 +114,10 @@ function buildPrompt(input: {
 除 translationZh 外，所有分析都用短语，不写解释句；只保留“动作+结果”。summary 不超过30个汉字；hook.description、每条 viralPoints、strengths 和 structureFormula 均不超过18个汉字。删除“通过、进行、能够、可以、有效提升、有助于、让用户”等套话。
 translationZh 必须是完整原口播的自然中文翻译，不要只翻译其中几句；听不清的部分标记为“[听不清]”。
 如果视频没有口播，translationZh 必须写“无口播”，仍需根据画面完成其余分析。
-如果完整原文为“背景音乐，无有效产品口播”，表示 TokScript 已确认没有可用的产品口播；translationZh 必须写“无口播”，不要翻译歌词或重复噪声。
 严格使用以下 JSON 结构：{"summary":"","language":"","translationZh":"","hook":{"timeRange":"","type":"","description":"","whyItWorks":""},"viralPoints":[{"timeRange":"","description":"","reason":""}],"strengths":[""],"structureFormula":""}。
 
 产品：${JSON.stringify(productContext)}
-镜头时间轴：${JSON.stringify(timeline)}
-带时间码原文：${JSON.stringify(input.transcriptSegments)}
-完整原文：${input.transcript}`;
+镜头时间轴：${JSON.stringify(timeline)}`;
   }
   return `你是 TikTok 带货短视频拆解专家。请用中文输出，原文案保留英语或西语，并逐段给出中文翻译。translationZh 字段必须给出完整口播的中文翻译。
 
@@ -140,8 +135,6 @@ translationZh 必须是完整原口播的自然中文翻译，不要只翻译其
 
 产品：${JSON.stringify(input.product)}
 镜头时间轴：${JSON.stringify(timeline)}
-带时间码原文：${JSON.stringify(input.transcriptSegments)}
-完整原文：${input.transcript}
 长期学习系统提供的产品/品类/团队历史经验：${JSON.stringify(input.learningContext)}
 
 历史经验只能用于校准判断和识别可复用规律，不能机械沿用旧分数。人工标签和团队备注的优先级高于未验证案例。
@@ -297,39 +290,20 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal) {
     setStage(videoId, "extracting", "正在识别镜头并提取关键画面", 36);
     const assets = await extractVideoAssets(videoId, relativeVideoPath, signal, {
       light: analysisMode === "product_doc",
-      // TokScript is the sole transcript source for TikTok links. Never
-      // re-transcribe the downloaded TikTok file with a second provider.
-      // Local uploads still need audio extraction because they have no
-      // TokScript transcript request.
-      includeAudio: initial.sourceType !== "tiktok" && !transcript,
     });
     updateVideo(videoId, {
       duration_seconds: assets.duration,
       cover_path: getVideo(videoId, false)?.coverPath || assets.scenes[0]?.screenshotPath || null,
     });
 
-    if (initial.sourceType !== "tiktok" && !transcript && assets.audioPath) {
-      if (!isConfigured("qwen")) {
-        throw new Error("本地上传视频需要配置 Qwen 才能识别口播");
-      }
-      setStage(videoId, "transcribing", "正在识别英语或西语口播", 52);
-      const audioChunks = await splitAudioForQwenAsr(assets.audioPath, assets.duration, signal);
-      const transcripts: string[] = [];
-      for (const chunk of audioChunks) {
-        signal?.throwIfAborted();
-        transcripts.push(await transcribeAudioWithQwen(resolveMediaPath(chunk), signal));
-      }
-      transcript = transcripts.join(" ").trim();
-      updateVideo(videoId, { transcript_original: transcript });
-      trace.push("Qwen：本地上传视频语音识别");
-    }
-
     const learningContext = analysisMode === "product_doc" ? null : getLearningContext(product, videoId);
     const learnedExamples = Array.isArray(learningContext?.similarExamples) ? learningContext.similarExamples.length : 0;
     if (learnedExamples) trace.push(`长期学习：参考 ${learnedExamples} 条相似历史经验`);
-    const prompt = buildPrompt({ product, scenes: assets.scenes, transcript, transcriptSegments, learningContext, mode: analysisMode });
-    const framePaths = assets.scenes.map((scene) => resolveMediaPath(scene.screenshotPath));
-    setStage(videoId, "analyzing", "正在分析画面、声音、钩子和转化结构", 66);
+    const prompt = buildPrompt({ product, scenes: assets.scenes, learningContext, mode: analysisMode });
+    const qwenVideoPath = remoteVideoUrl
+      ? relativeVideoPath
+      : await prepareLocalVideoForQwen(videoId, relativeVideoPath, assets.duration, signal);
+    setStage(videoId, "analyzing", "正在观看完整视频并分析画面、声音、钩子和转化结构", 66);
 
     let qwenContext: Record<string, unknown> | undefined;
     if (isConfigured("qwen")) {
@@ -337,11 +311,11 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal) {
         qwenContext = await analyzeVideoWithQwen({
           prompt,
           remoteVideoUrl,
-          framePaths,
+          localVideoPath: resolveMediaPath(qwenVideoPath),
           maxTokens: analysisMode === "product_doc" ? 2_000 : 4_500,
           signal,
         });
-        trace.push("Qwen：关键帧、文案与镜头结构分析");
+        trace.push("Qwen Omni：完整 MP4 画面与原始音轨分析");
       } catch (error) {
         if (signal?.aborted) throw error;
         trace.push(`Qwen 初审未采用：${error instanceof Error ? error.message : "未知错误"}`);
@@ -355,7 +329,7 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal) {
       trace.push("自动路由：Qwen 结果完整，直接生成快速报告");
     } else if (isConfigured("qwen")) {
       try {
-        rawAnalysis = await analyzeVideoWithQwen({ prompt, remoteVideoUrl, framePaths, maxTokens: analysisMode === "product_doc" ? 2_000 : 4_500, signal });
+        rawAnalysis = await analyzeVideoWithQwen({ prompt, remoteVideoUrl, localVideoPath: resolveMediaPath(qwenVideoPath), maxTokens: analysisMode === "product_doc" ? 2_000 : 4_500, signal });
         trace.push("Qwen：首次结果不完整，已重试一次");
       } catch (error) {
         if (signal?.aborted) throw error;
@@ -429,6 +403,7 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal) {
       score_rhythm: analysis.scores.rhythm,
       summary: analysis.summary,
       hook_summary: analysis.hook.description,
+      transcript_original: transcript || analysis.scenes.map((scene) => scene.originalText).filter(Boolean).join(" "),
       transcript_zh: analysis.translationZh || analysis.scenes.map((scene) => scene.translationZh).filter(Boolean).join(" "),
       analysis_json: JSON.stringify(analysis),
       error_message: null,

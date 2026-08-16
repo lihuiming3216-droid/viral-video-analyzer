@@ -1,8 +1,7 @@
 import "server-only";
 
 import { execFile } from "node:child_process";
-import { randomUUID } from "node:crypto";
-import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { createWriteStream, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -187,7 +186,7 @@ export async function extractVideoAssets(
   videoId: string,
   relativeVideoPath: string,
   signal?: AbortSignal,
-  options: { light?: boolean; includeAudio?: boolean } = {},
+  options: { light?: boolean } = {},
 ) {
   const absoluteVideoPath = resolveMediaPath(relativeVideoPath);
   signal?.throwIfAborted();
@@ -216,38 +215,57 @@ export async function extractVideoAssets(
       clipPath: null,
     });
   }
-  if (options.includeAudio === false) {
-    return { ...metadata, scenes, audioPath: null as string | null };
-  }
-  const audioRelative = path.join(videoId, `audio-${randomUUID().slice(0, 6)}.mp3`);
-  const audioAbsolute = resolveMediaPath(audioRelative);
-  try {
-    await runFile(
-      ffmpegPath,
-      ["-y", "-i", absoluteVideoPath, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "64k", audioAbsolute],
-      { maxBuffer: 8 * 1024 * 1024, signal },
-    );
-  } catch (error) {
-    if (signal?.aborted) throw error;
-    return { ...metadata, scenes, audioPath: null as string | null };
-  }
-  return { ...metadata, scenes, audioPath: audioRelative };
+  return { ...metadata, scenes };
 }
 
-export async function splitAudioForQwenAsr(relativeAudioPath: string, durationSeconds: number, signal?: AbortSignal) {
-  if (durationSeconds <= 295) return [relativeAudioPath];
-  const source = resolveMediaPath(relativeAudioPath);
-  const chunksDirectory = path.join(path.dirname(source), `asr-${randomUUID().slice(0, 6)}`);
-  mkdirSync(chunksDirectory, { recursive: true });
+const QWEN_INLINE_VIDEO_LIMIT = 6 * 1024 * 1024;
+
+/**
+ * OpenAI-compatible Qwen requests can only inline a small Base64 video. Keep
+ * the entire local-upload timeline and audio, but transcode an analysis proxy when
+ * the original is too large. TikTok links use TokScript's public media URL and
+ * do not pay this local transcode cost.
+ */
+export async function prepareLocalVideoForQwen(
+  videoId: string,
+  relativeVideoPath: string,
+  durationSeconds: number,
+  signal?: AbortSignal,
+) {
+  const source = resolveMediaPath(relativeVideoPath);
+  if (statSync(source).size <= QWEN_INLINE_VIDEO_LIMIT) return relativeVideoPath;
+
+  const relative = path.join(videoId, "qwen-full-video.mp4");
+  const target = resolveMediaPath(relative);
+  mkdirSync(path.dirname(target), { recursive: true });
+  const targetBytes = 5 * 1024 * 1024;
+  const audioKbps = 32;
+  const totalKbps = Math.floor((targetBytes * 8) / Math.max(2, durationSeconds) / 1_000);
+  const bitrateKbps = Math.max(24, Math.min(1_200, totalKbps - audioKbps));
   await runFile(
     ffmpegPath,
-    ["-y", "-i", source, "-f", "segment", "-segment_time", "270", "-reset_timestamps", "1", "-c", "copy", path.join(chunksDirectory, "chunk-%02d.mp3")],
-    { maxBuffer: 8 * 1024 * 1024, signal },
+    [
+      "-y", "-i", source,
+      "-vf", "scale='min(640,iw)':-2",
+      "-c:v", "libx264",
+      "-preset", "veryfast",
+      "-b:v", `${bitrateKbps}k`,
+      "-maxrate", `${bitrateKbps}k`,
+      "-bufsize", `${bitrateKbps * 2}k`,
+      "-c:a", "aac",
+      "-b:a", `${audioKbps}k`,
+      "-ac", "1",
+      "-ar", "16000",
+      "-movflags", "+faststart",
+      target,
+    ],
+    { maxBuffer: 16 * 1024 * 1024, signal },
   );
-  return readdirSync(chunksDirectory)
-    .filter((name) => /^chunk-\d+\.mp3$/.test(name))
-    .sort()
-    .map((name) => path.relative(mediaRoot, path.join(chunksDirectory, name)));
+  if (statSync(target).size > QWEN_INLINE_VIDEO_LIMIT) {
+    rmSync(target, { force: true });
+    throw new Error("本地视频压缩后仍超过 Qwen 完整视频直传限制");
+  }
+  return relative;
 }
 
 export async function createSceneClip(videoId: string, relativeVideoPath: string, start: number, end: number, label: string, signal?: AbortSignal) {

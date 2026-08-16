@@ -174,16 +174,18 @@ export async function POST(request: NextRequest) {
         });
       }
     });
+    // Feishu's automation runner accepts any 2xx response, but the Base button
+    // client can still surface its internal `-8` toast for an asynchronous 202
+    // response. Return a conventional, minimal 200 success envelope instead.
+    // The background job remains responsible for creating and writing the card.
     return NextResponse.json({
-      ok: true,
-      accepted: true,
-      status: "后台处理中",
-      fields: {},
-      patch: {},
-      productDocument: "",
-      writeBack: true,
-      writeBackError: "",
-    }, { status: 202 });
+      code: 0,
+      msg: "success",
+      data: {
+        accepted: true,
+        status: "后台处理中",
+      },
+    });
   } catch (error) {
     return NextResponse.json({ error: safeBackgroundError(error) }, { status: 500 });
   }

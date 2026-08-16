@@ -12,6 +12,11 @@ function cleanUrl(value: string) {
   return value.replace(/[，。；;、!！?？)）\]】}]+$/g, "");
 }
 
+function isTikTokHost(hostname: string) {
+  const host = hostname.toLowerCase();
+  return host === "tiktok.com" || host.endsWith(".tiktok.com");
+}
+
 function cleanProductName(value: string) {
   return value
     .replace(/<at\b[^>]*>.*?<\/at>/gi, " ")
@@ -24,16 +29,16 @@ function cleanProductName(value: string) {
 
 export function parseFeishuSubmission(content: string): ParsedFeishuSubmission {
   const allUrls = (content.match(urlPattern) || []).map(cleanUrl);
-  const urls = [...new Set(allUrls.filter((value) => {
+  const urls = allUrls.filter((value) => {
     try {
-      return new URL(value).hostname.toLowerCase().endsWith("tiktok.com");
+      return isTikTokHost(new URL(value).hostname);
     } catch {
       return false;
     }
-  }))].slice(0, 10);
+  }).slice(0, 10);
   const unsupportedUrls = allUrls.filter((value) => {
     try {
-      return !new URL(value).hostname.toLowerCase().endsWith("tiktok.com");
+      return !isTikTokHost(new URL(value).hostname);
     } catch {
       return true;
     }
@@ -67,7 +72,7 @@ export function parseFeishuSubmission(content: string): ParsedFeishuSubmission {
   if (!urls.length) error = unsupportedUrls.length ? "目前只支持 TikTok 链接" : "没有识别到 TikTok 链接";
   else if (!productName) error = "没有识别到产品名称，请发送“产品名称 + TikTok 链接”";
   else if (allUrls.filter((value) => {
-    try { return new URL(value).hostname.toLowerCase().endsWith("tiktok.com"); } catch { return false; }
+    try { return isTikTokHost(new URL(value).hostname); } catch { return false; }
   }).length > 10) error = "一次最多提交 10 条 TikTok 链接";
 
   return { productName, pid, urls, unsupportedUrls, error };

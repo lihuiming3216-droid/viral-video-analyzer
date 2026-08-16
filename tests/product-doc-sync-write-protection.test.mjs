@@ -11,12 +11,40 @@ const syncSource = await readFile(
 async function loadSyncModule() {
   const stubSource = `
     const hooks = () => globalThis.__productDocSyncWriteProtectionHooks || {};
+    const rowBindings = new Map();
+    const initializedDocuments = new Set();
+    let activeHooks;
+    const resetState = () => {
+      const current = hooks();
+      if (activeHooks !== current) {
+        rowBindings.clear();
+        initializedDocuments.clear();
+        activeHooks = current;
+      }
+      return current;
+    };
     export const createVideo = (...args) => hooks().createVideo?.(...args);
+    export const deleteProductDocumentVideoRow = (documentId, linkBlockId) => {
+      const current = resetState();
+      if (current.deleteProductDocumentVideoRow) return current.deleteProductDocumentVideoRow(documentId, linkBlockId);
+      rowBindings.delete(documentId + ":" + linkBlockId);
+    };
     export const getProduct = (...args) => hooks().getProduct?.(...args) || null;
+    export const getProductDocumentVideoRow = (documentId, linkBlockId) => { const current = resetState(); return current.getProductDocumentVideoRow?.(documentId, linkBlockId) || rowBindings.get(documentId + ":" + linkBlockId) || null; };
+    export const getProductDocumentVideoRowByVideoId = (videoId) => { const current = resetState(); return current.getProductDocumentVideoRowByVideoId?.(videoId) || [...rowBindings.values()].find((row) => row.videoId === videoId) || null; };
     export const getVideo = (...args) => hooks().getVideo?.(...args) || null;
     export const getVideoBySourceUrl = (...args) => hooks().getVideoBySourceUrl?.(...args) || null;
+    export const isProductDocumentVideoRowsInitialized = (documentId) => { const current = resetState(); return current.isProductDocumentVideoRowsInitialized?.(documentId) ?? initializedDocuments.has(documentId); };
     export const listFeishuProductCardMappingsByProductId = (...args) => hooks().listFeishuProductCardMappingsByProductId?.(...args) || [];
     export const listProducts = (...args) => hooks().listProducts?.(...args) || [];
+    export const markProductDocumentVideoRowsInitialized = (documentId) => { const current = resetState(); return current.markProductDocumentVideoRowsInitialized?.(documentId) ?? initializedDocuments.add(documentId); };
+    export const saveProductDocumentVideoRow = (input) => {
+      const current = resetState();
+      if (current.saveProductDocumentVideoRow) return current.saveProductDocumentVideoRow(input);
+      const row = { ...input };
+      rowBindings.set(input.documentId + ":" + input.linkBlockId, row);
+      return row;
+    };
     export const updateVideo = (...args) => hooks().updateVideo?.(...args) || null;
     export const listFeishuDocumentBlocks = (...args) => hooks().listFeishuDocumentBlocks?.(...args) || [];
     export const updateFeishuTextBlock = (...args) => hooks().updateFeishuTextBlock?.(...args);
@@ -84,6 +112,34 @@ function documentBlocks(rows) {
 }
 
 const syncModule = await loadSyncModule();
+
+test("writes to the same Feishu document are serialized", async () => {
+  let releaseFirst;
+  const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+  let calls = 0;
+  let active = 0;
+  let maxActive = 0;
+  globalThis.__productDocSyncWriteProtectionHooks = {
+    listFeishuDocumentBlocks: async () => {
+      calls += 1;
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      if (calls === 1) await firstGate;
+      active -= 1;
+      return [];
+    },
+  };
+  const product = { id: "serial-product", documentId: "serial-document" };
+  const first = syncModule.syncProductDocument({}, product);
+  while (calls < 1) await new Promise((resolve) => setTimeout(resolve, 1));
+  const second = syncModule.syncProductDocument({}, product);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(calls, 1, "the second write waits for the first document operation");
+  releaseFirst();
+  await Promise.all([first, second]);
+  assert.equal(calls, 2);
+  assert.equal(maxActive, 1);
+});
 
 test("completed document sync fills only independently blank analysis and translation cells", async () => {
   const rows = [
@@ -263,11 +319,13 @@ test("document sync worker waits twenty seconds before its first scan", () => {
   }
 });
 
-test("a newly completed video is delivered to its exact document row immediately", async () => {
+test("a newly completed video is delivered to only its bound document row", async () => {
   const link = "https://www.tiktok.com/@demo/video/7999999999999999999";
   const video = {
     id: "video-direct",
     productId: "product-direct",
+    sourceType: "tiktok",
+    sourceUrl: new URL(link).toString(),
     status: "completed",
     transcriptZh: "直接写入的翻译",
     errorMessage: null,
@@ -320,13 +378,12 @@ test("a newly completed video is delivered to its exact document row immediately
   try {
     assert.equal(await syncModule.syncCompletedVideoToProductDocument(video.id), true);
     assert.deepEqual(scans, documentIds, "the canonical document duplicated by its mapping is scanned once");
-    for (const documentId of documentIds) {
-      assert.deepEqual(writes.filter((write) => write.documentId === documentId), [
-        { documentId, blockId: rowTextIds[0].status, content: "" },
-        { documentId, blockId: rowTextIds[0].analysis, content: "直接写入的视频分析" },
-        { documentId, blockId: rowTextIds[0].translation, content: "直接写入的翻译" },
-      ], `the completed video must be delivered to its exact row in ${documentId}`);
-    }
+    assert.deepEqual(writes.filter((write) => write.documentId === documentIds[0]), [
+      { documentId: documentIds[0], blockId: rowTextIds[0].status, content: "" },
+      { documentId: documentIds[0], blockId: rowTextIds[0].analysis, content: "直接写入的视频分析" },
+      { documentId: documentIds[0], blockId: rowTextIds[0].translation, content: "直接写入的翻译" },
+    ]);
+    assert.deepEqual(writes.filter((write) => write.documentId === documentIds[1]), [], "one task is bound to one document row");
   } finally {
     delete globalThis.__productDocSyncWriteProtectionHooks;
   }
@@ -375,7 +432,7 @@ test("periodic sync discovers a new link in the second row-mapped document witho
     getVideoBySourceUrl: () => null,
     createVideo: (input) => {
       created.push(input);
-      return { id: "video-from-second-document", status: "waiting" };
+      return { id: "video-from-second-document", status: "queued" };
     },
     enqueueVideos: (ids) => enqueued.push(...ids),
     updateFeishuTextBlock: async (_client, documentId, blockId, content) => {
@@ -586,7 +643,7 @@ test("a malformed earlier row cannot block later new links", async () => {
   }
 });
 
-test("duplicate document links create one task and both rows share it", async () => {
+test("duplicate document links create independent tasks for each row", async () => {
   const link = "https://www.tiktok.com/t/ZP8Duplicate/";
   const { blocks } = documentBlocks([
     { link, status: "", analysis: "", translation: "" },
@@ -600,7 +657,7 @@ test("duplicate document links create one task and both rows share it", async ()
     getVideoBySourceUrl: () => stored,
     createVideo: () => {
       creates += 1;
-      stored = { id: "shared-video", status: "queued" };
+      stored = { id: `row-video-${creates}`, status: "queued" };
       return stored;
     },
     enqueueVideos: (ids) => enqueued.push(...ids),
@@ -608,10 +665,10 @@ test("duplicate document links create one task and both rows share it", async ()
   try {
     assert.deepEqual(
       await syncModule.syncProductDocument({}, { id: "product-duplicate", documentId: "document-duplicate" }),
-      { found: 2, queued: 1, completed: 0, failed: 0 },
+      { found: 2, queued: 2, completed: 0, failed: 0 },
     );
-    assert.equal(creates, 1);
-    assert.deepEqual(enqueued, ["shared-video"]);
+    assert.equal(creates, 2);
+    assert.deepEqual(enqueued, ["row-video-1", "row-video-2"]);
   } finally {
     delete globalThis.__productDocSyncWriteProtectionHooks;
   }
@@ -648,6 +705,47 @@ test("failed product-document analysis retries twice without writing status text
       writes.filter((write) => write.blockId === rowTextIds[0].status),
       [{ blockId: rowTextIds[0].status, content: "" }],
     );
+  } finally {
+    delete globalThis.__productDocSyncWriteProtectionHooks;
+  }
+});
+
+test("a stopped document task stays stopped and is shown without automatic requeue", async () => {
+  const link = "https://www.tiktok.com/@demo/video/7000000000000000250";
+  const { blocks, rowTextIds } = documentBlocks([{ link, status: "", analysis: "", translation: "" }]);
+  const video = {
+    id: "stopped-video",
+    productId: "product-stopped",
+    sourceType: "tiktok",
+    sourceUrl: new URL(link).toString(),
+    status: "stopped",
+    analysisMode: "product_doc",
+    errorMessage: "用户停止",
+  };
+  const latestText = new Map(blocks.filter((block) => block.text).map((block) => [block.block_id, block]));
+  const writes = [];
+  const enqueued = [];
+  const client = {
+    request: async ({ url }) => {
+      if (!String(url).includes("/blocks/")) return { data: { document: { revision_id: 77 } } };
+      const blockId = decodeURIComponent(String(url).split("/").at(-1));
+      return { data: { block: latestText.get(blockId) } };
+    },
+  };
+  globalThis.__productDocSyncWriteProtectionHooks = {
+    listFeishuDocumentBlocks: () => blocks,
+    getVideo: () => video,
+    getVideoBySourceUrl: () => video,
+    enqueueVideos: (ids) => enqueued.push(...ids),
+    updateFeishuTextBlock: async (_client, _documentId, blockId, content) => writes.push({ blockId, content }),
+  };
+  try {
+    assert.deepEqual(
+      await syncModule.syncProductDocument(client, { id: video.productId, documentId: "document-stopped" }),
+      { found: 1, queued: 0, completed: 0, failed: 1 },
+    );
+    assert.deepEqual(enqueued, []);
+    assert.deepEqual(writes, [{ blockId: rowTextIds[0].analysis, content: "已停止，请重新粘贴视频链接" }]);
   } finally {
     delete globalThis.__productDocSyncWriteProtectionHooks;
   }

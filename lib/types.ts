@@ -153,6 +153,10 @@ export interface VideoRecord {
   analysisMode: "full" | "product_doc";
   /** Automatic whole-task retries used only by product-document rows. */
   productDocRetryCount: number;
+  /** Timestamp of the current execution attempt; queue waiting is excluded. */
+  processingStartedAt: string | null;
+  /** Number of times this task has actually started processing. */
+  attemptCount: number;
 }
 
 export interface SceneRecord {

@@ -99,7 +99,7 @@ function initialize(db: DatabaseSync) {
       id TEXT PRIMARY KEY,
       product_id TEXT NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
       source_type TEXT NOT NULL,
-      source_url TEXT UNIQUE,
+      source_url TEXT,
       source_file_name TEXT,
       analysis_mode TEXT NOT NULL DEFAULT 'full',
       title TEXT NOT NULL DEFAULT '',
@@ -137,6 +137,8 @@ function initialize(db: DatabaseSync) {
       transcript_segments_json TEXT NOT NULL DEFAULT '[]',
       analysis_json TEXT,
       provider_payload_json TEXT,
+      processing_started_at TEXT,
+      attempt_count INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -230,6 +232,28 @@ function initialize(db: DatabaseSync) {
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       PRIMARY KEY(video_id, app_token, table_id, record_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_feishu_automation_jobs_row
+      ON feishu_automation_jobs(app_token, table_id, record_id, updated_at);
+
+    CREATE TABLE IF NOT EXISTS product_document_video_rows (
+      document_id TEXT NOT NULL,
+      link_block_id TEXT NOT NULL,
+      product_id TEXT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+      source_url TEXT NOT NULL,
+      video_id TEXT NOT NULL UNIQUE REFERENCES videos(id) ON DELETE CASCADE,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY(document_id, link_block_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_product_document_video_rows_product_url
+      ON product_document_video_rows(product_id, source_url, updated_at DESC);
+
+    CREATE TABLE IF NOT EXISTS product_document_video_scan_state (
+      document_id TEXT PRIMARY KEY,
+      initialized_at TEXT NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS feishu_product_card_mappings (
@@ -370,6 +394,116 @@ function initialize(db: DatabaseSync) {
   if (!videoColumns.some((column) => String(column.name) === "product_doc_retry_count")) {
     db.exec("ALTER TABLE videos ADD COLUMN product_doc_retry_count INTEGER NOT NULL DEFAULT 0");
   }
+  if (!videoColumns.some((column) => String(column.name) === "processing_started_at")) {
+    db.exec("ALTER TABLE videos ADD COLUMN processing_started_at TEXT");
+  }
+  if (!videoColumns.some((column) => String(column.name) === "attempt_count")) {
+    db.exec("ALTER TABLE videos ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0");
+  }
+
+  // Older databases made source_url globally unique. A repeated submission is
+  // a new task with its own timeout, error history and result, so rebuild the
+  // table once without that legacy constraint. Foreign-key rows keep referring
+  // to the same video ids throughout the in-place migration.
+  const sourceUrlUniqueIndex = (db.prepare("PRAGMA index_list(videos)").all() as Array<Record<string, unknown>>)
+    .find((index) => {
+      if (!Number(index.unique)) return false;
+      const columns = db.prepare(`PRAGMA index_info(${JSON.stringify(String(index.name))})`).all() as Array<Record<string, unknown>>;
+      return columns.length === 1 && String(columns[0]?.name) === "source_url";
+    });
+  if (sourceUrlUniqueIndex) {
+    const columns = (db.prepare("PRAGMA table_info(videos)").all() as Array<Record<string, unknown>>)
+      .map((column) => String(column.name));
+    const columnList = columns.map((column) => `"${column.replaceAll('"', '""')}"`).join(", ");
+    db.exec("PRAGMA foreign_keys = OFF");
+    try {
+      db.exec(`
+        BEGIN IMMEDIATE;
+        CREATE TABLE videos_next (
+          id TEXT PRIMARY KEY,
+          product_id TEXT NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+          source_type TEXT NOT NULL,
+          source_url TEXT,
+          source_file_name TEXT,
+          analysis_mode TEXT NOT NULL DEFAULT 'full',
+          title TEXT NOT NULL DEFAULT '',
+          account_name TEXT NOT NULL DEFAULT '',
+          platform_video_id TEXT,
+          language TEXT,
+          published_at TEXT,
+          duration_seconds REAL,
+          original_path TEXT,
+          cover_path TEXT,
+          remote_video_url TEXT,
+          status TEXT NOT NULL DEFAULT 'waiting',
+          stage TEXT NOT NULL DEFAULT '等待分析',
+          progress INTEGER NOT NULL DEFAULT 0,
+          error_message TEXT,
+          score_traffic INTEGER NOT NULL DEFAULT 0,
+          score_conversion INTEGER NOT NULL DEFAULT 0,
+          score_visual INTEGER NOT NULL DEFAULT 0,
+          score_product INTEGER NOT NULL DEFAULT 0,
+          score_audio INTEGER NOT NULL DEFAULT 0,
+          score_rhythm INTEGER NOT NULL DEFAULT 0,
+          summary TEXT NOT NULL DEFAULT '',
+          hook_summary TEXT NOT NULL DEFAULT '',
+          manual_label TEXT,
+          manual_notes TEXT NOT NULL DEFAULT '',
+          view_count INTEGER,
+          like_count INTEGER,
+          comment_count INTEGER,
+          share_count INTEGER,
+          favorite_count INTEGER,
+          follower_count INTEGER,
+          stats_captured_at TEXT,
+          transcript_original TEXT NOT NULL DEFAULT '',
+          transcript_zh TEXT NOT NULL DEFAULT '',
+          transcript_segments_json TEXT NOT NULL DEFAULT '[]',
+          analysis_json TEXT,
+          provider_payload_json TEXT,
+          product_doc_retry_count INTEGER NOT NULL DEFAULT 0,
+          processing_started_at TEXT,
+          attempt_count INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        INSERT INTO videos_next (${columnList}) SELECT ${columnList} FROM videos;
+        DROP TABLE videos;
+        ALTER TABLE videos_next RENAME TO videos;
+        COMMIT;
+      `);
+    } catch (error) {
+      try { db.exec("ROLLBACK"); } catch { /* transaction already closed */ }
+      throw error;
+    } finally {
+      db.exec("PRAGMA foreign_keys = ON");
+    }
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_videos_product_created ON videos(product_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_videos_account_created ON videos(account_name, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_videos_status ON videos(status);
+      CREATE INDEX IF NOT EXISTS idx_videos_published_at ON videos(published_at);
+      CREATE INDEX IF NOT EXISTS idx_videos_source_url ON videos(source_url, created_at DESC);
+    `);
+  } else {
+    db.exec("CREATE INDEX IF NOT EXISTS idx_videos_source_url ON videos(source_url, created_at DESC)");
+  }
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS video_attempts (
+      id TEXT PRIMARY KEY,
+      video_id TEXT NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+      attempt_number INTEGER NOT NULL,
+      status TEXT NOT NULL,
+      error_message TEXT NOT NULL DEFAULT '',
+      started_at TEXT NOT NULL,
+      finished_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_video_attempts_video_started
+      ON video_attempts(video_id, started_at DESC);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_video_attempts_video_number
+      ON video_attempts(video_id, attempt_number);
+  `);
   const feishuSettingsColumns = db.prepare("PRAGMA table_info(feishu_settings)").all() as Array<Record<string, unknown>>;
   for (const [name, definition] of [
     ["product_folder_token", "TEXT NOT NULL DEFAULT ''"],
@@ -414,6 +548,8 @@ function initialize(db: DatabaseSync) {
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_feishu_automation_jobs_video
       ON feishu_automation_jobs(video_id, updated_at);
+    CREATE INDEX IF NOT EXISTS idx_feishu_automation_jobs_row
+      ON feishu_automation_jobs(app_token, table_id, record_id, updated_at);
   `);
   // Older installations do not have this mapping table. CREATE TABLE above
   // handles that case; the column migration also tolerates an early/partial
@@ -664,15 +800,33 @@ export function saveFeishuAutomationJob(input: {
   fieldMap?: Record<string, string>;
 }) {
   const timestamp = now();
-  getDb().prepare(`INSERT INTO feishu_automation_jobs(
-    video_id, app_token, table_id, record_id, field_map_json, created_at, updated_at
-  ) VALUES (?, ?, ?, ?, ?, ?, ?)
-  ON CONFLICT(video_id, app_token, table_id, record_id) DO UPDATE SET
-    field_map_json=excluded.field_map_json, updated_at=excluded.updated_at`)
-    .run(
-      input.videoId.trim(), input.appToken.trim(), input.tableId.trim(), input.recordId.trim(),
-      JSON.stringify(safeFeishuAutomationFieldMap(input.fieldMap)), timestamp, timestamp,
-    );
+  const videoId = input.videoId.trim();
+  const appToken = input.appToken.trim();
+  const tableId = input.tableId.trim();
+  const recordId = input.recordId.trim();
+  const db = getDb();
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    // A Base row has exactly one current delivery generation. A later click
+    // supersedes every older task for that row, while the same video may still
+    // deliver independently to other Base rows.
+    db.prepare(`DELETE FROM feishu_automation_jobs
+      WHERE app_token=? AND table_id=? AND record_id=? AND video_id<>?`)
+      .run(appToken, tableId, recordId, videoId);
+    db.prepare(`INSERT INTO feishu_automation_jobs(
+      video_id, app_token, table_id, record_id, field_map_json, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(video_id, app_token, table_id, record_id) DO UPDATE SET
+      field_map_json=excluded.field_map_json, updated_at=excluded.updated_at`)
+      .run(
+        videoId, appToken, tableId, recordId,
+        JSON.stringify(safeFeishuAutomationFieldMap(input.fieldMap)), timestamp, timestamp,
+      );
+    db.exec("COMMIT");
+  } catch (error) {
+    try { db.exec("ROLLBACK"); } catch { /* transaction already closed */ }
+    throw error;
+  }
 }
 
 export function getFeishuAutomationJob(videoId: string) {
@@ -794,6 +948,8 @@ function videoFromRow(row: Record<string, unknown>): VideoRecord {
     analysis: json<AnalysisResult | null>(row.analysis_json, null),
     analysisMode: row.analysis_mode === "product_doc" ? "product_doc" : "full",
     productDocRetryCount: Number(row.product_doc_retry_count ?? 0),
+    processingStartedAt: row.processing_started_at ? String(row.processing_started_at) : null,
+    attemptCount: Number(row.attempt_count ?? 0),
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
   };
@@ -1151,12 +1307,88 @@ export function listVideos(filters: { search?: string; productId?: string; accou
     .map((row) => videoFromRow(row as Record<string, unknown>));
 }
 
-export function getVideoBySourceUrl(sourceUrl: string) {
+export interface ProductDocumentVideoRow {
+  documentId: string;
+  linkBlockId: string;
+  productId: string;
+  sourceUrl: string;
+  videoId: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+function productDocumentVideoRowFromDb(row: Record<string, unknown>): ProductDocumentVideoRow {
+  return {
+    documentId: String(row.document_id),
+    linkBlockId: String(row.link_block_id),
+    productId: String(row.product_id),
+    sourceUrl: String(row.source_url),
+    videoId: String(row.video_id),
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+  };
+}
+
+export function getProductDocumentVideoRow(documentId: string, linkBlockId: string) {
+  const row = getDb().prepare(`SELECT * FROM product_document_video_rows
+    WHERE document_id=? AND link_block_id=?`).get(documentId.trim(), linkBlockId.trim()) as Record<string, unknown> | undefined;
+  return row ? productDocumentVideoRowFromDb(row) : null;
+}
+
+export function getProductDocumentVideoRowByVideoId(videoId: string) {
+  const row = getDb().prepare("SELECT * FROM product_document_video_rows WHERE video_id=?")
+    .get(videoId.trim()) as Record<string, unknown> | undefined;
+  return row ? productDocumentVideoRowFromDb(row) : null;
+}
+
+export function saveProductDocumentVideoRow(input: {
+  documentId: string;
+  linkBlockId: string;
+  productId: string;
+  sourceUrl: string;
+  videoId: string;
+}) {
+  const timestamp = now();
+  getDb().prepare(`INSERT INTO product_document_video_rows(
+    document_id, link_block_id, product_id, source_url, video_id, created_at, updated_at
+  ) VALUES (?, ?, ?, ?, ?, ?, ?)
+  ON CONFLICT(document_id, link_block_id) DO UPDATE SET
+    product_id=excluded.product_id,
+    source_url=excluded.source_url,
+    video_id=excluded.video_id,
+    updated_at=excluded.updated_at`)
+    .run(
+      input.documentId.trim(), input.linkBlockId.trim(), input.productId.trim(),
+      input.sourceUrl.trim(), input.videoId.trim(), timestamp, timestamp,
+    );
+  return getProductDocumentVideoRow(input.documentId, input.linkBlockId)!;
+}
+
+export function deleteProductDocumentVideoRow(documentId: string, linkBlockId: string) {
+  return getDb().prepare(`DELETE FROM product_document_video_rows
+    WHERE document_id=? AND link_block_id=?`).run(documentId.trim(), linkBlockId.trim());
+}
+
+export function isProductDocumentVideoRowsInitialized(documentId: string) {
+  return Boolean(getDb().prepare("SELECT 1 FROM product_document_video_scan_state WHERE document_id=?")
+    .get(documentId.trim()));
+}
+
+export function markProductDocumentVideoRowsInitialized(documentId: string) {
+  getDb().prepare(`INSERT INTO product_document_video_scan_state(document_id, initialized_at)
+    VALUES (?, ?) ON CONFLICT(document_id) DO NOTHING`).run(documentId.trim(), now());
+}
+
+export function getVideoBySourceUrl(sourceUrl: string, productId?: string) {
   const normalized = sourceUrl.trim();
   if (!normalized) return null;
-  const row = getDb()
-    .prepare("SELECT v.*, p.name AS product_name FROM videos v JOIN products p ON p.id=v.product_id WHERE v.source_url=?")
-    .get(normalized) as Record<string, unknown> | undefined;
+  const row = productId
+    ? getDb().prepare(`SELECT v.*, p.name AS product_name FROM videos v JOIN products p ON p.id=v.product_id
+        WHERE v.source_url=? AND v.product_id=? ORDER BY v.created_at DESC, v.rowid DESC LIMIT 1`)
+      .get(normalized, productId) as Record<string, unknown> | undefined
+    : getDb().prepare(`SELECT v.*, p.name AS product_name FROM videos v JOIN products p ON p.id=v.product_id
+        WHERE v.source_url=? ORDER BY v.created_at DESC, v.rowid DESC LIMIT 1`)
+      .get(normalized) as Record<string, unknown> | undefined;
   return row ? videoFromRow(row) : null;
 }
 
@@ -1209,7 +1441,7 @@ export function createVideo(input: {
 export function updateVideo(id: string, values: Record<string, unknown>) {
   const allowed = new Set([
     "product_id", "title", "account_name", "platform_video_id", "language", "published_at",
-    "analysis_mode", "product_doc_retry_count",
+    "analysis_mode", "product_doc_retry_count", "processing_started_at", "attempt_count",
     "duration_seconds", "original_path", "cover_path", "remote_video_url", "status", "stage", "progress",
     "error_message", "score_traffic", "score_conversion", "score_visual", "score_product", "score_audio",
     "score_rhythm", "summary", "hook_summary", "manual_label", "manual_notes", "view_count", "like_count",
@@ -1317,5 +1549,78 @@ export function getPendingVideoIds() {
   return getDb()
     .prepare("SELECT id FROM videos WHERE status IN ('queued','downloading','transcribing','extracting','analyzing') ORDER BY created_at")
     .all()
+    .map((row) => String((row as Record<string, unknown>).id));
+}
+
+export function startVideoAttempt(videoId: string) {
+  const db = getDb();
+  const timestamp = now();
+  const attemptId = randomUUID();
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const row = db.prepare("SELECT attempt_count FROM videos WHERE id=?").get(videoId) as Record<string, unknown> | undefined;
+    if (!row) throw new Error("视频不存在");
+    const attemptNumber = Number(row.attempt_count || 0) + 1;
+    db.prepare(`UPDATE video_attempts
+      SET status='stopped', error_message='新一轮处理启动，上一轮已中断', finished_at=?
+      WHERE video_id=? AND status='running' AND finished_at IS NULL`)
+      .run(timestamp, videoId);
+    db.prepare("UPDATE videos SET attempt_count=?, processing_started_at=?, updated_at=? WHERE id=?")
+      .run(attemptNumber, timestamp, timestamp, videoId);
+    db.prepare(`INSERT INTO video_attempts(
+      id, video_id, attempt_number, status, error_message, started_at, finished_at
+    ) VALUES (?, ?, ?, 'running', '', ?, NULL)`).run(attemptId, videoId, attemptNumber, timestamp);
+    db.exec("COMMIT");
+    return { attemptId, attemptNumber, startedAt: timestamp };
+  } catch (error) {
+    try { db.exec("ROLLBACK"); } catch { /* transaction already closed */ }
+    throw error;
+  }
+}
+
+export function finishVideoAttempt(
+  attemptId: string,
+  videoId: string,
+  status: "completed" | "failed" | "stopped",
+  errorMessage = "",
+) {
+  const db = getDb();
+  const timestamp = now();
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const attempt = db.prepare(`SELECT started_at FROM video_attempts
+      WHERE id=? AND video_id=? AND status='running' AND finished_at IS NULL`)
+      .get(attemptId, videoId) as Record<string, unknown> | undefined;
+    if (attempt) {
+      const result = db.prepare(`UPDATE video_attempts
+        SET status=?, error_message=?, finished_at=?
+        WHERE id=? AND video_id=? AND status='running' AND finished_at IS NULL`)
+        .run(status, errorMessage, timestamp, attemptId, videoId);
+      if (result.changes > 0) {
+        db.prepare(`UPDATE videos SET processing_started_at=NULL, updated_at=?
+          WHERE id=? AND processing_started_at=?`)
+          .run(timestamp, videoId, String(attempt.started_at));
+      }
+    }
+    db.exec("COMMIT");
+  } catch (error) {
+    try { db.exec("ROLLBACK"); } catch { /* transaction already closed */ }
+    throw error;
+  }
+}
+
+export function finishOpenVideoAttempts(videoId: string, status: "failed" | "stopped", errorMessage: string) {
+  const timestamp = now();
+  getDb().prepare(`UPDATE video_attempts SET status=?, error_message=?, finished_at=?
+    WHERE video_id=? AND status='running' AND finished_at IS NULL`)
+    .run(status, errorMessage, timestamp, videoId);
+}
+
+export function getStaleProcessingVideoIds(cutoffIso: string) {
+  return getDb().prepare(`SELECT id FROM videos
+    WHERE status IN ('downloading','transcribing','extracting','analyzing')
+      AND COALESCE(NULLIF(processing_started_at, ''), updated_at) < ?
+    ORDER BY COALESCE(NULLIF(processing_started_at, ''), updated_at)`)
+    .all(cutoffIso)
     .map((row) => String((row as Record<string, unknown>).id));
 }

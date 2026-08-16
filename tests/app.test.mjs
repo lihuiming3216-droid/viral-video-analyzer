@@ -197,10 +197,12 @@ test("Qwen uses bounded requests and outbound dependencies can use the macOS pro
   assert.doesNotMatch(qwen, /OpenAI/);
 });
 
-test("queue polling cannot enqueue the currently active video twice", async () => {
+test("queue runs two videos concurrently without enqueueing an active id twice", async () => {
   const queue = await readFile(new URL("lib/queue.ts", root), "utf8");
-  assert.match(queue, /__viralQueueActiveId/);
-  assert.match(queue, /__viralQueueActiveId !== id/);
+  assert.match(queue, /MAX_CONCURRENT_VIDEOS = 2/);
+  assert.match(queue, /__viralQueueActiveIds/);
+  assert.match(queue, /__viralQueueActiveIds!\.has\(id\)/);
+  assert.match(queue, /VIDEO_TASK_TIMEOUT_MS = 30 \* 60 \* 1_000/);
   assert.match(queue, /AbortController/);
   assert.match(queue, /controller\.abort/);
 });

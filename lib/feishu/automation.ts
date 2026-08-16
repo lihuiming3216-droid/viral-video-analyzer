@@ -4,8 +4,8 @@ import type { Client } from "@larksuiteoapi/node-sdk";
 import {
   createProduct, createVideo,
   deleteFeishuAutomationJob, getFeishuAutomationJobs,
-  getFeishuProductCardMapping, getProduct, getProductByPid, getVideo, getVideoBySourceUrl,
-  listFeishuAutomationJobVideoIds, saveFeishuAutomationJob, updateProduct, updateVideo,
+  getFeishuProductCardMapping, getProduct, getProductByPid, getVideo,
+  listFeishuAutomationJobVideoIds, saveFeishuAutomationJob, updateProduct,
   upsertFeishuProductCardMapping,
 } from "@/lib/database";
 import { ensureFeishuConnection, getConnectedFeishuChannel } from "@/lib/feishu/runtime";
@@ -227,39 +227,48 @@ export async function completeFeishuAutomation(videoId: string) {
     let allDelivered = true;
     for (const job of jobs) {
       try {
-        const productCardMapping = getFeishuProductCardMapping({
-          appToken: job.appToken,
-          tableId: job.tableId,
-          recordId: job.recordId,
-        });
-        const map = { ...defaultFeishuAutomationFieldMap, ...job.fieldMap };
-        const fields: Record<string, unknown> = {
-          [map.status]: video.status === "completed" ? "已完成" : video.status === "failed" ? "失败" : "已停止",
-        };
-        if (video.status === "completed") {
-          fields[map.analysis] = conciseProductDocAnalysis(video);
-          fields[map.translation] = video.transcriptZh || "暂无中文翻译";
-          const mappedDocumentUrl = productCardMapping?.documentUrl || product?.documentUrl;
-          if (mappedDocumentUrl) fields[map.productDocument] = mappedDocumentUrl;
-        } else if (video.errorMessage) {
-          fields[map.analysis] = `处理失败：${safeAutomationFailure(video.errorMessage)}`;
-        }
-        let delivered = false;
-        for (let attempt = 1; attempt <= 3; attempt += 1) {
-          try {
-            await patchBaseRecord(channel.rawClient, { ...job, fields });
-            delivered = true;
-            break;
-          } catch (error) {
-            if (isBaseRolePermissionError(error) || attempt === 3) break;
-            await new Promise((resolve) => setTimeout(resolve, attempt * 100));
+        const delivered = await withProductCardRecordLock(job, async () => {
+          // Re-read after acquiring the row lock. A newer click transactionally
+          // removes this job, so an older completion can never overwrite it.
+          const current = getFeishuAutomationJobs(videoId).find((candidate) => (
+            candidate.appToken === job.appToken
+            && candidate.tableId === job.tableId
+            && candidate.recordId === job.recordId
+          ));
+          if (!current) return true;
+          const productCardMapping = getFeishuProductCardMapping({
+            appToken: current.appToken,
+            tableId: current.tableId,
+            recordId: current.recordId,
+          });
+          const map = { ...defaultFeishuAutomationFieldMap, ...current.fieldMap };
+          const fields: Record<string, unknown> = {
+            [map.status]: video.status === "completed" ? "已完成" : video.status === "failed" ? "失败" : "已停止",
+          };
+          if (video.status === "completed") {
+            fields[map.analysis] = conciseProductDocAnalysis(video);
+            fields[map.translation] = video.transcriptZh || "暂无中文翻译";
+            const mappedDocumentUrl = productCardMapping?.documentUrl || product?.documentUrl;
+            if (mappedDocumentUrl) fields[map.productDocument] = mappedDocumentUrl;
+          } else if (video.errorMessage) {
+            fields[map.analysis] = `处理失败：${safeAutomationFailure(video.errorMessage)}`;
           }
-        }
+          for (let attempt = 1; attempt <= 3; attempt += 1) {
+            try {
+              await patchBaseRecord(channel.rawClient, { ...current, fields });
+              deleteFeishuAutomationJob(current);
+              return true;
+            } catch (error) {
+              if (isBaseRolePermissionError(error) || attempt === 3) return false;
+              await new Promise((resolve) => setTimeout(resolve, attempt * 100));
+            }
+          }
+          return false;
+        });
         if (!delivered) {
           allDelivered = false;
           continue;
         }
-        deleteFeishuAutomationJob(job);
       } catch {
         // A single Base row must never prevent the remaining deliveries. The
         // untouched job is the durable retry marker for a later completion run.
@@ -459,11 +468,7 @@ async function handleFeishuAutomationUnlocked(input: FeishuAutomationInput) {
   if (resolved.videoUrl) {
     const targetProduct = product || getProductByPid(resolved.pid) || getProduct("system-unclassified");
     if (!targetProduct) throw new Error("无法找到可归档视频的产品档案");
-    const matchedVideo = getVideoBySourceUrl(resolved.videoUrl);
-    const existing = matchedVideo && matchedVideo.productId !== targetProduct.id
-      ? updateVideo(matchedVideo.id, { product_id: targetProduct.id })
-      : matchedVideo;
-    const video = existing || createVideo({
+    const video = createVideo({
       productId: targetProduct.id,
       sourceType: "tiktok",
       sourceUrl: resolved.videoUrl,
@@ -479,19 +484,8 @@ async function handleFeishuAutomationUnlocked(input: FeishuAutomationInput) {
         fieldMap: resolved.map,
       });
     }
-    if (existing?.status === "completed") {
-      // Reusing a finished URL must not spend API tokens a second time.
-      if (writeBack) await completeFeishuAutomation(video.id);
-      queuePatch({
-        [resolved.map.status]: "已完成",
-        [resolved.map.analysis]: conciseProductDocAnalysis(video),
-        [resolved.map.translation]: video.transcriptZh || "暂无中文翻译",
-        [resolved.map.productDocument]: shell.documentUrl,
-      });
-    } else {
-      enqueueVideos([video.id]);
-      queuePatch({ [resolved.map.status]: "排队中" });
-    }
+    enqueueVideos([video.id]);
+    queuePatch({ [resolved.map.status]: "排队中" });
   }
 
   await flushPatch();

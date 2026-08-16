@@ -4,11 +4,17 @@ import path from "node:path";
 import type { Client } from "@larksuiteoapi/node-sdk";
 import {
   createVideo,
+  deleteProductDocumentVideoRow,
   getProduct,
+  getProductDocumentVideoRow,
+  getProductDocumentVideoRowByVideoId,
   getVideo,
   getVideoBySourceUrl,
+  isProductDocumentVideoRowsInitialized,
   listFeishuProductCardMappingsByProductId,
   listProducts,
+  markProductDocumentVideoRowsInitialized,
+  saveProductDocumentVideoRow,
   updateVideo,
 } from "@/lib/database";
 import { listFeishuDocumentBlocks, updateFeishuTextBlock } from "@/lib/feishu/document";
@@ -39,12 +45,14 @@ type WorkerGlobal = typeof globalThis & {
   __productDocSyncRunning?: boolean;
   __productDocSyncCursor?: number;
   __productDocSyncLastError?: string;
+  __productDocSyncLocks?: Map<string, Promise<unknown>>;
 };
 
 const workerState = globalThis as WorkerGlobal;
 workerState.__productDocSyncRunning ||= false;
 workerState.__productDocSyncCursor ||= 0;
 workerState.__productDocSyncLastError ||= "";
+workerState.__productDocSyncLocks ||= new Map<string, Promise<unknown>>();
 const attachmentErrors = new Set<string>();
 const rowErrors = new Set<string>();
 const deliveredFailureCells = new Set<string>();
@@ -207,7 +215,20 @@ async function updateBlankResultCell(
   return updateIfChanged(client, documentId, blockId, "", normalizedNext, { documentRevisionId });
 }
 
-export async function syncProductDocument(
+async function withProductDocumentLock<T>(documentId: string, task: () => Promise<T>) {
+  const previous = workerState.__productDocSyncLocks!.get(documentId) || Promise.resolve();
+  const current = previous.catch(() => undefined).then(task);
+  workerState.__productDocSyncLocks!.set(documentId, current);
+  try {
+    return await current;
+  } finally {
+    if (workerState.__productDocSyncLocks!.get(documentId) === current) {
+      workerState.__productDocSyncLocks!.delete(documentId);
+    }
+  }
+}
+
+async function syncProductDocumentUnlocked(
   client: Client,
   product: Product,
   options: { onlyVideoId?: string } = {},
@@ -218,35 +239,76 @@ export async function syncProductDocument(
   const readBlock = createBlockReader(client, product.documentId, blocks);
   const table = await findVideoTable(blocks, readBlock);
   if (!table) return result;
+  const migrationMode = !isProductDocumentVideoRowsInitialized(product.documentId);
 
   const cells = table.table?.cells || [];
   for (let rowStart = 4; rowStart + 3 < cells.length; rowStart += 4) {
     try {
       const row = await Promise.all(cells.slice(rowStart, rowStart + 4).map((cellId) => cellText(cellId, readBlock)));
+      const linkBlockId = row[0].textId;
+      if (linkBlockId && !row[0].text.trim()) {
+        deleteProductDocumentVideoRow(product.documentId, linkBlockId);
+        continue;
+      }
       const link = normalizeTikTokUrl(row[0].text);
       // The second cell is a video-only container and may legitimately have no
       // text block. The other three columns remain text-backed.
-      if (!link || !row[0].textId || !row[2].textId || !row[3].textId) continue;
-      let video = getVideoBySourceUrl(link);
-      if (options.onlyVideoId && video?.id !== options.onlyVideoId) continue;
-      result.found += 1;
+      if (!link || !linkBlockId || !row[2].textId || !row[3].textId) continue;
+      const binding = getProductDocumentVideoRow(product.documentId, linkBlockId);
+      let video = binding?.sourceUrl === link ? getVideo(binding.videoId, false) : null;
+      if (binding && !video) {
+        const exactLegacy = getVideoBySourceUrl(link, product.id);
+        if (exactLegacy?.id === binding.videoId) video = exactLegacy;
+      }
+      if (options.onlyVideoId) {
+        if (binding && binding.videoId !== options.onlyVideoId) continue;
+        if (!video) {
+          const exact = getVideo(options.onlyVideoId, false);
+          if (!exact || exact.productId !== product.id || exact.sourceUrl !== link) continue;
+          const claimed = getProductDocumentVideoRowByVideoId(exact.id);
+          if (claimed && (claimed.documentId !== product.documentId || claimed.linkBlockId !== linkBlockId)) continue;
+          video = exact;
+          saveProductDocumentVideoRow({
+            documentId: product.documentId,
+            linkBlockId,
+            productId: product.id,
+            sourceUrl: link,
+            videoId: exact.id,
+          });
+        }
+      }
       // This cell is now reserved for the playable MP4. Remove legacy textual
       // states once, without touching the preview/view children.
       if (row[1].textId && row[1].text) {
         await updateIfChanged(client, product.documentId, row[1].textId, row[1].text, "");
       }
       if (!video) {
-        video = createVideo({
+        const legacy = migrationMode && !binding ? getVideoBySourceUrl(link, product.id) : null;
+        const legacyClaim = legacy ? getProductDocumentVideoRowByVideoId(legacy.id) : null;
+        video = legacy && !legacyClaim
+          ? legacy
+          : createVideo({
+            productId: product.id,
+            sourceType: "tiktok",
+            sourceUrl: link,
+            title: `文档样片 ${rowStart / 4}`,
+            analysisMode: "product_doc",
+          });
+        saveProductDocumentVideoRow({
+          documentId: product.documentId,
+          linkBlockId,
           productId: product.id,
-          sourceType: "tiktok",
           sourceUrl: link,
-          title: `文档样片 ${rowStart / 4}`,
-          analysisMode: "product_doc",
+          videoId: video.id,
         });
-        enqueueVideos([video.id]);
-        result.queued += 1;
-        continue;
+        if (video.status === "queued") {
+          enqueueVideos([video.id]);
+          result.found += 1;
+          result.queued += 1;
+          continue;
+        }
       }
+      result.found += 1;
 
       const attachmentErrorKey = `${product.documentId}:${video.id}`;
       try {
@@ -272,6 +334,13 @@ export async function syncProductDocument(
       }
 
       const failureCellKey = `${product.documentId}:${row[2].textId}:${video.id}`;
+      if (video.status === "stopped") {
+        if (!row[2].text.trim()) {
+          await updateBlankResultCell(client, product.documentId, row[2].textId, "已停止，请重新粘贴视频链接");
+        }
+        result.failed += 1;
+        continue;
+      }
       if (video.status === "failed" && video.analysisMode === "product_doc") {
         const retryCount = Number(video.productDocRetryCount || 0);
         if (retryCount < 2) {
@@ -325,7 +394,17 @@ export async function syncProductDocument(
       }
     }
   }
+  if (!options.onlyVideoId) markProductDocumentVideoRowsInitialized(product.documentId);
   return result;
+}
+
+export function syncProductDocument(
+  client: Client,
+  product: Product,
+  options: { onlyVideoId?: string } = {},
+) {
+  if (!product.documentId) return Promise.resolve({ found: 0, queued: 0, completed: 0, failed: 0 });
+  return withProductDocumentLock(product.documentId, () => syncProductDocumentUnlocked(client, product, options));
 }
 
 /** Deliver a newly completed video to its exact product-document row now. */

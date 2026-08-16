@@ -1,7 +1,7 @@
 import "server-only";
 
 import { execFile } from "node:child_process";
-import { createWriteStream, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -300,6 +300,27 @@ export function readMedia(relativePath: string) {
 export function deleteVideoMedia(videoId: string) {
   const target = resolveMediaPath(videoId);
   if (existsSync(target)) rmSync(target, { recursive: true, force: true });
+}
+
+/**
+ * Remove files produced by an unsuccessful attempt. TikTok originals are
+ * downloaded cache and are removed with the task directory. A user upload is
+ * owned by the user, so its exact original file is retained while screenshots,
+ * covers, clips and the Qwen proxy are deleted.
+ */
+export function deleteVideoAttemptCache(videoId: string, preservedOriginalPath?: string | null) {
+  const target = resolveMediaPath(videoId);
+  if (!existsSync(target)) return;
+  const preserved = preservedOriginalPath ? resolveMediaPath(preservedOriginalPath) : null;
+  if (!preserved || path.dirname(preserved) !== target) {
+    rmSync(target, { recursive: true, force: true });
+    return;
+  }
+  for (const entry of readdirSync(target)) {
+    const child = path.join(target, entry);
+    if (child === preserved) continue;
+    rmSync(child, { recursive: true, force: true });
+  }
 }
 
 export function contentTypeForMedia(filePath: string) {

@@ -143,6 +143,26 @@ test("legacy video jobs migrate to per-Base-row deliveries without overwriting",
       .map((column) => String(column.name));
     assert.deepEqual(primaryKey, ["video_id", "app_token", "table_id", "record_id"]);
 
+    const newer = database.createVideo({
+      productId: product.id,
+      sourceType: "tiktok",
+      sourceUrl: "https://www.tiktok.com/@creator/video/7000000000000000002",
+    });
+    database.saveFeishuAutomationJob({
+      videoId: newer.id,
+      appToken: "app-a",
+      tableId: "table-a",
+      recordId: "record-a",
+      fieldMap: { status: "最新任务" },
+    });
+    assert.deepEqual(
+      database.getFeishuAutomationJobs(video.id).map((job) => job.recordId),
+      ["record-b"],
+      "a newer click must supersede the older task for the same Base row",
+    );
+    assert.equal(database.getFeishuAutomationJobs(newer.id)[0].fieldMap.status, "最新任务");
+    database.deleteFeishuAutomationJob(database.getFeishuAutomationJobs(newer.id)[0]);
+
     database.deleteFeishuAutomationJob(jobs.find((job) => job.recordId === "record-a"));
     const remaining = database.getFeishuAutomationJobs(video.id);
     assert.deepEqual(remaining.map((job) => job.recordId), ["record-b"], "one success must only delete its own delivery");
@@ -211,6 +231,24 @@ test("completion retries each Base delivery and deletes successful rows independ
     writes.find((write) => write.recordId === "record-b").fields.产品手卡,
     "https://feishu.cn/docx/record-b",
   );
+});
+
+test("a superseded Base-row job is rechecked under the row lock and never written", async () => {
+  let reads = 0;
+  let writes = 0;
+  globalThis.__feishuVideoDeliveryTestHooks = {
+    getFeishuAutomationJobs: () => (reads++ === 0 ? [delivery("record-a")] : []),
+    getVideo: () => ({
+      id: "video-1", productId: "product-1", status: "completed", transcriptZh: "旧翻译", errorMessage: null,
+    }),
+    getProduct: () => ({ id: "product-1", documentUrl: null }),
+    getConnectedFeishuChannel: () => ({
+      rawClient: { request: async () => { writes += 1; return { code: 0 }; } },
+    }),
+  };
+
+  assert.equal(await automation.completeFeishuAutomation("video-1"), true);
+  assert.equal(writes, 0, "the older completion must not overwrite the newer row generation");
 });
 
 test("the worker redelivers an exhausted terminal job on its later startup pass", async () => {

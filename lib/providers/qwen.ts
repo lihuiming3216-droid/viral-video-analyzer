@@ -124,21 +124,30 @@ export async function analyzeVideoWithQwen(input: {
       text: `${input.prompt}\n你已收到一个包含原始画面和原始音轨的完整 MP4。必须按时间顺序观看并听完整段视频，直接识别口播、音乐、音效、情绪与画面，不得假设另有外部转写。只返回合法 JSON，不要使用 Markdown 代码块。`,
     },
   ];
-  const response = await fetch(`${config.baseUrl}/chat/completions`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${config.apiKey}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: qwenVideoModel(),
-      messages: [{ role: "user", content }],
-      modalities: ["text"],
-      enable_thinking: false,
-      stream: true,
-      stream_options: { include_usage: true },
-      max_tokens: input.maxTokens || 4_500,
-    }),
-    signal: input.signal
-      ? AbortSignal.any([input.signal, AbortSignal.timeout(120_000)])
-      : AbortSignal.timeout(120_000),
-  });
-  return parseOmniStream(response);
+  try {
+    const response = await fetch(`${config.baseUrl}/chat/completions`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${config.apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: qwenVideoModel(),
+        messages: [{ role: "user", content }],
+        modalities: ["text"],
+        enable_thinking: false,
+        stream: true,
+        stream_options: { include_usage: true },
+        max_tokens: input.maxTokens || 4_500,
+      }),
+      signal: input.signal
+        ? AbortSignal.any([input.signal, AbortSignal.timeout(120_000)])
+        : AbortSignal.timeout(120_000),
+    });
+    return await parseOmniStream(response);
+  } catch (error) {
+    if (input.signal?.aborted) throw error;
+    const message = error instanceof Error ? error.message : String(error || "");
+    if (/(?:timeout|timed out|aborted due to timeout|etimedout)/i.test(message)) {
+      throw new Error("Qwen 完整视频分析超时");
+    }
+    throw error;
+  }
 }

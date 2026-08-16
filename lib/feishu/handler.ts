@@ -1,11 +1,11 @@
 import "server-only";
 
 import type { LarkChannel } from "@larksuiteoapi/node-sdk";
-import { createProduct, createVideo, listProducts, listVideos, updateProduct, updateVideo } from "@/lib/database";
+import { createProduct, createVideo, listProducts, updateProduct } from "@/lib/database";
 import { enqueueVideos } from "@/lib/queue";
 import { buildErrorCard, buildProgressCard } from "@/lib/feishu/cards";
 import { parseFeishuSubmission } from "@/lib/feishu/parser";
-import { applyFeishuCardAction, deliverCompletedVideo } from "@/lib/feishu/notifications";
+import { applyFeishuCardAction } from "@/lib/feishu/notifications";
 import { setVideoProgressHandler } from "@/lib/video-events";
 import {
   createFeishuBatch, createFeishuDelivery, recordFeishuEvent, updateFeishuBatch,
@@ -85,7 +85,6 @@ export function registerFeishuHandlers(channel: LarkChannel) {
     }
 
     const product = findOrCreateProduct(parsed.productName, parsed.pid);
-    const existing = listVideos();
     const batch = createFeishuBatch({
       sourceMessageId: message.messageId,
       chatId: message.chatId,
@@ -98,27 +97,14 @@ export function registerFeishuHandlers(channel: LarkChannel) {
     const enqueueIds = new Set<string>();
 
     parsed.urls.forEach((url, index) => {
-      const duplicate = existing.find((video) => video.sourceUrl === url);
-      let video: VideoRecord;
-      let deliveryStatus = "queued";
-      if (duplicate) {
-        video = updateVideo(duplicate.id, { product_id: product.id })!;
-        if (duplicate.status === "completed") deliveryStatus = "historical_pending";
-        else if (!["queued", "downloading", "transcribing", "extracting", "analyzing"].includes(duplicate.status)) {
-          video = updateVideo(duplicate.id, {
-            status: "queued", stage: "已重新加入队列", progress: 2, error_message: null,
-          })!;
-          enqueueIds.add(video.id);
-        }
-      } else {
-        video = createVideo({
-          productId: product.id,
-          sourceType: "tiktok",
-          sourceUrl: url,
-          title: `${product.name} · 飞书样片 ${index + 1}`,
-        });
-        enqueueIds.add(video.id);
-      }
+      const video: VideoRecord = createVideo({
+        productId: product.id,
+        sourceType: "tiktok",
+        sourceUrl: url,
+        title: `${product.name} · 飞书样片 ${index + 1}`,
+      });
+      const deliveryStatus = "queued";
+      enqueueIds.add(video.id);
       videos.push(video);
       deliveries.push(createFeishuDelivery({
         videoId: video.id,
@@ -140,8 +126,6 @@ export function registerFeishuHandlers(channel: LarkChannel) {
     updateFeishuBatch(batch.id, { progressMessageId: sent.messageId, status: "processing" });
     if (deliveries.length === 1) updateFeishuDelivery(deliveries[0].id, { cardMessageId: sent.messageId });
 
-    deliveries.filter((delivery) => delivery.status === "historical_pending")
-      .forEach((delivery) => void deliverCompletedVideo(delivery.id, channel));
     if (enqueueIds.size) enqueueVideos([...enqueueIds]);
   });
 

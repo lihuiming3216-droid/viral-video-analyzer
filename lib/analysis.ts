@@ -171,7 +171,9 @@ async function withOneNetworkRetry<T>(
 function userFacingAnalysisError(error: unknown) {
   const message = error instanceof Error ? error.message : "未知错误";
   if (transientNetworkFailure(error)) {
-    return "获取 TikTok 视频超时，系统已自动重试一次；请稍后在分析状态栏输入“重试”再次处理";
+    if (/Qwen/i.test(message)) return "Qwen 完整视频分析超时，系统已自动重试一次";
+    if (/TokScript/i.test(message)) return "TokScript 获取视频超时，系统已自动重试一次";
+    return "视频处理网络超时，系统已自动重试一次";
   }
   return message;
 }
@@ -209,7 +211,21 @@ function transcriptForScene(
     .join(" ");
 }
 
-export async function analyzeVideo(videoId: string, signal?: AbortSignal) {
+function ownsVideoAttempt(videoId: string, expectedAttemptNumber?: number) {
+  if (expectedAttemptNumber === undefined) return true;
+  try {
+    return getVideo(videoId, false)?.attemptCount === expectedAttemptNumber;
+  } catch {
+    return false;
+  }
+}
+
+function assertVideoAttempt(videoId: string, signal?: AbortSignal, expectedAttemptNumber?: number) {
+  signal?.throwIfAborted();
+  if (!ownsVideoAttempt(videoId, expectedAttemptNumber)) throw new Error("分析任务已被新的执行替代");
+}
+
+export async function analyzeVideo(videoId: string, signal?: AbortSignal, expectedAttemptNumber?: number) {
   const initial = getVideo(videoId);
   if (!initial) throw new Error("视频不存在");
   const product = getProduct(initial.productId);
@@ -217,7 +233,7 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal) {
   const analysisMode = initial.analysisMode;
   const trace: string[] = [];
   try {
-    signal?.throwIfAborted();
+    assertVideoAttempt(videoId, signal, expectedAttemptNumber);
     let relativeVideoPath = initial.originalPath;
     let remoteVideoUrl = initial.remoteVideoUrl;
     let transcript = initial.transcriptOriginal;
@@ -239,6 +255,7 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal) {
         () => setStage(videoId, "downloading", "获取视频信息较慢，正在自动重试", 14),
         signal,
       );
+      assertVideoAttempt(videoId, signal, expectedAttemptNumber);
       if (!tok.downloadUrl) throw new Error("TokScript 没有返回可下载的视频地址");
       remoteVideoUrl = tok.downloadUrl;
       transcript = tok.transcript;
@@ -276,10 +293,12 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal) {
           () => setStage(videoId, "downloading", "原视频下载较慢，正在自动重试", 24),
           signal,
         );
+        assertVideoAttempt(videoId, signal, expectedAttemptNumber);
         const coverPath = tok.coverUrl ? await downloadMedia(videoId, tok.coverUrl, "cover", signal).catch((error) => {
           if (signal?.aborted) throw error;
           return null;
         }) : null;
+        assertVideoAttempt(videoId, signal, expectedAttemptNumber);
         updateVideo(videoId, { original_path: relativeVideoPath, cover_path: coverPath });
       }
     } else if (initial.sourceType === "tiktok") {
@@ -291,6 +310,7 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal) {
     const assets = await extractVideoAssets(videoId, relativeVideoPath, signal, {
       light: analysisMode === "product_doc",
     });
+    assertVideoAttempt(videoId, signal, expectedAttemptNumber);
     updateVideo(videoId, {
       duration_seconds: assets.duration,
       cover_path: getVideo(videoId, false)?.coverPath || assets.scenes[0]?.screenshotPath || null,
@@ -303,6 +323,7 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal) {
     const qwenVideoPath = remoteVideoUrl
       ? relativeVideoPath
       : await prepareLocalVideoForQwen(videoId, relativeVideoPath, assets.duration, signal);
+    assertVideoAttempt(videoId, signal, expectedAttemptNumber);
     setStage(videoId, "analyzing", "正在观看完整视频并分析画面、声音、钩子和转化结构", 66);
 
     let qwenContext: Record<string, unknown> | undefined;
@@ -315,6 +336,7 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal) {
           maxTokens: analysisMode === "product_doc" ? 2_000 : 4_500,
           signal,
         });
+        assertVideoAttempt(videoId, signal, expectedAttemptNumber);
         trace.push("Qwen Omni：完整 MP4 画面与原始音轨分析");
       } catch (error) {
         if (signal?.aborted) throw error;
@@ -322,6 +344,7 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal) {
       }
     }
 
+    assertVideoAttempt(videoId, signal, expectedAttemptNumber);
     setStage(videoId, "analyzing", analysisMode === "product_doc" ? "正在生成轻量视频分析和中文翻译" : "正在生成中文深度报告和复拍脚本", 82);
     let rawAnalysis: Partial<AnalysisResult>;
     if (isUsableAnalysis(qwenContext, assets.scenes.length, analysisMode, transcript)) {
@@ -330,6 +353,7 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal) {
     } else if (isConfigured("qwen")) {
       try {
         rawAnalysis = await analyzeVideoWithQwen({ prompt, remoteVideoUrl, localVideoPath: resolveMediaPath(qwenVideoPath), maxTokens: analysisMode === "product_doc" ? 2_000 : 4_500, signal });
+        assertVideoAttempt(videoId, signal, expectedAttemptNumber);
         trace.push("Qwen：首次结果不完整，已重试一次");
       } catch (error) {
         if (signal?.aborted) throw error;
@@ -389,12 +413,14 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal) {
         tags: result.tags,
       });
     }
-    signal?.throwIfAborted();
+    assertVideoAttempt(videoId, signal, expectedAttemptNumber);
     replaceScenes(videoId, sceneRows);
+    assertVideoAttempt(videoId, signal, expectedAttemptNumber);
     updateVideo(videoId, {
       status: "completed",
       stage: "分析完成",
       progress: 100,
+      processing_started_at: null,
       score_traffic: analysis.scores.traffic,
       score_conversion: analysis.scores.conversion,
       score_visual: analysis.scores.visual,
@@ -414,6 +440,7 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal) {
     await import("@/lib/feishu/product-doc-sync")
       .then(({ syncCompletedVideoToProductDocument }) => syncCompletedVideoToProductDocument(videoId))
       .catch(() => false);
+    assertVideoAttempt(videoId, signal, expectedAttemptNumber);
     // A video created by a Feishu Base automation carries a pending job. Push
     // the compact result back to that exact record after analysis completes.
     void import("@/lib/feishu/automation")
@@ -426,15 +453,23 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal) {
       // 学习档案失败不能影响已经完成的视频报告。
     }
   } catch (error) {
-    updateVideo(videoId, {
-      status: signal?.aborted ? "stopped" : "failed",
-      stage: signal?.aborted ? "已停止" : "分析失败",
-      error_message: signal?.aborted ? null : userFacingAnalysisError(error),
-    });
-    void import("@/lib/feishu/automation")
-      .then(({ completeFeishuAutomation }) => completeFeishuAutomation(videoId))
-      .catch(() => undefined);
-    emitVideoProgress(videoId);
+    const abortReason = signal?.aborted && signal.reason instanceof Error ? signal.reason : null;
+    const timedOut = abortReason?.name === "VideoTaskTimeoutError";
+    // The queue owns hard-timeout finalization. Keeping that path in one place
+    // prevents analyzeVideo and the queue fallback from both publishing the
+    // same stopped event when an abort-aware dependency exits quickly.
+    if (!timedOut && ownsVideoAttempt(videoId, expectedAttemptNumber)) {
+      updateVideo(videoId, {
+        status: signal?.aborted ? "stopped" : "failed",
+        stage: signal?.aborted ? "已停止" : "分析失败",
+        error_message: signal?.aborted ? null : userFacingAnalysisError(error),
+        processing_started_at: null,
+      });
+      void import("@/lib/feishu/automation")
+        .then(({ completeFeishuAutomation }) => completeFeishuAutomation(videoId))
+        .catch(() => undefined);
+      emitVideoProgress(videoId);
+    }
     throw error;
   }
 }

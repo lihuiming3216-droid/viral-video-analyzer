@@ -24,6 +24,8 @@ async function loadSyncModule() {
     export const getConnectedFeishuChannel = (...args) => hooks().getConnectedFeishuChannel?.(...args) || null;
     export const conciseProductDocAnalysis = (...args) => hooks().conciseProductDocAnalysis?.(...args) || "自动视频分析";
     export const enqueueVideos = (...args) => hooks().enqueueVideos?.(...args);
+    export const resolveMediaPath = (...args) => hooks().resolveMediaPath?.(...args) || args[0];
+    export const ensureFeishuVideoPreview = (...args) => hooks().ensureFeishuVideoPreview?.(...args) || false;
   `;
   const stubUrl = `data:text/javascript;base64,${Buffer.from(stubSource).toString("base64")}`;
   const testSource = syncSource.replace(
@@ -41,6 +43,8 @@ async function loadSyncModule() {
     .replaceAll('"@/lib/feishu/runtime"', JSON.stringify(stubUrl))
     .replaceAll('"@/lib/product-doc-analysis"', JSON.stringify(stubUrl))
     .replaceAll('"@/lib/queue"', JSON.stringify(stubUrl));
+  compiled = compiled.replaceAll('"@/lib/video-processing"', JSON.stringify(stubUrl));
+  compiled = compiled.replaceAll('"@/lib/feishu/docx-file"', JSON.stringify(stubUrl));
   return import(`data:text/javascript;base64,${Buffer.from(compiled).toString("base64")}`);
 }
 
@@ -186,6 +190,43 @@ test("completed document sync fills only independently blank analysis and transl
       "an empty database translation leaves the blank document cell untouched",
     );
     assert.equal(writes.some((write) => write.content === "暂无中文翻译"), false);
+  } finally {
+    delete globalThis.__productDocSyncWriteProtectionHooks;
+  }
+});
+
+test("document sync sends a downloaded TokScript MP4 to the status cell preview helper", async () => {
+  const link = "https://www.tiktok.com/@demo/video/7888888888888888888";
+  const { blocks } = documentBlocks([{ link, status: "AI分析", analysis: "", translation: "" }]);
+  const video = {
+    id: "video-attachment-12345678",
+    status: "failed",
+    sourceType: "tiktok",
+    originalPath: "media/video-attachment/original.mp4",
+    remoteVideoUrl: "https://cdn.example/original.mp4",
+    errorMessage: "分析失败",
+  };
+  const previews = [];
+  globalThis.__productDocSyncWriteProtectionHooks = {
+    listFeishuDocumentBlocks: () => blocks,
+    getVideoBySourceUrl: () => video,
+    resolveMediaPath: (value) => `/resolved/${value}`,
+    ensureFeishuVideoPreview: async (input) => previews.push(input),
+    updateFeishuTextBlock: async () => undefined,
+  };
+  try {
+    const client = {};
+    await syncModule.syncProductDocument(client, { id: "product-attachment", documentId: "document-attachment" });
+    assert.equal(previews.length, 1);
+    const [{ client: previewClient, blocks: previewBlocks, ...previewInput }] = previews;
+    assert.equal(previewClient, client);
+    assert.equal(previewBlocks, blocks);
+    assert.deepEqual(previewInput, {
+      documentId: "document-attachment",
+      parentBlockId: "row-1-status",
+      absolutePath: "/resolved/media/video-attachment/original.mp4",
+      fileName: "TokScript视频-video-at.mp4",
+    });
   } finally {
     delete globalThis.__productDocSyncWriteProtectionHooks;
   }

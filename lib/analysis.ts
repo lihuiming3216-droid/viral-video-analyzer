@@ -116,6 +116,7 @@ function buildPrompt(input: {
 除 translationZh 外，所有分析都用短语，不写解释句；只保留“动作+结果”。summary 不超过30个汉字；hook.description、每条 viralPoints、strengths 和 structureFormula 均不超过18个汉字。删除“通过、进行、能够、可以、有效提升、有助于、让用户”等套话。
 translationZh 必须是完整原口播的自然中文翻译，不要只翻译其中几句；听不清的部分标记为“[听不清]”。
 如果视频没有口播，translationZh 必须写“无口播”，仍需根据画面完成其余分析。
+如果完整原文为“背景音乐，无有效产品口播”，表示 TokScript 已确认没有可用的产品口播；translationZh 必须写“无口播”，不要翻译歌词或重复噪声。
 严格使用以下 JSON 结构：{"summary":"","language":"","translationZh":"","hook":{"timeRange":"","type":"","description":"","whyItWorks":""},"viralPoints":[{"timeRange":"","description":"","reason":""}],"strengths":[""],"structureFormula":""}。
 
 产品：${JSON.stringify(productContext)}

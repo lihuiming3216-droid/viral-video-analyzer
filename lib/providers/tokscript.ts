@@ -2,6 +2,7 @@ import "server-only";
 
 import { fetchWithProxy } from "@/lib/network";
 import { getProviderConfig, requireProvider } from "@/lib/provider-config";
+import { NO_PRODUCT_VOICEOVER_TRANSCRIPT } from "@/lib/transcript-validation";
 
 type McpTool = {
   name: string;
@@ -242,6 +243,56 @@ function explicitTranscript(root: unknown) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+function audioTrackName(root: unknown) {
+  const seen = new Set<unknown>();
+  const visit = (value: unknown): string => {
+    if (!value || typeof value !== "object" || seen.has(value)) return "";
+    seen.add(value);
+    for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+      if (/^(?:audio|music|sound)(?:_info|Info|_track|Track)?$/i.test(key) && child && typeof child === "object") {
+        const row = child as Record<string, unknown>;
+        const name = row.name ?? row.title ?? row.audio_name ?? row.music_name;
+        if (typeof name === "string" && name.trim()) return name.trim();
+      }
+    }
+    for (const child of Object.values(value as Record<string, unknown>)) {
+      const found = Array.isArray(child)
+        ? child.map(visit).find(Boolean) || ""
+        : visit(child);
+      if (found) return found;
+    }
+    return "";
+  };
+  return visit(root);
+}
+
+function speechTokens(value: string) {
+  return value.normalize("NFKC").toLowerCase().match(/[\p{L}\p{N}']+/gu) || [];
+}
+
+export function tokScriptTranscriptIsNoProductVoiceover(transcript: string, audioName = "") {
+  const normalized = String(transcript || "").normalize("NFKC").trim().replace(/\s+/g, " ");
+  if (tokScriptExplicitNoSpeech(normalized)) {
+    return true;
+  }
+  const tokens = speechTokens(normalized);
+  if (tokens.length <= 1) return true;
+  const unique = new Set(tokens);
+  if (tokens.length >= 4 && unique.size <= 2) return true;
+
+  const audioTokens = [...new Set(speechTokens(audioName).filter((token) => !/^(?:original|sound|music|audio|sped|up)$/.test(token)))];
+  if (audioTokens.length >= 3) {
+    const transcriptSet = new Set(tokens);
+    const overlap = audioTokens.filter((token) => transcriptSet.has(token)).length;
+    if (overlap >= 3 && overlap / audioTokens.length >= 0.6) return true;
+  }
+  return false;
+}
+
+function tokScriptExplicitNoSpeech(value: string) {
+  return /^(?:there (?:is|was) no (?:speech|spoken audio|voice[ -]?over|narration)|no (?:speech|spoken audio|voice[ -]?over|narration)(?:\b.*)?|(?:only )?(?:background )?music(?: only)?|only music)(?:[.!！。]|$)/i.test(value);
+}
+
 /**
  * Some MCP clients serialize a transcript as one labelled text block instead
  * of JSON. Accept only an explicit Transcript section, never arbitrary text or
@@ -358,7 +409,6 @@ export function tokScriptTranscriptFailure(value: string) {
   const normalized = String(value || "").normalize("NFKC").trim().replace(/\s+/g, " ");
   return /^(?:error|failed|failure|unable|could not|cannot|service unavailable|rate limit(?:ed)?|too many requests)\b/i.test(normalized)
     || /(?:failed to extract transcript|transcript extraction (?:failed|error)|no transcript (?:data|available)|transcript (?:unavailable|not found)|SIGI_STATE|UNIVERSAL_DATA_FOR_REHYDRATION)/i.test(normalized)
-    || /^(?:there (?:is|was) no (?:speech|spoken audio|voice[ -]?over|narration)|no (?:speech|spoken audio|voice[ -]?over|narration)(?:\b.*)?|(?:only )?(?:background )?music(?: only)?|only music)(?:[.!！。]|$)/i.test(normalized)
     || /^(?:(?:full )?transcript\s*:\s*)?(?:\(\s*empty\s*\)|empty|none|null|n\/?a)\s*$/i.test(normalized);
 }
 
@@ -406,10 +456,14 @@ export async function fetchTikTok(
     if (!normalizedTranscript || tokScriptTranscriptFailure(normalizedTranscript)) {
       throw new Error("TokScript 未返回有效口播文案");
     }
+    const noProductVoiceover = tokScriptTranscriptIsNoProductVoiceover(
+      normalizedTranscript,
+      audioTrackName(transcriptRaw),
+    );
     return {
-      transcript: normalizedTranscript,
+      transcript: noProductVoiceover ? NO_PRODUCT_VOICEOVER_TRANSCRIPT : normalizedTranscript,
       language: textValue(transcriptRaw, ["language", "detected_language", "detectedLanguage"]),
-      segments,
+      segments: noProductVoiceover ? [] : segments,
       downloadUrl: findMediaUrl(downloadRaw, "video"),
       coverUrl: findMediaUrl(coverRaw || downloadRaw, "cover"),
       title: textValue(transcriptRaw, ["title", "description", "caption"]),

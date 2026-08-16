@@ -1,5 +1,6 @@
 import "server-only";
 
+import path from "node:path";
 import type { Client } from "@larksuiteoapi/node-sdk";
 import {
   createVideo,
@@ -11,10 +12,12 @@ import {
   updateVideo,
 } from "@/lib/database";
 import { listFeishuDocumentBlocks, updateFeishuTextBlock } from "@/lib/feishu/document";
+import { ensureFeishuVideoPreview } from "@/lib/feishu/docx-file";
 import { ensureFeishuConnection, getConnectedFeishuChannel } from "@/lib/feishu/runtime";
 import { conciseProductDocAnalysis } from "@/lib/product-doc-analysis";
 import { enqueueVideos } from "@/lib/queue";
 import type { Product, VideoRecord } from "@/lib/types";
+import { resolveMediaPath } from "@/lib/video-processing";
 
 interface DocBlock extends Record<string, unknown> {
   block_id?: string;
@@ -42,6 +45,7 @@ const workerState = globalThis as WorkerGlobal;
 workerState.__productDocSyncRunning ||= false;
 workerState.__productDocSyncCursor ||= 0;
 workerState.__productDocSyncLastError ||= "";
+const attachmentErrors = new Set<string>();
 
 function productDocumentTargets(product: Product) {
   const seen = new Set<string>();
@@ -65,6 +69,10 @@ function productDocumentTargets(product: Product) {
 
 function textFrom(block: DocBlock | undefined) {
   return (block?.text?.elements || []).map((element) => element.text_run?.content || "").join("").trim();
+}
+
+function tokScriptVideoFileName(video: VideoRecord) {
+  return `TokScript视频-${video.id.slice(0, 8)}${path.extname(video.originalPath || "") || ".mp4"}`;
 }
 
 function normalizeTikTokUrl(value: string) {
@@ -249,6 +257,29 @@ export async function syncProductDocument(
     }
 
     await updateIfChanged(client, product.documentId, row[1].textId, row[1].text, statusText(video));
+    const attachmentErrorKey = `${product.documentId}:${video.id}`;
+    try {
+      if (video.sourceType === "tiktok" && video.originalPath) {
+        await ensureFeishuVideoPreview({
+          client,
+          documentId: product.documentId,
+          parentBlockId: String(cells[rowStart + 1] || ""),
+          absolutePath: resolveMediaPath(video.originalPath),
+          fileName: tokScriptVideoFileName(video),
+          blocks,
+        });
+      }
+      attachmentErrors.delete(attachmentErrorKey);
+    } catch (error) {
+      // The attachment is useful context, but must never block analysis or
+      // overwrite the status/result text. The next 20-second pass retries it.
+      if (!attachmentErrors.has(attachmentErrorKey)) {
+        const message = error instanceof Error ? error.message : "视频附件上传失败";
+        console.warn(`[product-doc-sync] TokScript视频附件 ${video.id}: ${message}`);
+        if (attachmentErrors.size >= 1_000) attachmentErrors.clear();
+        attachmentErrors.add(attachmentErrorKey);
+      }
+    }
     if (video.status === "completed") {
       // Analysis and translation cells are user-owned once they contain text.
       // Keep the two columns independent so clearing either cell explicitly opts

@@ -1,3 +1,5 @@
+export const NO_PRODUCT_VOICEOVER_TRANSCRIPT = "背景音乐，无有效产品口播";
+
 /** True when a model answer explicitly claims that the video has no speech. */
 export function translationClaimsNoVoiceover(value: unknown) {
   const normalized = String(value || "")
@@ -10,5 +12,8 @@ export function translationClaimsNoVoiceover(value: unknown) {
 
 /** A nonempty TokScript transcript cannot be translated as “no voiceover”. */
 export function transcriptAndTranslationAgree(transcript: unknown, translation: unknown) {
-  return !String(transcript || "").trim() || !translationClaimsNoVoiceover(translation);
+  const normalizedTranscript = String(transcript || "").normalize("NFKC").trim();
+  return !normalizedTranscript
+    || normalizedTranscript === NO_PRODUCT_VOICEOVER_TRANSCRIPT.normalize("NFKC")
+    || !translationClaimsNoVoiceover(translation);
 }

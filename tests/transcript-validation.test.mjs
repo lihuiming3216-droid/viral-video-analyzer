@@ -20,3 +20,10 @@ test("a nonempty TokScript transcript cannot be accepted as no voiceover", () =>
 test("an empty TokScript transcript may still represent a genuinely silent video", () => {
   assert.equal(validation.transcriptAndTranslationAgree("", "无口播"), true);
 });
+
+test("the stable TokScript background-music marker accepts no-voiceover output", () => {
+  assert.equal(
+    validation.transcriptAndTranslationAgree("背景音乐，无有效产品口播", "无口播"),
+    true,
+  );
+});

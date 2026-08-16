@@ -10,6 +10,7 @@ async function loadTokScriptModule() {
     export const fetchWithProxy = (...args) => globalThis.__tokscriptSourceHooks.fetchWithProxy(...args);
     export const getProviderConfig = () => ({ enabled: true, apiKey: "test", baseUrl: "https://api.example/mcp" });
     export const requireProvider = () => ({ enabled: true, apiKey: "test", baseUrl: "https://api.example/mcp" });
+    export const NO_PRODUCT_VOICEOVER_TRANSCRIPT = "背景音乐，无有效产品口播";
   `;
   const stubUrl = `data:text/javascript;base64,${Buffer.from(stubSource).toString("base64")}`;
   let compiled = ts.transpileModule(source, {
@@ -19,6 +20,7 @@ async function loadTokScriptModule() {
     .replace('import "server-only";', "")
     .replaceAll('"@/lib/network"', JSON.stringify(stubUrl))
     .replaceAll('"@/lib/provider-config"', JSON.stringify(stubUrl));
+  compiled = compiled.replaceAll('"@/lib/transcript-validation"', JSON.stringify(stubUrl));
   return import(`data:text/javascript;base64,${Buffer.from(compiled).toString("base64")}`);
 }
 
@@ -70,11 +72,42 @@ test("TokScript plain-text extraction diagnostics are never accepted as speech",
   assert.equal(tokscript.tokScriptTranscriptFailure("No transcript available for this video"), true);
   assert.equal(tokscript.tokScriptTranscriptFailure("Service unavailable; try again later"), true);
   assert.equal(tokscript.tokScriptTranscriptFailure("Rate limit exceeded"), true);
-  assert.equal(tokscript.tokScriptTranscriptFailure("There is no speech."), true);
-  assert.equal(tokscript.tokScriptTranscriptFailure("No voiceover, only music"), true);
-  assert.equal(tokscript.tokScriptTranscriptFailure("only music"), true);
+  assert.equal(tokscript.tokScriptTranscriptFailure("There is no speech."), false);
+  assert.equal(tokscript.tokScriptTranscriptFailure("No voiceover, only music"), false);
+  assert.equal(tokscript.tokScriptTranscriptFailure("only music"), false);
   assert.equal(tokscript.tokScriptTranscriptFailure("Transcript: (empty)"), true);
   assert.equal(tokscript.tokScriptTranscriptFailure("This monitor is easy to carry and use outdoors."), false);
+});
+
+test("short, repetitive, and soundtrack-matching text is marked as no product voiceover", () => {
+  assert.equal(tokscript.tokScriptTranscriptIsNoProductVoiceover("you"), true);
+  assert.equal(tokscript.tokScriptTranscriptIsNoProductVoiceover("buy now"), false);
+  assert.equal(tokscript.tokScriptTranscriptIsNoProductVoiceover("you are you are you are you are"), true);
+  assert.equal(
+    tokscript.tokScriptTranscriptIsNoProductVoiceover(
+      "I think I like when it rains, you told me that you feel the same",
+      "I Think I Like When It Rains",
+    ),
+    true,
+  );
+  assert.equal(
+    tokscript.tokScriptTranscriptIsNoProductVoiceover(
+      "Wrap the cuff around your upper arm and press start to measure your blood pressure",
+      "Original sound",
+    ),
+    false,
+  );
+});
+
+test("a soundtrack transcript becomes the stable no-voiceover marker", async () => {
+  const result = await fetchWithTranscriptToolResult({
+    structuredContent: {
+      transcript: "I think I like when it rains, you told me that you feel the same",
+      audio: { name: "I Think I Like When It Rains" },
+    },
+  });
+  assert.equal(result.transcript, "背景音乐，无有效产品口播");
+  assert.deepEqual(result.segments, []);
 });
 
 test("only explicit structured transcript or segments fields supply speech", async () => {
@@ -132,12 +165,10 @@ test("plain MCP text requires an explicit nonempty Transcript label", async () =
   );
 });
 
-test("no-speech diagnostics never become a transcript", async () => {
+test("explicit no-speech results become the stable no-voiceover marker", async () => {
   for (const transcript of ["There is no speech", "No voiceover", "only music"]) {
-    await assert.rejects(
-      fetchWithTranscriptToolResult({ structuredContent: { transcript } }),
-      /TokScript 未返回有效口播文案/,
-    );
+    const result = await fetchWithTranscriptToolResult({ structuredContent: { transcript } });
+    assert.equal(result.transcript, "背景音乐，无有效产品口播");
   }
   await assert.rejects(
     fetchWithTranscriptToolResult({ content: [{ type: "text", text: "Transcript: (empty)" }] }),

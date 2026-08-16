@@ -46,6 +46,8 @@ workerState.__productDocSyncRunning ||= false;
 workerState.__productDocSyncCursor ||= 0;
 workerState.__productDocSyncLastError ||= "";
 const attachmentErrors = new Set<string>();
+const rowErrors = new Set<string>();
+const deliveredFailureCells = new Set<string>();
 
 function productDocumentTargets(product: Product) {
   const seen = new Set<string>();
@@ -92,23 +94,6 @@ function normalizeTikTokUrl(value: string) {
   }
 }
 
-function statusText(video: VideoRecord) {
-  if (video.status === "failed") {
-    const reason = String(video.errorMessage || "分析失败").replace(/\s+/g, " ").slice(0, 70);
-    return `失败：${reason}`;
-  }
-  return ({
-    waiting: "待处理",
-    queued: "排队中",
-    downloading: "获取视频",
-    transcribing: "识别文案",
-    extracting: "提取画面",
-    analyzing: "AI分析",
-    completed: "已完成",
-    stopped: "已停止",
-  } as Record<string, string>)[video.status] || "待处理";
-}
-
 async function fetchBlock(
   client: Client,
   documentId: string,
@@ -142,9 +127,17 @@ function createBlockReader(client: Client, documentId: string, blocks: Array<Rec
 
 async function cellText(cellId: string, readBlock: (blockId: string) => Promise<DocBlock>) {
   const cell = await readBlock(cellId);
-  const textId = String(cell.children?.[0] || "");
+  let block: DocBlock | undefined;
+  let textId = "";
+  for (const childId of cell.children || []) {
+    const candidate = await readBlock(childId);
+    if (candidate.block_type === 2 || candidate.text) {
+      textId = childId;
+      block = candidate;
+      break;
+    }
+  }
   if (!textId) return { cell, textId: "", block: undefined as DocBlock | undefined, text: "" };
-  const block = await readBlock(textId);
   return { cell, textId, block, text: textFrom(block) };
 }
 
@@ -228,77 +221,108 @@ export async function syncProductDocument(
 
   const cells = table.table?.cells || [];
   for (let rowStart = 4; rowStart + 3 < cells.length; rowStart += 4) {
-    const row = await Promise.all(cells.slice(rowStart, rowStart + 4).map((cellId) => cellText(cellId, readBlock)));
-    const link = normalizeTikTokUrl(row[0].text);
-    if (!link || row.some((cell) => !cell.textId)) continue;
-    let video = getVideoBySourceUrl(link);
-    if (options.onlyVideoId && video?.id !== options.onlyVideoId) continue;
-    result.found += 1;
-    if (!video) {
-      video = createVideo({
-        productId: product.id,
-        sourceType: "tiktok",
-        sourceUrl: link,
-        title: `文档样片 ${rowStart / 4}`,
-        analysisMode: "product_doc",
-      });
-      enqueueVideos([video.id]);
-      await updateIfChanged(client, product.documentId, row[1].textId, row[1].text, "排队中");
-      result.queued += 1;
-      continue;
-    }
-
-    if (["failed", "stopped", "completed"].includes(video.status) && /^(?:重试|retry)/i.test(row[1].text)) {
-      video = updateVideo(video.id, { error_message: null }) || video;
-      enqueueVideos([video.id]);
-      await updateIfChanged(client, product.documentId, row[1].textId, row[1].text, "排队中");
-      result.queued += 1;
-      continue;
-    }
-
-    await updateIfChanged(client, product.documentId, row[1].textId, row[1].text, statusText(video));
-    const attachmentErrorKey = `${product.documentId}:${video.id}`;
     try {
-      if (video.sourceType === "tiktok" && video.originalPath) {
-        await ensureFeishuVideoPreview({
-          client,
-          documentId: product.documentId,
-          parentBlockId: String(cells[rowStart + 1] || ""),
-          absolutePath: resolveMediaPath(video.originalPath),
-          fileName: tokScriptVideoFileName(video),
-          blocks,
+      const row = await Promise.all(cells.slice(rowStart, rowStart + 4).map((cellId) => cellText(cellId, readBlock)));
+      const link = normalizeTikTokUrl(row[0].text);
+      // The second cell is a video-only container and may legitimately have no
+      // text block. The other three columns remain text-backed.
+      if (!link || !row[0].textId || !row[2].textId || !row[3].textId) continue;
+      let video = getVideoBySourceUrl(link);
+      if (options.onlyVideoId && video?.id !== options.onlyVideoId) continue;
+      result.found += 1;
+      // This cell is now reserved for the playable MP4. Remove legacy textual
+      // states once, without touching the preview/view children.
+      if (row[1].textId && row[1].text) {
+        await updateIfChanged(client, product.documentId, row[1].textId, row[1].text, "");
+      }
+      if (!video) {
+        video = createVideo({
+          productId: product.id,
+          sourceType: "tiktok",
+          sourceUrl: link,
+          title: `文档样片 ${rowStart / 4}`,
+          analysisMode: "product_doc",
         });
+        enqueueVideos([video.id]);
+        result.queued += 1;
+        continue;
       }
-      attachmentErrors.delete(attachmentErrorKey);
+
+      const attachmentErrorKey = `${product.documentId}:${video.id}`;
+      try {
+        if (video.sourceType === "tiktok" && video.originalPath) {
+          await ensureFeishuVideoPreview({
+            client,
+            documentId: product.documentId,
+            parentBlockId: String(cells[rowStart + 1] || ""),
+            absolutePath: resolveMediaPath(video.originalPath),
+            fileName: tokScriptVideoFileName(video),
+            blocks,
+          });
+        }
+        attachmentErrors.delete(attachmentErrorKey);
+      } catch (error) {
+        // Preview delivery is optional and must never block analysis/results.
+        if (!attachmentErrors.has(attachmentErrorKey)) {
+          const message = error instanceof Error ? error.message : "视频附件上传失败";
+          console.warn(`[product-doc-sync] TokScript视频附件 ${video.id}: ${message}`);
+          if (attachmentErrors.size >= 1_000) attachmentErrors.clear();
+          attachmentErrors.add(attachmentErrorKey);
+        }
+      }
+
+      const failureCellKey = `${product.documentId}:${row[2].textId}:${video.id}`;
+      if (video.status === "failed" && video.analysisMode === "product_doc") {
+        const retryCount = Number(video.productDocRetryCount || 0);
+        if (retryCount < 2) {
+          updateVideo(video.id, { product_doc_retry_count: retryCount + 1 });
+          enqueueVideos([video.id]);
+          result.queued += 1;
+          continue;
+        }
+        if (/^失败：/.test(row[2].text)) {
+          deliveredFailureCells.add(failureCellKey);
+        } else if (!row[2].text.trim() && deliveredFailureCells.has(failureCellKey)) {
+          updateVideo(video.id, { product_doc_retry_count: 0, error_message: null });
+          deliveredFailureCells.delete(failureCellKey);
+          enqueueVideos([video.id]);
+          result.queued += 1;
+          continue;
+        } else if (!row[2].text.trim()) {
+          const reason = String(video.errorMessage || "分析失败").replace(/\s+/g, " ").slice(0, 70);
+          await updateBlankResultCell(client, product.documentId, row[2].textId, `失败：${reason}`);
+          deliveredFailureCells.add(failureCellKey);
+        }
+      }
+
+      if (video.status === "completed") {
+        deliveredFailureCells.delete(failureCellKey);
+        // Analysis and translation cells are user-owned once they contain text.
+        if (!row[2].text.trim()) {
+          await updateBlankResultCell(
+            client,
+            product.documentId,
+            row[2].textId,
+            conciseProductDocAnalysis(video),
+          );
+        }
+        const transcriptZh = String(video.transcriptZh || "").trim();
+        if (!row[3].text.trim() && transcriptZh) {
+          await updateBlankResultCell(client, product.documentId, row[3].textId, transcriptZh);
+        }
+        result.completed += 1;
+      } else if (video.status === "failed") {
+        result.failed += 1;
+      }
+      rowErrors.delete(`${product.documentId}:${rowStart}`);
     } catch (error) {
-      // The attachment is useful context, but must never block analysis or
-      // overwrite the status/result text. The next 20-second pass retries it.
-      if (!attachmentErrors.has(attachmentErrorKey)) {
-        const message = error instanceof Error ? error.message : "视频附件上传失败";
-        console.warn(`[product-doc-sync] TokScript视频附件 ${video.id}: ${message}`);
-        if (attachmentErrors.size >= 1_000) attachmentErrors.clear();
-        attachmentErrors.add(attachmentErrorKey);
+      // One malformed row must never prevent later links in this document.
+      const key = `${product.documentId}:${rowStart}`;
+      if (!rowErrors.has(key)) {
+        console.warn(`[product-doc-sync] 第 ${rowStart / 4} 行同步失败: ${error instanceof Error ? error.message : "未知错误"}`);
+        if (rowErrors.size >= 1_000) rowErrors.clear();
+        rowErrors.add(key);
       }
-    }
-    if (video.status === "completed") {
-      // Analysis and translation cells are user-owned once they contain text.
-      // Keep the two columns independent so clearing either cell explicitly opts
-      // only that cell back into automatic delivery.
-      if (!row[2].text.trim()) {
-        await updateBlankResultCell(
-          client,
-          product.documentId,
-          row[2].textId,
-          conciseProductDocAnalysis(video),
-        );
-      }
-      const transcriptZh = String(video.transcriptZh || "").trim();
-      if (!row[3].text.trim() && transcriptZh) {
-        await updateBlankResultCell(client, product.documentId, row[3].textId, transcriptZh);
-      }
-      result.completed += 1;
-    } else if (video.status === "failed") {
-      result.failed += 1;
     }
   }
   return result;

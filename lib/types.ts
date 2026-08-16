@@ -151,6 +151,8 @@ export interface VideoRecord {
   updatedAt: string;
   scenes?: SceneRecord[];
   analysisMode: "full" | "product_doc";
+  /** Automatic whole-task retries used only by product-document rows. */
+  productDocRetryCount: number;
 }
 
 export interface SceneRecord {

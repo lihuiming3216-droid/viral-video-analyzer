@@ -143,8 +143,8 @@ test("completed document sync fills only independently blank analysis and transl
     for (const ids of rowTextIds) {
       assert.deepEqual(
         writes.filter((write) => write.blockId === ids.status).map((write) => write.content),
-        ["已完成"],
-        "status remains system-managed even when the result columns already contain text",
+        [""],
+        "legacy status text is cleared so the cell contains only the video",
       );
     }
 
@@ -322,7 +322,7 @@ test("a newly completed video is delivered to its exact document row immediately
     assert.deepEqual(scans, documentIds, "the canonical document duplicated by its mapping is scanned once");
     for (const documentId of documentIds) {
       assert.deepEqual(writes.filter((write) => write.documentId === documentId), [
-        { documentId, blockId: rowTextIds[0].status, content: "已完成" },
+        { documentId, blockId: rowTextIds[0].status, content: "" },
         { documentId, blockId: rowTextIds[0].analysis, content: "直接写入的视频分析" },
         { documentId, blockId: rowTextIds[0].translation, content: "直接写入的翻译" },
       ], `the completed video must be delivered to its exact row in ${documentId}`);
@@ -403,8 +403,8 @@ test("periodic sync discovers a new link in the second row-mapped document witho
     assert.deepEqual(writes, [{
       documentId: "document-row-b",
       blockId: second.rowTextIds[0].status,
-      content: "排队中",
-    }]);
+      content: "",
+    }], "legacy state text is cleared; no new queue state is displayed");
   } finally {
     delete globalThis.__productDocSyncWriteProtectionHooks;
   }
@@ -431,6 +431,10 @@ test("a result cell filled after the table scan is re-read and never overwritten
   const client = {
     request: async ({ url }) => {
       if (!String(url).includes("/blocks/")) {
+        latestText.set(rowTextIds[0].analysis, {
+          block_id: rowTextIds[0].analysis,
+          text: { elements: [{ text_run: { content: "用户刚输入的分析" } }] },
+        });
         return { data: { document: { revision_id: 30 } } };
       }
       const blockId = decodeURIComponent(String(url).split("/").at(-1));
@@ -443,12 +447,6 @@ test("a result cell filled after the table scan is re-read and never overwritten
     conciseProductDocAnalysis: () => "自动分析",
     updateFeishuTextBlock: async (_client, _documentId, blockId, content) => {
       writes.push({ blockId, content });
-      if (blockId === rowTextIds[0].status) {
-        latestText.set(rowTextIds[0].analysis, {
-          block_id: rowTextIds[0].analysis,
-          text: { elements: [{ text_run: { content: "用户刚输入的分析" } }] },
-        });
-      }
     },
   };
 
@@ -505,15 +503,16 @@ test("automatic result writes carry the freshly read document revision", async (
   try {
     await syncModule.syncProductDocument(client, { id: "product-revision", documentId: "document-revision" });
     assert.deepEqual(writes, [
-      { blockId: rowTextIds[0].analysis, content: "自动分析", revision: 40 },
-      { blockId: rowTextIds[0].translation, content: "自动翻译", revision: 41 },
+      { blockId: rowTextIds[0].status, content: "", revision: undefined },
+      { blockId: rowTextIds[0].analysis, content: "自动分析", revision: 41 },
+      { blockId: rowTextIds[0].translation, content: "自动翻译", revision: 42 },
     ]);
   } finally {
     delete globalThis.__productDocSyncWriteProtectionHooks;
   }
 });
 
-test("an explicit retry requeues a completed video without touching manual result cells", async () => {
+test("the video cell no longer acts as a textual retry control", async () => {
   const link = "https://www.tiktok.com/@demo/video/7888888888888888888";
   const video = {
     id: "video-retry",
@@ -541,11 +540,161 @@ test("an explicit retry requeues a completed video without touching manual resul
 
   try {
     const result = await syncModule.syncProductDocument({}, { id: "product-1", documentId: "document-1" });
-    assert.deepEqual(result, { found: 1, queued: 1, completed: 0, failed: 0 });
-    assert.deepEqual(enqueued, [video.id]);
-    assert.deepEqual(writes, [{ blockId: rowTextIds[0].status, content: "排队中" }]);
+    assert.deepEqual(result, { found: 1, queued: 0, completed: 1, failed: 0 });
+    assert.deepEqual(enqueued, []);
+    assert.deepEqual(writes, [{ blockId: rowTextIds[0].status, content: "" }]);
     assert.equal(writes.some((write) => write.blockId === rowTextIds[0].analysis), false);
     assert.equal(writes.some((write) => write.blockId === rowTextIds[0].translation), false);
+  } finally {
+    delete globalThis.__productDocSyncWriteProtectionHooks;
+  }
+});
+
+test("a malformed earlier row cannot block later new links", async () => {
+  const badLink = "https://www.tiktok.com/@demo/video/7000000000000000101";
+  const newLink = "https://www.tiktok.com/@demo/video/7000000000000000102";
+  const { blocks, rowTextIds } = documentBlocks([
+    { link: badLink, status: "", analysis: "", translation: "" },
+    { link: newLink, status: "", analysis: "", translation: "" },
+  ]);
+  const statusCell = blocks.find((block) => block.block_id === "row-1-status");
+  statusCell.children = ["row-1-video-view"];
+  blocks.push({ block_id: "row-1-video-view", block_type: 33, children: ["row-1-video-file"] });
+  blocks.push({ block_id: "row-1-video-file", block_type: 23, file: { name: "existing.mp4" } });
+  const created = [];
+  const enqueued = [];
+  globalThis.__productDocSyncWriteProtectionHooks = {
+    listFeishuDocumentBlocks: () => blocks,
+    getVideoBySourceUrl: (url) => {
+      if (url === new URL(badLink).toString()) throw new Error("坏行测试");
+      return null;
+    },
+    createVideo: (input) => {
+      created.push(input);
+      return { id: "later-video", status: "queued" };
+    },
+    enqueueVideos: (ids) => enqueued.push(...ids),
+  };
+  try {
+    const result = await syncModule.syncProductDocument({}, { id: "product-rows", documentId: "document-rows" });
+    assert.deepEqual(result, { found: 1, queued: 1, completed: 0, failed: 0 });
+    assert.equal(created[0].sourceUrl, new URL(newLink).toString());
+    assert.deepEqual(enqueued, ["later-video"]);
+    assert.equal(rowTextIds[0].status.endsWith("-text"), true);
+  } finally {
+    delete globalThis.__productDocSyncWriteProtectionHooks;
+  }
+});
+
+test("duplicate document links create one task and both rows share it", async () => {
+  const link = "https://www.tiktok.com/t/ZP8Duplicate/";
+  const { blocks } = documentBlocks([
+    { link, status: "", analysis: "", translation: "" },
+    { link, status: "", analysis: "", translation: "" },
+  ]);
+  let stored = null;
+  let creates = 0;
+  const enqueued = [];
+  globalThis.__productDocSyncWriteProtectionHooks = {
+    listFeishuDocumentBlocks: () => blocks,
+    getVideoBySourceUrl: () => stored,
+    createVideo: () => {
+      creates += 1;
+      stored = { id: "shared-video", status: "queued" };
+      return stored;
+    },
+    enqueueVideos: (ids) => enqueued.push(...ids),
+  };
+  try {
+    assert.deepEqual(
+      await syncModule.syncProductDocument({}, { id: "product-duplicate", documentId: "document-duplicate" }),
+      { found: 2, queued: 1, completed: 0, failed: 0 },
+    );
+    assert.equal(creates, 1);
+    assert.deepEqual(enqueued, ["shared-video"]);
+  } finally {
+    delete globalThis.__productDocSyncWriteProtectionHooks;
+  }
+});
+
+test("failed product-document analysis retries twice without writing status text", async () => {
+  const link = "https://www.tiktok.com/@demo/video/7000000000000000201";
+  const { blocks, rowTextIds } = documentBlocks([{ link, status: "旧状态", analysis: "", translation: "" }]);
+  const video = {
+    id: "retry-video",
+    status: "failed",
+    analysisMode: "product_doc",
+    productDocRetryCount: 1,
+    errorMessage: "临时失败",
+  };
+  const updates = [];
+  const enqueued = [];
+  const writes = [];
+  globalThis.__productDocSyncWriteProtectionHooks = {
+    listFeishuDocumentBlocks: () => blocks,
+    getVideoBySourceUrl: () => video,
+    updateVideo: (_id, values) => updates.push(values),
+    enqueueVideos: (ids) => enqueued.push(...ids),
+    updateFeishuTextBlock: async (_client, _documentId, blockId, content) => writes.push({ blockId, content }),
+  };
+  try {
+    assert.deepEqual(
+      await syncModule.syncProductDocument({}, { id: "product-retry", documentId: "document-retry" }),
+      { found: 1, queued: 1, completed: 0, failed: 0 },
+    );
+    assert.deepEqual(updates, [{ product_doc_retry_count: 2 }]);
+    assert.deepEqual(enqueued, [video.id]);
+    assert.deepEqual(
+      writes.filter((write) => write.blockId === rowTextIds[0].status),
+      [{ blockId: rowTextIds[0].status, content: "" }],
+    );
+  } finally {
+    delete globalThis.__productDocSyncWriteProtectionHooks;
+  }
+});
+
+test("clearing a delivered terminal error requests a fresh analysis", async () => {
+  const link = "https://www.tiktok.com/@demo/video/7000000000000000202";
+  const { blocks, rowTextIds } = documentBlocks([{ link, status: "", analysis: "", translation: "" }]);
+  const video = {
+    id: "terminal-video",
+    status: "failed",
+    analysisMode: "product_doc",
+    productDocRetryCount: 2,
+    errorMessage: "最终失败",
+  };
+  const latestText = new Map(blocks.filter((block) => block.text).map((block) => [block.block_id, block]));
+  const client = {
+    request: async ({ url }) => {
+      if (!String(url).includes("/blocks/")) return { data: { document: { revision_id: 50 } } };
+      const blockId = decodeURIComponent(String(url).split("/").at(-1));
+      return { data: { block: latestText.get(blockId) } };
+    },
+  };
+  const updates = [];
+  const enqueued = [];
+  const writes = [];
+  globalThis.__productDocSyncWriteProtectionHooks = {
+    listFeishuDocumentBlocks: () => blocks,
+    getVideoBySourceUrl: () => video,
+    updateVideo: (_id, values) => updates.push(values),
+    enqueueVideos: (ids) => enqueued.push(...ids),
+    updateFeishuTextBlock: async (_client, _documentId, blockId, content) => writes.push({ blockId, content }),
+  };
+  try {
+    assert.deepEqual(
+      await syncModule.syncProductDocument(client, { id: "product-terminal", documentId: "document-terminal" }),
+      { found: 1, queued: 0, completed: 0, failed: 1 },
+    );
+    assert.deepEqual(writes, [{ blockId: rowTextIds[0].analysis, content: "失败：最终失败" }]);
+    writes.length = 0;
+    assert.deepEqual(
+      await syncModule.syncProductDocument(client, { id: "product-terminal", documentId: "document-terminal" }),
+      { found: 1, queued: 1, completed: 0, failed: 0 },
+    );
+    assert.deepEqual(updates, [{ product_doc_retry_count: 0, error_message: null }]);
+    assert.deepEqual(enqueued, [video.id]);
+    assert.deepEqual(writes, []);
   } finally {
     delete globalThis.__productDocSyncWriteProtectionHooks;
   }

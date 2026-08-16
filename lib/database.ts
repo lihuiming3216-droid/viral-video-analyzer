@@ -367,6 +367,9 @@ function initialize(db: DatabaseSync) {
   if (!videoColumns.some((column) => String(column.name) === "analysis_mode")) {
     db.exec("ALTER TABLE videos ADD COLUMN analysis_mode TEXT NOT NULL DEFAULT 'full'");
   }
+  if (!videoColumns.some((column) => String(column.name) === "product_doc_retry_count")) {
+    db.exec("ALTER TABLE videos ADD COLUMN product_doc_retry_count INTEGER NOT NULL DEFAULT 0");
+  }
   const feishuSettingsColumns = db.prepare("PRAGMA table_info(feishu_settings)").all() as Array<Record<string, unknown>>;
   for (const [name, definition] of [
     ["product_folder_token", "TEXT NOT NULL DEFAULT ''"],
@@ -790,6 +793,7 @@ function videoFromRow(row: Record<string, unknown>): VideoRecord {
     transcriptZh: String(row.transcript_zh ?? ""),
     analysis: json<AnalysisResult | null>(row.analysis_json, null),
     analysisMode: row.analysis_mode === "product_doc" ? "product_doc" : "full",
+    productDocRetryCount: Number(row.product_doc_retry_count ?? 0),
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
   };
@@ -1205,7 +1209,7 @@ export function createVideo(input: {
 export function updateVideo(id: string, values: Record<string, unknown>) {
   const allowed = new Set([
     "product_id", "title", "account_name", "platform_video_id", "language", "published_at",
-    "analysis_mode",
+    "analysis_mode", "product_doc_retry_count",
     "duration_seconds", "original_path", "cover_path", "remote_video_url", "status", "stage", "progress",
     "error_message", "score_traffic", "score_conversion", "score_visual", "score_product", "score_audio",
     "score_rhythm", "summary", "hook_summary", "manual_label", "manual_notes", "view_count", "like_count",

@@ -234,3 +234,43 @@ export async function analyzeVideoWithQwen(input: {
     }
   }
 }
+
+/**
+ * Translate TokScript's transcript without sending the video to Qwen. This is
+ * intentionally independent from the full-video analysis request so a slow or
+ * failed multimodal call cannot erase an otherwise valid translation.
+ */
+export async function translateTranscriptWithQwen(input: {
+  transcript: string;
+  signal?: AbortSignal;
+}) {
+  const transcript = input.transcript.trim();
+  if (!transcript) return "";
+  const config = requireProvider("qwen");
+  const timeoutSignal = AbortSignal.timeout(QWEN_REQUEST_TIMEOUT_MS);
+  const signal = input.signal ? AbortSignal.any([input.signal, timeoutSignal]) : timeoutSignal;
+  const response = await fetch(`${config.baseUrl}/chat/completions`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${config.apiKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: qwenVideoModel(),
+      messages: [{
+        role: "user",
+        content: [{
+          type: "text",
+          text: `把下面 TokScript 提供的完整口播原文翻译成自然、准确、完整的简体中文。只返回 JSON，不要解释：{"translationZh":""}。不要删减、总结、补写。原文：${JSON.stringify(transcript)}`,
+        }],
+      }],
+      modalities: ["text"],
+      enable_thinking: false,
+      stream: true,
+      max_tokens: 4_500,
+    }),
+    signal,
+  });
+  const parsed = await parseOmniStream(response, () => undefined);
+  const result = parsed.result as Record<string, unknown>;
+  const translation = String(result.translationZh || result.translation_zh || result.translation || "").trim();
+  if (!translation) throw new Error("Qwen 未返回口播中文翻译");
+  return translation;
+}

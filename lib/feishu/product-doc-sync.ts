@@ -399,6 +399,18 @@ async function syncProductDocumentUnlocked(
         continue;
       }
       if (video.status === "failed" && video.analysisMode === "product_doc") {
+        // TokScript translation is independent of Qwen video analysis. Keep
+        // the Chinese transcript even when the video-analysis task failed.
+        const failedTranscriptZh = String(video.transcriptZh || "").trim();
+        if (!row[3].text.trim() && failedTranscriptZh) {
+          await updateBlankResultCell(
+            client,
+            product.documentId,
+            row[3].textId,
+            failedTranscriptZh,
+            { linkBlockId, sourceUrl: video.sourceUrl || "" },
+          );
+        }
         // Qwen's retry budget belongs to this one video task. A terminal task
         // is requeued only when the user clears the delivered failure cell.
         if (/^失败：/.test(row[2].text)) {

@@ -138,6 +138,16 @@ test("only explicit structured transcript or segments fields supply speech", asy
   ]);
 });
 
+test("TokScript Chinese transcript is preserved when returned directly", async () => {
+  const result = await fetchWithTranscriptToolResult({
+    structuredContent: {
+      transcript: "Wrap the cuff around your upper arm and press start.",
+      transcriptZh: "将袖带缠绕在上臂并按下开始键。",
+    },
+  });
+  assert.equal(result.transcriptZh, "将袖带缠绕在上臂并按下开始键。");
+});
+
 test("structured metadata cannot replace an empty or missing transcript", async () => {
   for (const structuredContent of [
     { transcript: "", message: "Video processed successfully", text: "Success", content: "Metadata" },

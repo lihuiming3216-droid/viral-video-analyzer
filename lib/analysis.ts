@@ -11,7 +11,11 @@ import {
 import { clampScore, formatTime } from "@/lib/json-utils";
 import { getLearningContext, learnFromVideo } from "@/lib/learning";
 import { getProviderConfig } from "@/lib/provider-config";
-import { analyzeVideoWithQwen, type QwenRequestDiagnostic } from "@/lib/providers/qwen";
+import {
+  analyzeVideoWithQwen,
+  translateTranscriptWithQwen,
+  type QwenRequestDiagnostic,
+} from "@/lib/providers/qwen";
 import { fetchTikTok, tokScriptTranscriptFailure } from "@/lib/providers/tokscript";
 import type {
   AnalysisResult,
@@ -67,7 +71,12 @@ function normalizeScene(value: Partial<AnalysisScene>, shotIndex: number): Analy
   };
 }
 
-function normalizeAnalysis(value: Partial<AnalysisResult>, sceneCount: number, trace: string[]): AnalysisResult {
+function normalizeAnalysis(
+  value: Partial<AnalysisResult>,
+  sceneCount: number,
+  trace: string[],
+  transcriptZhOverride = "",
+): AnalysisResult {
   const rawScores = value.scores || defaultScores();
   const rawScenes = Array.isArray(value.scenes) ? value.scenes : [];
   const scenes = Array.from({ length: sceneCount }, (_, index) => {
@@ -77,7 +86,7 @@ function normalizeAnalysis(value: Partial<AnalysisResult>, sceneCount: number, t
   return {
     summary: String(value.summary || "分析已完成"),
     language: String(value.language || "unknown"),
-    translationZh: String(value.translationZh || ""),
+    translationZh: transcriptZhOverride.trim() || String(value.translationZh || ""),
     scores: {
       traffic: clampScore(rawScores.traffic), conversion: clampScore(rawScores.conversion),
       visual: clampScore(rawScores.visual), product: clampScore(rawScores.product),
@@ -201,15 +210,23 @@ function isUsableAnalysis(
   sceneCount: number,
   mode: "full" | "product_doc",
   transcript = "",
+  independentTranslation = "",
 ) {
   if (!value || typeof value.summary !== "string" || !value.summary.trim()) return false;
-  if (!transcriptAndTranslationAgree(transcript, value.translationZh)) return false;
+  // TokScript owns the transcript translation now. Qwen's video result may
+  // omit translation or return it independently; either case must not make a
+  // valid video analysis unusable.
+  if (value.translationZh && !transcriptAndTranslationAgree(transcript, value.translationZh)) return false;
+  const usableTranslation = String(value.translationZh || independentTranslation || "").trim();
+  if (!usableTranslation) return false;
   const scores = value.scores;
   const scenes = value.scenes;
   // The table path deliberately asks for a compact object without scene rows
   // or scores. Accept it here so a valid lightweight result does not trigger
   // a second Qwen request.
-  if (mode === "product_doc") return typeof value.translationZh === "string" && Boolean(value.translationZh.trim());
+  if (mode === "product_doc") {
+    return true;
+  }
   return Boolean(
     scores && typeof scores === "object"
     && Array.isArray(scenes)
@@ -285,6 +302,7 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
     assertVideoAttempt(videoId, signal, expectedAttemptNumber);
     let relativeVideoPath = initial.originalPath;
     let transcript = initial.transcriptOriginal;
+    let transcriptZh = String(initial.transcriptZh || "");
     let transcriptSegments: Array<{ start: number; end: number; text: string }> = [];
 
     const storedTokScriptFailure = initial.sourceType === "tiktok"
@@ -307,6 +325,7 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
       if (!tok.downloadUrl) throw new Error("TokScript 没有返回可下载的视频地址");
       const remoteVideoUrl = tok.downloadUrl;
       transcript = tok.transcript;
+      transcriptZh = tok.transcriptZh || transcriptZh;
       transcriptSegments = tok.segments;
       // Persist metadata before downloading the media. If the CDN is slow, a
       // retry keeps the already-fetched transcript and diagnostics instead of
@@ -314,6 +333,7 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
       updateVideo(videoId, {
         remote_video_url: remoteVideoUrl,
         transcript_original: transcript,
+        ...(transcriptZh ? { transcript_zh: transcriptZh } : {}),
         transcript_segments_json: JSON.stringify(transcriptSegments),
         language: tok.language || null,
         title: tok.title || initial.title,
@@ -351,6 +371,20 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
       }
     } else if (initial.sourceType === "tiktok") {
       trace.push("本地缓存：复用已保存的 TikTok 原片和文案");
+    }
+
+    // Translate the TokScript transcript independently from full-video Qwen.
+    // A video-analysis timeout must not erase a translation that is already
+    // available, nor prevent a text-only translation from being saved.
+    if (transcript.trim() && !transcriptZh.trim() && isConfigured("qwen")) {
+      try {
+        transcriptZh = await translateTranscriptWithQwen({ transcript, signal });
+        assertVideoAttempt(videoId, signal, expectedAttemptNumber);
+        if (transcriptZh.trim()) updateVideo(videoId, { transcript_zh: transcriptZh });
+      } catch (error) {
+        if (signal?.aborted) throw error;
+        trace.push(`TokScript 原文翻译未完成：${error instanceof Error ? error.message : "未知错误"}`);
+      }
     }
 
     if (!relativeVideoPath) throw new Error("没有可分析的视频文件");
@@ -438,7 +472,7 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
     assertVideoAttempt(videoId, signal, expectedAttemptNumber);
     setStage(videoId, "analyzing", analysisMode === "product_doc" ? "正在生成轻量视频分析和中文翻译" : "正在生成中文深度报告和复拍脚本", 82);
     let rawAnalysis: Partial<AnalysisResult>;
-    if (isUsableAnalysis(qwenContext, assets.scenes.length, analysisMode, transcript)) {
+    if (isUsableAnalysis(qwenContext, assets.scenes.length, analysisMode, transcript, transcriptZh)) {
       rawAnalysis = qwenContext as Partial<AnalysisResult>;
       trace.push("自动路由：Qwen 结果完整，直接生成快速报告");
     } else if (isConfigured("qwen")) {
@@ -455,11 +489,11 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
       throw new Error("请先配置并启用 Qwen，所有 AI 分析只使用 Qwen");
     }
 
-    if (!isUsableAnalysis(rawAnalysis as Record<string, unknown>, assets.scenes.length, analysisMode, transcript)) {
-      throw new Error("Qwen 未返回完整的视频分析和中文翻译，请重试该链接");
+    if (!isUsableAnalysis(rawAnalysis as Record<string, unknown>, assets.scenes.length, analysisMode, transcript, transcriptZh)) {
+      throw new Error("Qwen 未返回完整的视频分析，请重试该链接");
     }
 
-    const analysis = normalizeAnalysis(rawAnalysis, assets.scenes.length, trace);
+    const analysis = normalizeAnalysis(rawAnalysis, assets.scenes.length, trace, transcriptZh);
     const keyShotIndexes = new Set<number>();
     analysis.scenes.forEach((scene) => {
       if (scene.tags.some((tag) => /钩子|爆点|hook|viral/i.test(tag)) || /钩子|爆点/.test(scene.role)) keyShotIndexes.add(scene.shotIndex);

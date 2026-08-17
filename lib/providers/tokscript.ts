@@ -29,6 +29,8 @@ type TokScriptToolErrorCategory =
 
 export interface TokScriptResult {
   transcript: string;
+  /** Chinese translation returned by TokScript when the account/tool provides it. */
+  transcriptZh: string;
   language: string;
   segments: Array<{ start: number; end: number; text: string }>;
   downloadUrl: string;
@@ -406,6 +408,36 @@ function explicitTranscript(root: unknown) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+function explicitTranscriptZh(root: unknown) {
+  const value = findValue(root, [
+    "transcript_zh", "transcriptZh", "translation_zh", "translationZh",
+    "translated_transcript", "translatedTranscript", "chinese_translation", "chineseTranslation",
+    "zh_transcript", "zhTranscript",
+  ]);
+  if (typeof value === "string" && value.trim()) return value.trim();
+  // A few TokScript accounts use a generic `translation` key. Accept it only
+  // when it visibly contains Chinese, so metadata such as a language label is
+  // never mistaken for the transcript translation.
+  const generic = findValue(root, ["translation", "translated"]);
+  return typeof generic === "string" && /[\u3400-\u9fff]/.test(generic) ? generic.trim() : "";
+}
+
+function translatedSegments(root: unknown) {
+  const candidate = findValue(root, ["segments", "transcript_segments", "transcriptSegments"]);
+  if (!Array.isArray(candidate)) return "";
+  return candidate
+    .map((item) => {
+      if (!item || typeof item !== "object") return "";
+      const row = item as Record<string, unknown>;
+      return String(
+        row.translationZh ?? row.translation_zh ?? row.translatedText
+          ?? row.translated_text ?? row.translation ?? row.chinese ?? row.zh ?? "",
+      ).trim();
+    })
+    .filter(Boolean)
+    .join(" ");
+}
+
 function audioTrackName(root: unknown) {
   const seen = new Set<unknown>();
   const visit = (value: unknown): string => {
@@ -656,8 +688,13 @@ export async function fetchTikTok(
       normalizedTranscript,
       audioTrackName(transcriptRaw),
     );
+    const transcriptZh = explicitTranscriptZh(transcriptRaw)
+      || translatedSegments(transcriptRaw)
+      || explicitTranscriptZh(downloadRaw)
+      || translatedSegments(downloadRaw);
     return {
       transcript: noProductVoiceover ? NO_PRODUCT_VOICEOVER_TRANSCRIPT : normalizedTranscript,
+      transcriptZh: noProductVoiceover ? NO_PRODUCT_VOICEOVER_TRANSCRIPT : transcriptZh,
       language: textValue(transcriptRaw, ["language", "detected_language", "detectedLanguage"]),
       segments: noProductVoiceover ? [] : segments,
       downloadUrl: findMediaUrl(downloadRaw, "video"),

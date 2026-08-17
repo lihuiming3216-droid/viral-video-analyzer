@@ -695,6 +695,7 @@ test("failed product-document analysis is reported without automatically requeue
     productDocRetryCount: 1,
     productDocFailureDelivered: false,
     errorMessage: "临时失败",
+    transcriptZh: "这是 TokScript 原口播的中文翻译。",
   };
   const latestText = new Map(blocks.filter((block) => block.text).map((block) => [block.block_id, block]));
   const client = {
@@ -723,6 +724,7 @@ test("failed product-document analysis is reported without automatically requeue
     assert.deepEqual(enqueued, []);
     assert.deepEqual(writes, [
       { blockId: rowTextIds[0].status, content: "" },
+      { blockId: rowTextIds[0].translation, content: "这是 TokScript 原口播的中文翻译。" },
       { blockId: rowTextIds[0].analysis, content: "失败：临时失败" },
     ]);
   } finally {

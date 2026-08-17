@@ -20,6 +20,7 @@ async function loadAnalysis(hooks) {
     export const learnFromVideo = (...args) => hooks().learnFromVideo?.(...args);
     export const getProviderConfig = () => ({ enabled: true, apiKey: "test-key" });
     export const analyzeVideoWithQwen = (...args) => hooks().analyzeVideoWithQwen(...args);
+    export const translateTranscriptWithQwen = (...args) => hooks().translateTranscriptWithQwen?.(...args) || Promise.resolve("");
     export const fetchTikTok = (...args) => hooks().fetchTikTok?.(...args);
     export const tokScriptTranscriptFailure = () => false;
     export const transcriptAndTranslationAgree = () => true;

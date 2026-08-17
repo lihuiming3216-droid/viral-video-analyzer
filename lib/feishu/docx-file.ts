@@ -88,8 +88,11 @@ export async function ensureFeishuVideoPreview(input: {
   absolutePath: string;
   fileName: string;
   blocks: DocxBlock[];
+  validateBinding?: () => Promise<{ valid: boolean; documentRevisionId: number }>;
 }) {
-  const { client, documentId, parentBlockId, absolutePath, fileName, blocks } = input;
+  const { client, documentId, parentBlockId, absolutePath, fileName, blocks, validateBinding } = input;
+  const initialValidation = await validateBinding?.();
+  if (initialValidation && !initialValidation.valid) return false;
   if (descendants(parentBlockId, blocks).some((block) => block.block_type === 23 && block.file?.name === fileName)) {
     return false;
   }
@@ -116,9 +119,18 @@ export async function ensureFeishuVideoPreview(input: {
     if (!fileBlockId) throw new Error("飞书没有创建视频文件块");
 
     const token = await uploadFile(client, fileBlockId, absolutePath, fileName);
+    const finalValidation = await validateBinding?.();
+    if (finalValidation && !finalValidation.valid) {
+      await deleteChild(client, documentId, parentBlockId, viewBlockId);
+      viewBlockId = "";
+      return false;
+    }
     const patched = await client.docx.v1.documentBlock.patch({
       path: { document_id: documentId, block_id: fileBlockId },
       data: { replace_file: { token } },
+      params: finalValidation
+        ? { document_revision_id: finalValidation.documentRevisionId }
+        : undefined,
     });
     if (patched.code) throw new Error(patched.msg || "飞书视频附件绑定失败");
     return true;

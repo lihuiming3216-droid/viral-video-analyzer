@@ -40,8 +40,10 @@ function clientHarness(events, options = {}) {
         batchDelete: async ({ data }) => events.push(["delete", data.start_index, data.end_index]),
       },
       documentBlock: {
-        patch: async ({ path: inputPath, data }) => {
-          events.push(["patch", inputPath.block_id, data.replace_file.token]);
+        patch: async ({ path: inputPath, data, params }) => {
+          events.push(params
+            ? ["patch", inputPath.block_id, data.replace_file.token, params.document_revision_id]
+            : ["patch", inputPath.block_id, data.replace_file.token]);
           return { code: options.patchCode || 0 };
         },
       },
@@ -130,6 +132,61 @@ test("removes the empty preview when binding the uploaded file fails", async () 
       /飞书视频附件绑定失败/,
     );
     assert.deepEqual(events.at(-1), ["delete", 0, 1]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("removes an uploaded preview without binding when the row identity changes", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "feishu-preview-stale-row-"));
+  const absolutePath = path.join(directory, "original.mp4");
+  await writeFile(absolutePath, Buffer.alloc(32));
+  const events = [];
+  let validations = 0;
+  try {
+    const delivered = await preview.ensureFeishuVideoPreview({
+      client: clientHarness(events, {
+        children: [{ block_id: "view-1", block_type: 33 }],
+      }),
+      documentId: "document-stale-row",
+      parentBlockId: "status-cell",
+      absolutePath,
+      fileName: "TokScript视频-stale-row.mp4",
+      blocks: [{ block_id: "status-cell", children: ["status-text"] }],
+      validateBinding: async () => {
+        validations += 1;
+        return { valid: validations === 1, documentRevisionId: 80 + validations };
+      },
+    });
+    assert.equal(delivered, false);
+    assert.equal(validations, 2);
+    assert.deepEqual(events, [
+      ["create", 2],
+      ["upload", "TokScript视频-stale-row.mp4", "file-1", 32],
+      ["delete", 0, 1],
+    ]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("binds a validated preview against the same fresh document revision", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "feishu-preview-revision-"));
+  const absolutePath = path.join(directory, "original.mp4");
+  await writeFile(absolutePath, Buffer.alloc(32));
+  const events = [];
+  let revision = 90;
+  try {
+    assert.equal(await preview.ensureFeishuVideoPreview({
+      client: clientHarness(events),
+      documentId: "document-revision",
+      parentBlockId: "status-cell",
+      absolutePath,
+      fileName: "TokScript视频-revision.mp4",
+      blocks: [{ block_id: "status-cell", children: ["status-text"] }],
+      validateBinding: async () => ({ valid: true, documentRevisionId: revision++ }),
+    }), true);
+    assert.deepEqual(events.at(-1), ["patch", "file-1", "file-token", 91]);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

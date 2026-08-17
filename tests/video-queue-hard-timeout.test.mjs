@@ -140,6 +140,7 @@ async function loadAnalysis(hooks) {
     export const getVideo = (...args) => hooks().getVideo(...args);
     export const replaceScenes = (...args) => hooks().replaceScenes?.(...args);
     export const updateVideo = (...args) => hooks().updateVideo?.(...args);
+    export const updateVideoAttemptDiagnostics = (...args) => hooks().updateVideoAttemptDiagnostics?.(...args);
     export const clampScore = (value) => Number(value) || 0;
     export const formatTime = (value) => String(value);
     export const getLearningContext = () => null;
@@ -155,6 +156,7 @@ async function loadAnalysis(hooks) {
     export const extractVideoAssets = () => Promise.resolve({ duration: 1, scenes: [] });
     export const prepareLocalVideoForQwen = (_id, path) => Promise.resolve(path);
     export const resolveMediaPath = (value) => value;
+    export const validateCompleteVideoForQwen = () => Promise.resolve({ duration: 1, width: 1, height: 1, videoCodec: "h264", audioCodec: "aac" });
   `;
   const stubUrl = `data:text/javascript;base64,${Buffer.from(stub).toString("base64")}`;
   let compiled = ts.transpileModule(analysisSource, {

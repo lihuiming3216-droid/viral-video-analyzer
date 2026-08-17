@@ -1,12 +1,26 @@
 import "server-only";
 
-import { getProduct, getVideo, replaceScenes, updateVideo } from "@/lib/database";
+import { randomUUID } from "node:crypto";
+import {
+  getProduct,
+  getVideo,
+  replaceScenes,
+  updateVideo,
+  updateVideoAttemptDiagnostics,
+} from "@/lib/database";
 import { clampScore, formatTime } from "@/lib/json-utils";
 import { getLearningContext, learnFromVideo } from "@/lib/learning";
 import { getProviderConfig } from "@/lib/provider-config";
-import { analyzeVideoWithQwen } from "@/lib/providers/qwen";
+import { analyzeVideoWithQwen, type QwenRequestDiagnostic } from "@/lib/providers/qwen";
 import { fetchTikTok, tokScriptTranscriptFailure } from "@/lib/providers/tokscript";
-import type { AnalysisResult, AnalysisScene, Product, ScoreSet } from "@/lib/types";
+import type {
+  AnalysisResult,
+  AnalysisScene,
+  Product,
+  ScoreSet,
+  VideoAttemptCallDiagnostic,
+  VideoAttemptDiagnostics,
+} from "@/lib/types";
 import { transcriptAndTranslationAgree } from "@/lib/transcript-validation";
 import { emitVideoProgress } from "@/lib/video-events";
 import {
@@ -15,6 +29,7 @@ import {
   extractVideoAssets,
   prepareLocalVideoForQwen,
   resolveMediaPath,
+  validateCompleteVideoForQwen,
   type ExtractedScene,
 } from "@/lib/video-processing";
 
@@ -225,6 +240,37 @@ function assertVideoAttempt(videoId: string, signal?: AbortSignal, expectedAttem
   if (!ownsVideoAttempt(videoId, expectedAttemptNumber)) throw new Error("分析任务已被新的执行替代");
 }
 
+function qwenDiagnosticPhase(diagnostic: QwenRequestDiagnostic): VideoAttemptCallDiagnostic["phase"] {
+  if (diagnostic.outcome === "success") return "completed";
+  if (diagnostic.outcome === "http_error") return "awaiting_first_token";
+  if (diagnostic.outcome === "invalid_response") {
+    return diagnostic.firstTokenMs === null ? "awaiting_first_token" : "parsing";
+  }
+  if (diagnostic.headersMs === null) return "awaiting_headers";
+  return diagnostic.firstTokenMs === null ? "awaiting_first_token" : "streaming";
+}
+
+function qwenCallDiagnostic(
+  requestIndex: 1 | 2,
+  clientRequestId: string,
+  startedAt: string,
+  diagnostic: QwenRequestDiagnostic,
+): VideoAttemptCallDiagnostic {
+  return {
+    requestIndex,
+    clientRequestId,
+    ...(diagnostic.requestId ? { providerRequestId: diagnostic.requestId } : {}),
+    phase: qwenDiagnosticPhase(diagnostic),
+    outcome: diagnostic.outcome,
+    startedAt,
+    ...(diagnostic.headersMs === null ? {} : { headersMs: diagnostic.headersMs }),
+    ...(diagnostic.firstTokenMs === null ? {} : { firstTokenMs: diagnostic.firstTokenMs }),
+    totalMs: diagnostic.totalMs,
+    ...(diagnostic.httpStatus === null ? {} : { httpStatus: diagnostic.httpStatus }),
+    ...(diagnostic.responseSha256 ? { responseSha256: diagnostic.responseSha256 } : {}),
+  };
+}
+
 export async function analyzeVideo(videoId: string, signal?: AbortSignal, expectedAttemptNumber?: number) {
   const initial = getVideo(videoId);
   if (!initial) throw new Error("视频不存在");
@@ -235,7 +281,6 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
   try {
     assertVideoAttempt(videoId, signal, expectedAttemptNumber);
     let relativeVideoPath = initial.originalPath;
-    let remoteVideoUrl = initial.remoteVideoUrl;
     let transcript = initial.transcriptOriginal;
     let transcriptSegments: Array<{ start: number; end: number; text: string }> = [];
 
@@ -257,7 +302,7 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
       );
       assertVideoAttempt(videoId, signal, expectedAttemptNumber);
       if (!tok.downloadUrl) throw new Error("TokScript 没有返回可下载的视频地址");
-      remoteVideoUrl = tok.downloadUrl;
+      const remoteVideoUrl = tok.downloadUrl;
       transcript = tok.transcript;
       transcriptSegments = tok.segments;
       // Persist metadata before downloading the media. If the CDN is slow, a
@@ -320,22 +365,65 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
     const learnedExamples = Array.isArray(learningContext?.similarExamples) ? learningContext.similarExamples.length : 0;
     if (learnedExamples) trace.push(`长期学习：参考 ${learnedExamples} 条相似历史经验`);
     const prompt = buildPrompt({ product, scenes: assets.scenes, learningContext, mode: analysisMode });
-    const qwenVideoPath = remoteVideoUrl
-      ? relativeVideoPath
-      : await prepareLocalVideoForQwen(videoId, relativeVideoPath, assets.duration, signal);
+    // Qwen must always receive the locally downloaded, verified A/V file. A
+    // TokScript download URL is useful for acquiring the source, but asking
+    // Qwen to fetch that temporary URL again is both slower and less reliable,
+    // and some provider downloads have contained video without an audio track.
+    const qwenVideoPath = await prepareLocalVideoForQwen(
+      videoId,
+      relativeVideoPath,
+      assets.duration,
+      signal,
+    );
     assertVideoAttempt(videoId, signal, expectedAttemptNumber);
+    const qwenLocalVideoPath = resolveMediaPath(qwenVideoPath);
+    const qwenMedia = await validateCompleteVideoForQwen(qwenLocalVideoPath, signal);
+    assertVideoAttempt(videoId, signal, expectedAttemptNumber);
+    const qwenCalls: VideoAttemptCallDiagnostic[] = [];
+    const qwenMaxTokens = analysisMode === "product_doc" ? 2_000 : 4_500;
+    const runQwenRequest = (requestIndex: 1 | 2) => {
+      const clientRequestId = randomUUID();
+      const startedAt = new Date().toISOString();
+      return analyzeVideoWithQwen({
+        prompt,
+        localVideoPath: qwenLocalVideoPath,
+        maxTokens: qwenMaxTokens,
+        signal,
+        onDiagnostic: (diagnostic) => {
+          const call = qwenCallDiagnostic(requestIndex, clientRequestId, startedAt, diagnostic);
+          const priorIndex = qwenCalls.findIndex((item) => item.requestIndex === requestIndex);
+          if (priorIndex >= 0) qwenCalls[priorIndex] = call;
+          else qwenCalls.push(call);
+          qwenCalls.sort((a, b) => a.requestIndex - b.requestIndex);
+          if (expectedAttemptNumber === undefined) return;
+          const snapshot: VideoAttemptDiagnostics = {
+            schemaVersion: 1,
+            provider: "qwen",
+            model: diagnostic.model,
+            inputMode: "local_base64",
+            fileBytes: diagnostic.inputBytes,
+            inputSha256: diagnostic.inputSha256,
+            encodedBytes: 4 * Math.ceil(diagnostic.inputBytes / 3),
+            durationMs: Math.round(qwenMedia.duration * 1_000),
+            hasAudio: true,
+            videoCodec: qwenMedia.videoCodec,
+            audioCodec: qwenMedia.audioCodec,
+            calls: [...qwenCalls],
+          };
+          try {
+            updateVideoAttemptDiagnostics(videoId, expectedAttemptNumber, snapshot);
+          } catch {
+            // Diagnostics are best effort and must never change the analysis.
+          }
+        },
+      });
+    };
     setStage(videoId, "analyzing", "正在观看完整视频并分析画面、声音、钩子和转化结构", 66);
 
     let qwenContext: Record<string, unknown> | undefined;
     if (isConfigured("qwen")) {
       try {
-        qwenContext = await analyzeVideoWithQwen({
-          prompt,
-          remoteVideoUrl,
-          localVideoPath: resolveMediaPath(qwenVideoPath),
-          maxTokens: analysisMode === "product_doc" ? 2_000 : 4_500,
-          signal,
-        });
+        qwenContext = await runQwenRequest(1);
         assertVideoAttempt(videoId, signal, expectedAttemptNumber);
         trace.push("Qwen Omni：完整 MP4 画面与原始音轨分析");
       } catch (error) {
@@ -352,7 +440,7 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
       trace.push("自动路由：Qwen 结果完整，直接生成快速报告");
     } else if (isConfigured("qwen")) {
       try {
-        rawAnalysis = await analyzeVideoWithQwen({ prompt, remoteVideoUrl, localVideoPath: resolveMediaPath(qwenVideoPath), maxTokens: analysisMode === "product_doc" ? 2_000 : 4_500, signal });
+        rawAnalysis = await runQwenRequest(2);
         assertVideoAttempt(videoId, signal, expectedAttemptNumber);
         trace.push("Qwen：首次结果不完整，已重试一次");
       } catch (error) {

@@ -18,6 +18,8 @@ import type {
   ProviderSetting,
   SceneRecord,
   VerifiedProductFactsMergeInput,
+  VideoAttemptCallDiagnostic,
+  VideoAttemptDiagnostics,
   VideoRecord,
   VideoStatus,
 } from "@/lib/types";
@@ -102,6 +104,7 @@ function initialize(db: DatabaseSync) {
       source_url TEXT,
       source_file_name TEXT,
       analysis_mode TEXT NOT NULL DEFAULT 'full',
+      product_doc_failure_delivered INTEGER NOT NULL DEFAULT 0,
       title TEXT NOT NULL DEFAULT '',
       account_name TEXT NOT NULL DEFAULT '',
       platform_video_id TEXT,
@@ -394,6 +397,9 @@ function initialize(db: DatabaseSync) {
   if (!videoColumns.some((column) => String(column.name) === "product_doc_retry_count")) {
     db.exec("ALTER TABLE videos ADD COLUMN product_doc_retry_count INTEGER NOT NULL DEFAULT 0");
   }
+  if (!videoColumns.some((column) => String(column.name) === "product_doc_failure_delivered")) {
+    db.exec("ALTER TABLE videos ADD COLUMN product_doc_failure_delivered INTEGER NOT NULL DEFAULT 0");
+  }
   if (!videoColumns.some((column) => String(column.name) === "processing_started_at")) {
     db.exec("ALTER TABLE videos ADD COLUMN processing_started_at TEXT");
   }
@@ -462,6 +468,7 @@ function initialize(db: DatabaseSync) {
           analysis_json TEXT,
           provider_payload_json TEXT,
           product_doc_retry_count INTEGER NOT NULL DEFAULT 0,
+          product_doc_failure_delivered INTEGER NOT NULL DEFAULT 0,
           processing_started_at TEXT,
           attempt_count INTEGER NOT NULL DEFAULT 0,
           created_at TEXT NOT NULL,
@@ -496,6 +503,7 @@ function initialize(db: DatabaseSync) {
       attempt_number INTEGER NOT NULL,
       status TEXT NOT NULL,
       error_message TEXT NOT NULL DEFAULT '',
+      diagnostics_json TEXT NOT NULL DEFAULT '{}',
       started_at TEXT NOT NULL,
       finished_at TEXT
     );
@@ -504,6 +512,10 @@ function initialize(db: DatabaseSync) {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_video_attempts_video_number
       ON video_attempts(video_id, attempt_number);
   `);
+  const videoAttemptColumns = db.prepare("PRAGMA table_info(video_attempts)").all() as Array<Record<string, unknown>>;
+  if (!videoAttemptColumns.some((column) => String(column.name) === "diagnostics_json")) {
+    db.exec("ALTER TABLE video_attempts ADD COLUMN diagnostics_json TEXT NOT NULL DEFAULT '{}'");
+  }
   const feishuSettingsColumns = db.prepare("PRAGMA table_info(feishu_settings)").all() as Array<Record<string, unknown>>;
   for (const [name, definition] of [
     ["product_folder_token", "TEXT NOT NULL DEFAULT ''"],
@@ -948,6 +960,7 @@ function videoFromRow(row: Record<string, unknown>): VideoRecord {
     analysis: json<AnalysisResult | null>(row.analysis_json, null),
     analysisMode: row.analysis_mode === "product_doc" ? "product_doc" : "full",
     productDocRetryCount: Number(row.product_doc_retry_count ?? 0),
+    productDocFailureDelivered: Boolean(Number(row.product_doc_failure_delivered ?? 0)),
     processingStartedAt: row.processing_started_at ? String(row.processing_started_at) : null,
     attemptCount: Number(row.attempt_count ?? 0),
     createdAt: String(row.created_at),
@@ -1441,7 +1454,7 @@ export function createVideo(input: {
 export function updateVideo(id: string, values: Record<string, unknown>) {
   const allowed = new Set([
     "product_id", "title", "account_name", "platform_video_id", "language", "published_at",
-    "analysis_mode", "product_doc_retry_count", "processing_started_at", "attempt_count",
+    "analysis_mode", "product_doc_retry_count", "product_doc_failure_delivered", "processing_started_at", "attempt_count",
     "duration_seconds", "original_path", "cover_path", "remote_video_url", "status", "stage", "progress",
     "error_message", "score_traffic", "score_conversion", "score_visual", "score_product", "score_audio",
     "score_rhythm", "summary", "hook_summary", "manual_label", "manual_notes", "view_count", "like_count",
@@ -1552,6 +1565,139 @@ export function getPendingVideoIds() {
     .map((row) => String((row as Record<string, unknown>).id));
 }
 
+export const VIDEO_ATTEMPT_DIAGNOSTICS_MAX_BYTES = 16 * 1024;
+
+const videoAttemptDiagnosticKeys = new Set([
+  "schemaVersion", "provider", "model", "inputMode", "fileBytes", "inputSha256", "encodedBytes", "durationMs",
+  "hasAudio", "videoCodec", "audioCodec", "calls",
+]);
+const videoAttemptCallDiagnosticKeys = new Set([
+  "requestIndex", "clientRequestId", "providerRequestId", "phase", "outcome", "startedAt",
+  "headersMs", "firstTokenMs", "totalMs", "httpStatus", "responseSha256",
+]);
+const videoAttemptCallPhases = new Set([
+  "awaiting_headers", "awaiting_first_token", "streaming", "parsing", "completed",
+]);
+const videoAttemptCallOutcomes = new Set([
+  "success", "timeout", "aborted", "http_error", "network_error", "invalid_response",
+]);
+
+function plainDiagnosticObject(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function assertDiagnosticKeys(value: Record<string, unknown>, allowed: Set<string>, label: string) {
+  for (const key of Object.keys(value)) {
+    if (!allowed.has(key)) throw new Error(`${label}包含不允许的字段 ${key}`);
+  }
+}
+
+function diagnosticNumber(value: unknown, label: string, options: { integer?: boolean; positive?: boolean } = {}) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > Number.MAX_SAFE_INTEGER) {
+    throw new Error(`${label}必须是安全的非负数`);
+  }
+  if (options.integer && !Number.isInteger(value)) throw new Error(`${label}必须是整数`);
+  if (options.positive && value === 0) throw new Error(`${label}必须大于0`);
+  return value;
+}
+
+function diagnosticIdentifier(value: unknown, label: string, maxLength = 160) {
+  if (typeof value !== "string"
+    || !value
+    || value.length > maxLength
+    || /(?:https?|ftp):\/\/|^data:|bearer\s|sk-[A-Za-z0-9_-]{8,}/i.test(value)
+    || !/^[A-Za-z0-9][A-Za-z0-9._:+/-]*$/.test(value)) {
+    throw new Error(`${label}必须是安全标识符`);
+  }
+  return value;
+}
+
+function optionalDiagnosticNumber(value: Record<string, unknown>, key: string, options: { integer?: boolean } = {}) {
+  if (key in value) diagnosticNumber(value[key], `诊断字段 ${key}`, options);
+}
+
+function validateVideoAttemptCallDiagnostic(value: unknown): asserts value is VideoAttemptCallDiagnostic {
+  if (!plainDiagnosticObject(value)) throw new Error("Qwen请求诊断必须是普通对象");
+  assertDiagnosticKeys(value, videoAttemptCallDiagnosticKeys, "Qwen请求诊断");
+  const requestIndex = diagnosticNumber(value.requestIndex, "requestIndex", { integer: true, positive: true });
+  if (requestIndex !== 1 && requestIndex !== 2) throw new Error("requestIndex只能是1或2");
+  diagnosticIdentifier(value.clientRequestId, "clientRequestId");
+  if ("providerRequestId" in value) diagnosticIdentifier(value.providerRequestId, "providerRequestId");
+  if ("responseSha256" in value
+    && (typeof value.responseSha256 !== "string" || !/^[a-f0-9]{64}$/.test(value.responseSha256))) {
+    throw new Error("responseSha256必须是64位小写十六进制");
+  }
+  if (typeof value.phase !== "string" || !videoAttemptCallPhases.has(value.phase)) throw new Error("Qwen请求诊断阶段无效");
+  if (typeof value.outcome !== "string" || !videoAttemptCallOutcomes.has(value.outcome)) throw new Error("Qwen请求诊断结果无效");
+  if (typeof value.startedAt !== "string"
+    || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(value.startedAt)
+    || !Number.isFinite(Date.parse(value.startedAt))) {
+    throw new Error("startedAt必须是UTC ISO时间");
+  }
+  for (const key of ["headersMs", "firstTokenMs"]) {
+    optionalDiagnosticNumber(value, key);
+  }
+  diagnosticNumber(value.totalMs, "totalMs");
+  optionalDiagnosticNumber(value, "httpStatus", { integer: true });
+  if ("httpStatus" in value && (Number(value.httpStatus) < 100 || Number(value.httpStatus) > 599)) {
+    throw new Error("httpStatus超出有效范围");
+  }
+}
+
+function serializeVideoAttemptDiagnostics(value: VideoAttemptDiagnostics) {
+  if (!plainDiagnosticObject(value)) throw new Error("执行诊断必须是普通对象");
+  let serialized = "";
+  try {
+    serialized = JSON.stringify(value);
+  } catch {
+    throw new Error("执行诊断必须是可序列化JSON");
+  }
+  if (Buffer.byteLength(serialized, "utf8") > VIDEO_ATTEMPT_DIAGNOSTICS_MAX_BYTES) {
+    throw new Error(`执行诊断不能超过${VIDEO_ATTEMPT_DIAGNOSTICS_MAX_BYTES}字节`);
+  }
+  assertDiagnosticKeys(value, videoAttemptDiagnosticKeys, "执行诊断");
+  if (value.schemaVersion !== 1) throw new Error("执行诊断版本无效");
+  if (value.provider !== "qwen") throw new Error("执行诊断provider必须是qwen");
+  diagnosticIdentifier(value.model, "model", 100);
+  if (value.inputMode !== "local_base64") throw new Error("inputMode无效");
+  diagnosticNumber(value.fileBytes, "fileBytes", { integer: true, positive: true });
+  if (typeof value.inputSha256 !== "string" || !/^[a-f0-9]{64}$/.test(value.inputSha256)) {
+    throw new Error("inputSha256必须是64位小写十六进制");
+  }
+  diagnosticNumber(value.encodedBytes, "encodedBytes", { integer: true, positive: true });
+  diagnosticNumber(value.durationMs, "durationMs", { positive: true });
+  if (value.hasAudio !== true) throw new Error("hasAudio必须为true");
+  diagnosticIdentifier(value.videoCodec, "videoCodec", 80);
+  diagnosticIdentifier(value.audioCodec, "audioCodec", 80);
+  if (!Array.isArray(value.calls) || value.calls.length > 2) throw new Error("每次执行最多记录2个Qwen请求");
+  const requestIndexes = new Set<number>();
+  for (const call of value.calls) {
+    validateVideoAttemptCallDiagnostic(call);
+    if (requestIndexes.has(call.requestIndex)) throw new Error("Qwen请求序号不能重复");
+    requestIndexes.add(call.requestIndex);
+  }
+  return serialized;
+}
+
+/** Replace the sanitized diagnostic snapshot for the exact active attempt.
+ * A stale or already-finished attempt can never mutate durable history. */
+export function updateVideoAttemptDiagnostics(
+  videoId: string,
+  attemptNumber: number,
+  diagnostics: VideoAttemptDiagnostics,
+) {
+  const normalizedVideoId = videoId.trim();
+  if (!normalizedVideoId) throw new Error("videoId不能为空");
+  if (!Number.isInteger(attemptNumber) || attemptNumber <= 0) throw new Error("attemptNumber必须是正整数");
+  const serialized = serializeVideoAttemptDiagnostics(diagnostics);
+  const result = getDb().prepare(`UPDATE video_attempts SET diagnostics_json=?
+    WHERE video_id=? AND attempt_number=? AND status='running' AND finished_at IS NULL`)
+    .run(serialized, normalizedVideoId, attemptNumber);
+  return result.changes > 0;
+}
+
 export function startVideoAttempt(videoId: string) {
   const db = getDb();
   const timestamp = now();
@@ -1565,7 +1711,9 @@ export function startVideoAttempt(videoId: string) {
       SET status='stopped', error_message='新一轮处理启动，上一轮已中断', finished_at=?
       WHERE video_id=? AND status='running' AND finished_at IS NULL`)
       .run(timestamp, videoId);
-    db.prepare("UPDATE videos SET attempt_count=?, processing_started_at=?, updated_at=? WHERE id=?")
+    db.prepare(`UPDATE videos
+      SET attempt_count=?, processing_started_at=?, product_doc_failure_delivered=0, updated_at=?
+      WHERE id=?`)
       .run(attemptNumber, timestamp, timestamp, videoId);
     db.prepare(`INSERT INTO video_attempts(
       id, video_id, attempt_number, status, error_message, started_at, finished_at

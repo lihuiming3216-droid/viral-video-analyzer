@@ -23,6 +23,14 @@ export interface ExtractedScene {
   clipPath: string | null;
 }
 
+export interface CompleteVideoMetadata {
+  duration: number;
+  width: number;
+  height: number;
+  videoCodec: string;
+  audioCodec: string;
+}
+
 function safeExtension(fileName: string, fallback = ".mp4") {
   const extension = path.extname(fileName).toLowerCase();
   return [".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi"].includes(extension) ? extension : fallback;
@@ -119,16 +127,34 @@ export async function downloadMedia(
 async function probeVideo(absolutePath: string, signal?: AbortSignal) {
   const { stdout } = await runFile(
     ffprobePath,
-    ["-v", "error", "-show_entries", "format=duration:stream=codec_type,width,height", "-of", "json", absolutePath],
+    ["-v", "error", "-show_entries", "format=duration:stream=codec_type,codec_name,width,height", "-of", "json", absolutePath],
     { maxBuffer: 4 * 1024 * 1024, signal },
   );
   const payload = JSON.parse(stdout) as { format?: { duration?: string }; streams?: Array<Record<string, unknown>> };
-  const stream = payload.streams?.find((item) => item.codec_type === "video");
+  const videoStream = payload.streams?.find((item) => item.codec_type === "video");
+  const audioStream = payload.streams?.find((item) => item.codec_type === "audio");
   return {
     duration: Math.max(0.1, Number(payload.format?.duration || 0)),
-    width: Number(stream?.width || 0),
-    height: Number(stream?.height || 0),
+    width: Number(videoStream?.width || 0),
+    height: Number(videoStream?.height || 0),
+    videoCodec: String(videoStream?.codec_name || ""),
+    audioCodec: String(audioStream?.codec_name || ""),
   };
+}
+
+/**
+ * Qwen Omni can only inspect an MP4's original sound when the container really
+ * includes both media tracks. Validate that contract before claiming that a
+ * request contains a complete video with its original audio.
+ */
+export async function validateCompleteVideoForQwen(
+  absolutePath: string,
+  signal?: AbortSignal,
+): Promise<CompleteVideoMetadata> {
+  const metadata = await probeVideo(absolutePath, signal);
+  if (!metadata.videoCodec) throw new Error("完整视频缺少视频轨，无法进行 Qwen 全模态分析");
+  if (!metadata.audioCodec) throw new Error("完整视频缺少音频轨，无法进行 Qwen 全模态分析");
+  return metadata;
 }
 
 async function detectCuts(absolutePath: string, signal?: AbortSignal) {
@@ -221,10 +247,70 @@ export async function extractVideoAssets(
 const QWEN_INLINE_VIDEO_LIMIT = 6 * 1024 * 1024;
 
 /**
- * OpenAI-compatible Qwen requests can only inline a small Base64 video. Keep
- * the entire local-upload timeline and audio, but transcode an analysis proxy when
- * the original is too large. TikTok links use TokScript's public media URL and
- * do not pay this local transcode cost.
+ * Validate a local source and, when necessary, create a bounded full-duration
+ * H.264/AAC proxy. Absolute paths keep the media operation independently
+ * testable while prepareLocalVideoForQwen retains the application path guard.
+ */
+export async function prepareCompleteVideoFileForQwen(
+  source: string,
+  target: string,
+  durationSeconds: number,
+  signal?: AbortSignal,
+) {
+  const sourceMetadata = await validateCompleteVideoForQwen(source, signal);
+  if (statSync(source).size <= QWEN_INLINE_VIDEO_LIMIT) return source;
+
+  mkdirSync(path.dirname(target), { recursive: true });
+  const targetBytes = 5 * 1024 * 1024;
+  const audioKbps = 32;
+  const completeDuration = Math.max(0.1, sourceMetadata.duration || durationSeconds);
+  const totalKbps = Math.floor((targetBytes * 8) / completeDuration / 1_000);
+  const bitrateKbps = Math.max(24, Math.min(1_200, totalKbps - audioKbps));
+  try {
+    await runFile(
+      ffmpegPath,
+      [
+        "-y", "-i", source,
+        "-map", "0:v:0",
+        "-map", "0:a:0",
+        "-vf", "scale='min(640,iw)':-2",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-b:v", `${bitrateKbps}k`,
+        "-maxrate", `${bitrateKbps}k`,
+        "-bufsize", `${bitrateKbps * 2}k`,
+        "-c:a", "aac",
+        "-b:a", `${audioKbps}k`,
+        "-ac", "1",
+        "-ar", "16000",
+        "-sn", "-dn",
+        "-movflags", "+faststart",
+        target,
+      ],
+      { maxBuffer: 16 * 1024 * 1024, signal },
+    );
+    if (statSync(target).size > QWEN_INLINE_VIDEO_LIMIT) {
+      throw new Error("本地视频压缩后仍超过 Qwen 完整视频直传限制");
+    }
+    const proxyMetadata = await validateCompleteVideoForQwen(target, signal);
+    if (proxyMetadata.videoCodec !== "h264" || proxyMetadata.audioCodec !== "aac") {
+      throw new Error("Qwen 视频代理未生成 H.264/AAC 完整媒体");
+    }
+    const durationTolerance = Math.max(0.5, Math.min(1.5, completeDuration * 0.01));
+    if (Math.abs(proxyMetadata.duration - completeDuration) > durationTolerance) {
+      throw new Error("Qwen 视频代理未保留完整视频时长");
+    }
+    return target;
+  } catch (error) {
+    rmSync(target, { force: true });
+    throw error;
+  }
+}
+
+/**
+ * OpenAI-compatible Qwen requests can only inline a small Base64 video. Check
+ * every local source for picture and sound, then preserve its full timeline in
+ * a bounded analysis proxy when the original is too large.
  */
 export async function prepareLocalVideoForQwen(
   videoId: string,
@@ -233,39 +319,10 @@ export async function prepareLocalVideoForQwen(
   signal?: AbortSignal,
 ) {
   const source = resolveMediaPath(relativeVideoPath);
-  if (statSync(source).size <= QWEN_INLINE_VIDEO_LIMIT) return relativeVideoPath;
-
   const relative = path.join(videoId, "qwen-full-video.mp4");
   const target = resolveMediaPath(relative);
-  mkdirSync(path.dirname(target), { recursive: true });
-  const targetBytes = 5 * 1024 * 1024;
-  const audioKbps = 32;
-  const totalKbps = Math.floor((targetBytes * 8) / Math.max(2, durationSeconds) / 1_000);
-  const bitrateKbps = Math.max(24, Math.min(1_200, totalKbps - audioKbps));
-  await runFile(
-    ffmpegPath,
-    [
-      "-y", "-i", source,
-      "-vf", "scale='min(640,iw)':-2",
-      "-c:v", "libx264",
-      "-preset", "veryfast",
-      "-b:v", `${bitrateKbps}k`,
-      "-maxrate", `${bitrateKbps}k`,
-      "-bufsize", `${bitrateKbps * 2}k`,
-      "-c:a", "aac",
-      "-b:a", `${audioKbps}k`,
-      "-ac", "1",
-      "-ar", "16000",
-      "-movflags", "+faststart",
-      target,
-    ],
-    { maxBuffer: 16 * 1024 * 1024, signal },
-  );
-  if (statSync(target).size > QWEN_INLINE_VIDEO_LIMIT) {
-    rmSync(target, { force: true });
-    throw new Error("本地视频压缩后仍超过 Qwen 完整视频直传限制");
-  }
-  return relative;
+  const prepared = await prepareCompleteVideoFileForQwen(source, target, durationSeconds, signal);
+  return prepared === source ? relativeVideoPath : relative;
 }
 
 export async function createSceneClip(videoId: string, relativeVideoPath: string, start: number, end: number, label: string, signal?: AbortSignal) {

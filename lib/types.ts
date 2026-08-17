@@ -13,6 +13,53 @@ export type VideoStatus =
 
 export type ManualLabel = "优质" | "普通" | "较差" | null;
 
+export type VideoAttemptCallPhase =
+  | "awaiting_headers"
+  | "awaiting_first_token"
+  | "streaming"
+  | "parsing"
+  | "completed";
+
+export type VideoAttemptCallOutcome =
+  | "success"
+  | "timeout"
+  | "aborted"
+  | "http_error"
+  | "network_error"
+  | "invalid_response";
+
+/** Sanitized provider telemetry for one request. Free-form provider content,
+ * prompts, credentials and media locations deliberately have no field here. */
+export interface VideoAttemptCallDiagnostic {
+  requestIndex: 1 | 2;
+  clientRequestId: string;
+  providerRequestId?: string;
+  phase: VideoAttemptCallPhase;
+  outcome: VideoAttemptCallOutcome;
+  startedAt: string;
+  headersMs?: number;
+  firstTokenMs?: number;
+  totalMs: number;
+  httpStatus?: number;
+  responseSha256?: string;
+}
+
+/** Durable, size-bounded diagnostics for one video execution attempt. */
+export interface VideoAttemptDiagnostics {
+  schemaVersion: 1;
+  provider: "qwen";
+  model: string;
+  inputMode: "local_base64";
+  fileBytes: number;
+  inputSha256: string;
+  encodedBytes: number;
+  durationMs: number;
+  hasAudio: true;
+  videoCodec: string;
+  audioCodec: string;
+  calls: VideoAttemptCallDiagnostic[];
+}
+
 /** How a product-card fact was established. AI inference is safe to display,
  * but is deliberately distinct from a directly evidenced fact. */
 export type ProductFactBasis = "verified_text" | "verified_image_ocr" | "ai_inference";
@@ -151,8 +198,10 @@ export interface VideoRecord {
   updatedAt: string;
   scenes?: SceneRecord[];
   analysisMode: "full" | "product_doc";
-  /** Automatic whole-task retries used only by product-document rows. */
+  /** Legacy retry counter retained for existing databases; automatic retries are disabled. */
   productDocRetryCount: number;
+  /** Whether the terminal product-document failure was delivered to Feishu. */
+  productDocFailureDelivered: boolean;
   /** Timestamp of the current execution attempt; queue waiting is excluded. */
   processingStartedAt: string | null;
   /** Number of times this task has actually started processing. */

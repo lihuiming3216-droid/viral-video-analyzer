@@ -55,7 +55,6 @@ workerState.__productDocSyncLastError ||= "";
 workerState.__productDocSyncLocks ||= new Map<string, Promise<unknown>>();
 const attachmentErrors = new Set<string>();
 const rowErrors = new Set<string>();
-const deliveredFailureCells = new Set<string>();
 
 function productDocumentTargets(product: Product) {
   const seen = new Set<string>();
@@ -195,9 +194,26 @@ async function updateBlankResultCell(
   documentId: string,
   blockId: string,
   next: string,
+  rowIdentity: { linkBlockId: string; sourceUrl: string },
 ) {
   const normalizedNext = next.trim();
   if (!blockId || !normalizedNext) return false;
+  const latest = await latestRowText(client, documentId, rowIdentity.linkBlockId, blockId);
+  if (!rowMatchesSource(latest.linkText, rowIdentity.sourceUrl) || latest.resultText.trim()) return false;
+  // Feishu rejects a patch whose expected revision is no longer current. That
+  // closes the last read/write race if the link or result changes after both
+  // blocks were read at the same fresh document revision.
+  return updateIfChanged(client, documentId, blockId, "", normalizedNext, {
+    documentRevisionId: latest.documentRevisionId,
+  });
+}
+
+async function latestRowText(
+  client: Client,
+  documentId: string,
+  linkBlockId: string,
+  resultBlockId?: string,
+) {
   const documentResponse = await client.request<{
     code?: number;
     msg?: string;
@@ -207,12 +223,22 @@ async function updateBlankResultCell(
     method: "GET",
   });
   const documentRevisionId = documentResponse.data?.document?.revision_id;
-  if (!Number.isInteger(documentRevisionId)) throw new Error("飞书没有返回文档版本号");
-  const latest = await fetchBlock(client, documentId, blockId, documentRevisionId);
-  if (textFrom(latest).trim()) return false;
-  // Feishu rejects a patch whose expected revision is no longer current. That
-  // closes the last read/write race if a user types after the fresh block GET.
-  return updateIfChanged(client, documentId, blockId, "", normalizedNext, { documentRevisionId });
+  if (typeof documentRevisionId !== "number" || !Number.isInteger(documentRevisionId)) {
+    throw new Error("飞书没有返回文档版本号");
+  }
+  const [linkBlock, resultBlock] = await Promise.all([
+    fetchBlock(client, documentId, linkBlockId, documentRevisionId),
+    resultBlockId ? fetchBlock(client, documentId, resultBlockId, documentRevisionId) : Promise.resolve(undefined),
+  ]);
+  return {
+    documentRevisionId,
+    linkText: textFrom(linkBlock),
+    resultText: textFrom(resultBlock),
+  };
+}
+
+function rowMatchesSource(linkText: string, sourceUrl: string | null | undefined) {
+  return Boolean(sourceUrl) && normalizeTikTokUrl(linkText) === sourceUrl;
 }
 
 async function withProductDocumentLock<T>(documentId: string, task: () => Promise<T>) {
@@ -311,6 +337,24 @@ async function syncProductDocumentUnlocked(
       result.found += 1;
 
       const attachmentErrorKey = `${product.documentId}:${video.id}`;
+      const previewVideoId = video.id;
+      const previewSourceUrl = video.sourceUrl;
+      const previewAttemptNumber = video.attemptCount;
+      const previewOriginalPath = video.originalPath;
+      const validatePreviewBinding = async () => {
+        const latestRow = await latestRowText(client, product.documentId!, linkBlockId);
+        const currentBinding = getProductDocumentVideoRow(product.documentId!, linkBlockId);
+        const currentVideo = getVideo(previewVideoId, false);
+        return {
+          documentRevisionId: latestRow.documentRevisionId,
+          valid: rowMatchesSource(latestRow.linkText, previewSourceUrl)
+            && currentBinding?.videoId === previewVideoId
+            && currentBinding.sourceUrl === previewSourceUrl
+            && currentVideo?.sourceUrl === previewSourceUrl
+            && currentVideo.attemptCount === previewAttemptNumber
+            && currentVideo.originalPath === previewOriginalPath,
+        };
+      };
       try {
         if (video.sourceType === "tiktok" && video.originalPath) {
           await ensureFeishuVideoPreview({
@@ -320,6 +364,7 @@ async function syncProductDocumentUnlocked(
             absolutePath: resolveMediaPath(video.originalPath),
             fileName: tokScriptVideoFileName(video),
             blocks,
+            validateBinding: validatePreviewBinding,
           });
         }
         attachmentErrors.delete(attachmentErrorKey);
@@ -333,39 +378,77 @@ async function syncProductDocumentUnlocked(
         }
       }
 
-      const failureCellKey = `${product.documentId}:${row[2].textId}:${video.id}`;
+      // Preview upload can take long enough for a user to edit the row or for
+      // another explicit action to start/finish this video. Never make a retry
+      // decision from the pre-upload task snapshot.
+      const refreshedVideo = getVideo(video.id, false);
+      if (!refreshedVideo) continue;
+      video = refreshedVideo;
+
       if (video.status === "stopped") {
         if (!row[2].text.trim()) {
-          await updateBlankResultCell(client, product.documentId, row[2].textId, "已停止，请重新粘贴视频链接");
+          await updateBlankResultCell(
+            client,
+            product.documentId,
+            row[2].textId,
+            "已停止，请重新粘贴视频链接",
+            { linkBlockId, sourceUrl: video.sourceUrl || "" },
+          );
         }
         result.failed += 1;
         continue;
       }
       if (video.status === "failed" && video.analysisMode === "product_doc") {
-        const retryCount = Number(video.productDocRetryCount || 0);
-        if (retryCount < 2) {
-          updateVideo(video.id, { product_doc_retry_count: retryCount + 1 });
-          enqueueVideos([video.id]);
-          result.queued += 1;
-          continue;
-        }
+        // Qwen's retry budget belongs to this one video task. A terminal task
+        // is requeued only when the user clears the delivered failure cell.
         if (/^失败：/.test(row[2].text)) {
-          deliveredFailureCells.add(failureCellKey);
-        } else if (!row[2].text.trim() && deliveredFailureCells.has(failureCellKey)) {
-          updateVideo(video.id, { product_doc_retry_count: 0, error_message: null });
-          deliveredFailureCells.delete(failureCellKey);
-          enqueueVideos([video.id]);
-          result.queued += 1;
-          continue;
+          const expectedAttemptNumber = video.attemptCount;
+          const latestFailure = await latestRowText(client, product.documentId, linkBlockId, row[2].textId);
+          const currentBinding = getProductDocumentVideoRow(product.documentId, linkBlockId);
+          const currentVideo = getVideo(video.id, false);
+          if (!video.productDocFailureDelivered
+            && rowMatchesSource(latestFailure.linkText, video.sourceUrl)
+            && /^失败：/.test(latestFailure.resultText)
+            && currentBinding?.videoId === video.id
+            && currentBinding.sourceUrl === video.sourceUrl
+            && currentVideo?.status === "failed"
+            && currentVideo.analysisMode === "product_doc"
+            && currentVideo.attemptCount === expectedAttemptNumber) {
+            updateVideo(video.id, { product_doc_failure_delivered: 1 });
+          }
+        } else if (!row[2].text.trim() && video.productDocFailureDelivered) {
+          const expectedAttemptNumber = video.attemptCount;
+          const latestCell = await latestRowText(client, product.documentId, linkBlockId, row[2].textId);
+          const currentVideo = getVideo(video.id, false);
+          const currentBinding = getProductDocumentVideoRow(product.documentId, linkBlockId);
+          if (rowMatchesSource(latestCell.linkText, video.sourceUrl)
+            && !latestCell.resultText.trim()
+            && currentBinding?.videoId === video.id
+            && currentBinding.sourceUrl === video.sourceUrl
+            && currentVideo?.status === "failed"
+            && currentVideo.sourceUrl === video.sourceUrl
+            && currentVideo.analysisMode === "product_doc"
+            && currentVideo.productDocFailureDelivered
+            && currentVideo.attemptCount === expectedAttemptNumber) {
+            updateVideo(video.id, { product_doc_failure_delivered: 0, error_message: null });
+            enqueueVideos([video.id]);
+            result.queued += 1;
+            continue;
+          }
         } else if (!row[2].text.trim()) {
           const reason = String(video.errorMessage || "分析失败").replace(/\s+/g, " ").slice(0, 70);
-          await updateBlankResultCell(client, product.documentId, row[2].textId, `失败：${reason}`);
-          deliveredFailureCells.add(failureCellKey);
+          const delivered = await updateBlankResultCell(
+            client,
+            product.documentId,
+            row[2].textId,
+            `失败：${reason}`,
+            { linkBlockId, sourceUrl: video.sourceUrl || "" },
+          );
+          if (delivered) updateVideo(video.id, { product_doc_failure_delivered: 1 });
         }
       }
 
       if (video.status === "completed") {
-        deliveredFailureCells.delete(failureCellKey);
         // Analysis and translation cells are user-owned once they contain text.
         if (!row[2].text.trim()) {
           await updateBlankResultCell(
@@ -373,11 +456,18 @@ async function syncProductDocumentUnlocked(
             product.documentId,
             row[2].textId,
             conciseProductDocAnalysis(video),
+            { linkBlockId, sourceUrl: video.sourceUrl || "" },
           );
         }
         const transcriptZh = String(video.transcriptZh || "").trim();
         if (!row[3].text.trim() && transcriptZh) {
-          await updateBlankResultCell(client, product.documentId, row[3].textId, transcriptZh);
+          await updateBlankResultCell(
+            client,
+            product.documentId,
+            row[3].textId,
+            transcriptZh,
+            { linkBlockId, sourceUrl: video.sourceUrl || "" },
+          );
         }
         result.completed += 1;
       } else if (video.status === "failed") {

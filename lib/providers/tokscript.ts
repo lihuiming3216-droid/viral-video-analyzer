@@ -14,6 +14,19 @@ type McpEnvelope = {
   error?: { message?: string };
 };
 
+type TokScriptToolStage = "download" | "transcript" | "cover";
+type TokScriptSetupStage = "resolve_url" | "connect" | "list_tools";
+type TokScriptToolErrorCategory =
+  | "timeout"
+  | "rate_limit"
+  | "permission"
+  | "invalid_input"
+  | "not_found"
+  | "network_error"
+  | "provider_unavailable"
+  | "extraction_failed"
+  | "tool_error";
+
 export interface TokScriptResult {
   transcript: string;
   language: string;
@@ -78,22 +91,34 @@ class TokScriptClient {
     if (session) this.sessionId = session;
     if (!response.ok) throw new Error(`TokScript 连接失败（${response.status}），请检查密钥或接口地址`);
     const envelope = await this.parseResponse(response);
-    if (envelope.error) throw new Error(envelope.error.message || "TokScript 调用失败");
+    if (envelope.error) {
+      throw new TokScriptProviderResponseError(tokScriptToolErrorCategory(envelope.error.message));
+    }
     return envelope.result || {};
   }
 
   async connect() {
-    await this.post("initialize", {
-      protocolVersion: "2025-03-26",
-      capabilities: {},
-      clientInfo: { name: "viral-video-analyzer", version: "1.0.0" },
-    });
-    await this.post("notifications/initialized", {}, true);
+    try {
+      await this.post("initialize", {
+        protocolVersion: "2025-03-26",
+        capabilities: {},
+        clientInfo: { name: "viral-video-analyzer", version: "1.0.0" },
+      });
+      await this.post("notifications/initialized", {}, true);
+    } catch (error) {
+      if (this.signal?.aborted) throw error;
+      throw tokScriptSetupError("connect", error);
+    }
   }
 
   async listTools() {
-    const result = await this.post("tools/list");
-    return (Array.isArray(result.tools) ? result.tools : []) as McpTool[];
+    try {
+      const result = await this.post("tools/list");
+      return (Array.isArray(result.tools) ? result.tools : []) as McpTool[];
+    } catch (error) {
+      if (this.signal?.aborted) throw error;
+      throw tokScriptSetupError("list_tools", error);
+    }
   }
 
   async callTool(tool: McpTool, url: string) {
@@ -106,8 +131,147 @@ class TokScriptClient {
   }
 }
 
+function tokScriptToolErrorText(result: Record<string, unknown>) {
+  const candidates: string[] = [];
+  const seen = new Set<unknown>();
+  const collect = (value: unknown, depth = 0) => {
+    if (depth > 4 || value == null || seen.has(value)) return;
+    if (typeof value === "string") {
+      const text = value.trim();
+      if (!text) return;
+      try {
+        collect(JSON.parse(text), depth + 1);
+      } catch {
+        candidates.push(text);
+      }
+      return;
+    }
+    if (typeof value !== "object") return;
+    seen.add(value);
+    if (Array.isArray(value)) {
+      value.forEach((item) => collect(item, depth + 1));
+      return;
+    }
+    const record = value as Record<string, unknown>;
+    for (const key of ["message", "error", "detail", "reason", "text"]) {
+      if (key in record) collect(record[key], depth + 1);
+    }
+  };
+  collect(result.structuredContent);
+  collect(result.content);
+  collect(result.error);
+  collect(result.message);
+  return candidates[0] || "TokScript 未提供错误详情";
+}
+
+function tokScriptToolErrorCategory(value: unknown): TokScriptToolErrorCategory {
+  const message = String(value || "").normalize("NFKC").toLowerCase();
+  if (/(?:timeout|timed out|超时)/i.test(message)) return "timeout";
+  if (/(?:rate limit|too many requests|\b429\b|限流|请求过多)/i.test(message)) return "rate_limit";
+  if (/(?:unauthori[sz]ed|forbidden|permission|\b401\b|\b403\b|权限|鉴权)/i.test(message)) return "permission";
+  if (/(?:invalid (?:url|link|input|argument)|bad request|\b400\b|无效(?:链接|参数)|参数错误)/i.test(message)) return "invalid_input";
+  if (/(?:not found|\b404\b|不存在|未找到)/i.test(message)) return "not_found";
+  if (/(?:fetch failed|econnreset|etimedout|socket|und_err|network error|网络错误)/i.test(message)) return "network_error";
+  if (/(?:unavailable|temporar(?:y|ily)|\b50[234]\b|服务不可用|稍后重试)/i.test(message)) return "provider_unavailable";
+  if (/(?:extract|transcript|sigi_state|universal_data|转写|提取)/i.test(message)) return "extraction_failed";
+  return "tool_error";
+}
+
+const tokScriptToolErrorMessages: Record<TokScriptToolErrorCategory, string> = {
+  timeout: "工具调用超时",
+  rate_limit: "服务请求受限",
+  permission: "服务权限不足",
+  invalid_input: "服务拒绝输入",
+  not_found: "未找到视频数据",
+  network_error: "服务网络异常",
+  provider_unavailable: "服务暂不可用",
+  extraction_failed: "内容提取失败",
+  tool_error: "工具调用失败",
+};
+
+class TokScriptProviderResponseError extends Error {
+  constructor(readonly category: TokScriptToolErrorCategory) {
+    super(tokScriptToolErrorMessages[category]);
+    this.name = "TokScriptProviderResponseError";
+  }
+}
+
+class TokScriptSetupError extends Error {
+  constructor(
+    readonly stage: TokScriptSetupStage,
+    readonly category: TokScriptToolErrorCategory,
+  ) {
+    super(`TokScript 前置调用失败（stage=${stage}; category=${category}）：${tokScriptToolErrorMessages[category]}`);
+    this.name = category === "timeout" || category === "network_error"
+      ? "TokScriptRetryableError"
+      : "TokScriptSetupError";
+  }
+}
+
+function tokScriptSetupError(stage: TokScriptSetupStage, error: unknown) {
+  const category = error instanceof TokScriptProviderResponseError
+    ? error.category
+    : tokScriptToolErrorCategory(error instanceof Error ? error.message : String(error || ""));
+  return new TokScriptSetupError(stage, category);
+}
+
+class TokScriptToolCallError extends Error {
+  constructor(
+    readonly stage: TokScriptToolStage,
+    readonly category: TokScriptToolErrorCategory,
+    readonly attempts: number,
+  ) {
+    super(`TokScript 工具返回错误（stage=${stage}; category=${category}; attempts=${attempts}）：${tokScriptToolErrorMessages[category]}`);
+    this.name = "TokScriptToolCallError";
+  }
+}
+
+function tokScriptToolCallError(stage: TokScriptToolStage, error: unknown, attempts: number) {
+  if (error instanceof TokScriptToolCallError) {
+    return new TokScriptToolCallError(stage, error.category, attempts);
+  }
+  if (error instanceof TokScriptProviderResponseError) {
+    return new TokScriptToolCallError(stage, error.category, attempts);
+  }
+  const providerMessage = error instanceof Error ? error.message : String(error || "");
+  return new TokScriptToolCallError(stage, tokScriptToolErrorCategory(providerMessage), attempts);
+}
+
+async function callTokScriptToolWithOneRetry<T>(input: {
+  client: TokScriptClient;
+  tool: McpTool;
+  url: string;
+  stage: TokScriptToolStage;
+  parse: (result: Record<string, unknown>) => T;
+  requestSignal: AbortSignal;
+  userSignal?: AbortSignal;
+}) {
+  let attempt = 1;
+  while (true) {
+    try {
+      const result = await input.client.callTool(input.tool, input.url);
+      if (result.isError === true) {
+        const providerMessage = tokScriptToolErrorText(result);
+        throw new TokScriptToolCallError(
+          input.stage,
+          tokScriptToolErrorCategory(providerMessage),
+          attempt,
+        );
+      }
+      return input.parse(result);
+    } catch (error) {
+      if (input.userSignal?.aborted) throw error;
+      if (input.requestSignal.aborted) {
+        throw new TokScriptToolCallError(input.stage, "timeout", attempt);
+      }
+      const failure = tokScriptToolCallError(input.stage, error, attempt);
+      if (attempt === 2) throw failure;
+      attempt += 1;
+    }
+  }
+}
+
 function parseToolPayload(result: Record<string, unknown>) {
-  if (result.isError === true) throw new Error("TokScript 工具返回错误");
   if (result.structuredContent) return result.structuredContent;
   const content = Array.isArray(result.content) ? result.content : [];
   for (const item of content) {
@@ -137,7 +301,6 @@ type TranscriptToolPayload = {
  * block is marked separately for the narrowly-scoped labelled parser below.
  */
 function parseTranscriptToolPayload(result: Record<string, unknown>): TranscriptToolPayload {
-  if (result.isError === true) throw new Error("TokScript 工具返回错误");
   if (Object.prototype.hasOwnProperty.call(result, "structuredContent")) {
     return { payload: result.structuredContent, plainText: "" };
   }
@@ -430,7 +593,16 @@ export async function fetchTikTok(
   const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
   const client = new TokScriptClient(config.baseUrl, config.apiKey, requestSignal);
   try {
-    const resolvedUrl = await resolveTokScriptVideoUrl(url, requestSignal);
+    let resolvedUrl = "";
+    try {
+      resolvedUrl = await resolveTokScriptVideoUrl(url, requestSignal);
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      if (error instanceof Error && error.message === "TokScript 短链接未解析到官方 TikTok 视频地址") {
+        throw error;
+      }
+      throw tokScriptSetupError("resolve_url", error);
+    }
     await client.connect();
     const tools = await client.listTools();
     const pick = (names: string[]) => tools.find((tool) => names.includes(tool.name));
@@ -442,11 +614,35 @@ export async function fetchTikTok(
     }
     // Obtain both outputs from TokScript. TikTok-link jobs never re-transcribe
     // the downloaded media with another provider.
-    const downloadRaw = parseToolPayload(await client.callTool(downloadTool, resolvedUrl));
-    const parsedTranscript = parseTranscriptToolPayload(await client.callTool(transcriptTool, resolvedUrl));
+    const downloadRaw = await callTokScriptToolWithOneRetry({
+      client,
+      tool: downloadTool,
+      url: resolvedUrl,
+      stage: "download",
+      parse: parseToolPayload,
+      requestSignal,
+      userSignal: signal,
+    });
+    const parsedTranscript = await callTokScriptToolWithOneRetry({
+      client,
+      tool: transcriptTool,
+      url: resolvedUrl,
+      stage: "transcript",
+      parse: parseTranscriptToolPayload,
+      requestSignal,
+      userSignal: signal,
+    });
     const transcriptRaw = parsedTranscript.payload;
     const coverRaw = options.includeCover !== false && coverTool && !timeoutSignal.aborted
-      ? parseToolPayload(await client.callTool(coverTool, resolvedUrl))
+      ? await callTokScriptToolWithOneRetry({
+        client,
+        tool: coverTool,
+        url: resolvedUrl,
+        stage: "cover",
+        parse: parseToolPayload,
+        requestSignal,
+        userSignal: signal,
+      })
       : null;
     const segments = normalizeSegments(transcriptRaw);
     const transcript = explicitTranscript(transcriptRaw)
@@ -482,6 +678,7 @@ export async function fetchTikTok(
     };
   } catch (error) {
     if (signal?.aborted) throw error;
+    if (error instanceof TokScriptToolCallError) throw error;
     if (timeoutSignal.aborted || timeoutLike(error)) {
       throw new Error("TokScript 获取视频超时");
     }

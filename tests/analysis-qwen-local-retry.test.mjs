@@ -172,3 +172,84 @@ test("one attempt uses one local complete MP4, persists two Qwen calls, and neve
   assert.equal(initial.originalPath, originalPath);
   assert.equal(patches.at(-1).status, "completed");
 });
+
+test("a finalized TokScript tool error is not retried as a whole fetch", async () => {
+  const videoId = "tokscript-tool-error-boundary";
+  const attemptNumber = 3;
+  const patches = [];
+  let fetchCalls = 0;
+  const initial = {
+    id: videoId,
+    productId: "product-1",
+    sourceType: "tiktok",
+    sourceUrl: "https://www.tiktok.com/@example/video/123",
+    analysisMode: "product_doc",
+    originalPath: null,
+    remoteVideoUrl: null,
+    transcriptOriginal: "",
+    attemptCount: attemptNumber,
+    title: "test video",
+    coverPath: null,
+  };
+  const analysis = await loadAnalysis({
+    getVideo: () => initial,
+    getProduct: () => ({
+      id: "product-1",
+      name: "测试产品",
+      pid: "pid-1",
+      coreFunctions: [],
+      usageMethod: "",
+      targetAudience: "",
+      usageScenes: "",
+    }),
+    updateVideo: (_id, patch) => patches.push(patch),
+    fetchTikTok: async () => {
+      fetchCalls += 1;
+      const error = new Error("TokScript 工具返回错误（stage=download; category=timeout; attempts=2）：工具调用超时");
+      error.name = "TokScriptToolCallError";
+      throw error;
+    },
+  });
+
+  await assert.rejects(
+    analysis.analyzeVideo(videoId, undefined, attemptNumber),
+    /stage=download/,
+  );
+  assert.equal(fetchCalls, 1, "the provider already exhausted the one per-tool retry");
+  assert.equal(patches.at(-1).status, "failed");
+  assert.equal(
+    patches.at(-1).error_message,
+    "TokScript 工具返回错误（stage=download; category=timeout; attempts=2）：工具调用超时",
+  );
+
+  const retryPatches = [];
+  fetchCalls = 0;
+  const retryAnalysis = await loadAnalysis({
+    getVideo: () => initial,
+    getProduct: () => ({
+      id: "product-1",
+      name: "测试产品",
+      pid: "pid-1",
+      coreFunctions: [],
+      usageMethod: "",
+      targetAudience: "",
+      usageScenes: "",
+    }),
+    updateVideo: (_id, patch) => retryPatches.push(patch),
+    fetchTikTok: async () => {
+      fetchCalls += 1;
+      const error = new Error("TokScript 前置调用失败（stage=connect; category=network_error）：服务网络异常");
+      error.name = "TokScriptRetryableError";
+      throw error;
+    },
+  });
+  await assert.rejects(
+    retryAnalysis.analyzeVideo(videoId, undefined, attemptNumber),
+    /category=network_error/,
+  );
+  assert.equal(fetchCalls, 2, "a safe setup network error keeps the existing one whole-fetch retry");
+  assert.equal(
+    retryPatches.at(-1).error_message,
+    "TokScript 前置调用失败（stage=connect; category=network_error）：服务网络异常",
+  );
+});

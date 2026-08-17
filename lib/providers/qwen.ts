@@ -7,6 +7,7 @@ import { parseJsonLoose } from "@/lib/json-utils";
 import { requireProvider } from "@/lib/provider-config";
 
 const MAX_INLINE_VIDEO_BYTES = 6 * 1024 * 1024;
+const QWEN_REQUEST_TIMEOUT_MS = 10 * 60 * 1_000;
 
 function qwenVideoFps() {
   const configured = Number(process.env.QWEN_VIDEO_FPS || 2);
@@ -185,8 +186,8 @@ export async function analyzeVideoWithQwen(input: {
         max_tokens: input.maxTokens || 4_500,
       }),
       signal: input.signal
-        ? AbortSignal.any([input.signal, AbortSignal.timeout(120_000)])
-        : AbortSignal.timeout(120_000),
+        ? AbortSignal.any([input.signal, AbortSignal.timeout(QWEN_REQUEST_TIMEOUT_MS)])
+        : AbortSignal.timeout(QWEN_REQUEST_TIMEOUT_MS),
     });
     headersMs = Math.round(performance.now() - startedAt);
     requestId = safeResponseRequestId(response);

@@ -177,6 +177,8 @@ test("explicit no-speech results become the stable no-voiceover marker", async (
 });
 
 test("an MCP isError result is rejected before its text can become a transcript", async () => {
+  let downloadCalls = 0;
+  let transcriptCalls = 0;
   globalThis.__tokscriptSourceHooks = {
     fetchWithProxy: async (_url, init) => {
       const request = JSON.parse(String(init.body || "{}"));
@@ -189,6 +191,8 @@ test("an MCP isError result is rejected before its text can become a transcript"
           ],
         };
       } else if (request.method === "tools/call") {
+        if (request.params.name === "download_video") downloadCalls += 1;
+        if (request.params.name === "get_tiktok_transcript") transcriptCalls += 1;
         result = request.params.name === "download_video"
           ? { content: [{ type: "text", text: JSON.stringify({ download_url: "https://cdn.example/video.mp4" }) }] }
           : { isError: true, content: [{ type: "text", text: "temporary provider issue" }] };
@@ -202,8 +206,181 @@ test("an MCP isError result is rejected before its text can become a transcript"
   try {
     await assert.rejects(
       tokscript.fetchTikTok("https://www.tiktok.com/@creator/video/7600715017335491895", undefined, { includeCover: false }),
-      /TokScript 工具返回错误/,
+      (error) => {
+        assert.equal(error.name, "TokScriptToolCallError");
+        assert.match(error.message, /TokScript 工具返回错误/);
+        assert.match(error.message, /stage=transcript/);
+        assert.match(error.message, /category=provider_unavailable/);
+        assert.match(error.message, /attempts=2/);
+        assert.equal(
+          error.message,
+          "TokScript 工具返回错误（stage=transcript; category=provider_unavailable; attempts=2）：服务暂不可用",
+        );
+        assert.doesNotMatch(error.message, /temporary provider issue/);
+        return true;
+      },
     );
+    assert.equal(downloadCalls, 1);
+    assert.equal(transcriptCalls, 2, "the failing transcript tool is retried exactly once");
+  } finally {
+    delete globalThis.__tokscriptSourceHooks;
+  }
+});
+
+test("a transient download tool is retried once without repeating the transcript tool", async () => {
+  let downloadCalls = 0;
+  let transcriptCalls = 0;
+  globalThis.__tokscriptSourceHooks = {
+    fetchWithProxy: async (_url, init) => {
+      const request = JSON.parse(String(init.body || "{}"));
+      let result = {};
+      if (request.method === "tools/list") {
+        result = {
+          tools: [
+            { name: "download_video", inputSchema: { properties: { url: {} } } },
+            { name: "get_tiktok_transcript", inputSchema: { properties: { url: {} } } },
+          ],
+        };
+      } else if (request.method === "tools/call" && request.params.name === "download_video") {
+        downloadCalls += 1;
+        result = downloadCalls === 1
+          ? { isError: true, content: [{ type: "text", text: "service temporarily unavailable" }] }
+          : { structuredContent: { download_url: "https://cdn.example/video.mp4" } };
+      } else if (request.method === "tools/call") {
+        transcriptCalls += 1;
+        result = { structuredContent: { transcript: "This portable monitor fits in my backpack." } };
+      }
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: request.id, result }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  };
+  try {
+    const result = await tokscript.fetchTikTok(
+      "https://www.tiktok.com/@creator/video/7600715017335491895",
+      undefined,
+      { includeCover: false },
+    );
+    assert.equal(result.transcript, "This portable monitor fits in my backpack.");
+    assert.equal(downloadCalls, 2);
+    assert.equal(transcriptCalls, 1);
+  } finally {
+    delete globalThis.__tokscriptSourceHooks;
+  }
+});
+
+test("a persistent tool error stores only fixed stage, category and system text", async () => {
+  let downloadCalls = 0;
+  let transcriptCalls = 0;
+  globalThis.__tokscriptSourceHooks = {
+    fetchWithProxy: async (_url, init) => {
+      const request = JSON.parse(String(init.body || "{}"));
+      let result = {};
+      if (request.method === "tools/list") {
+        result = {
+          tools: [
+            { name: "download_video", inputSchema: { properties: { url: {} } } },
+            { name: "get_tiktok_transcript", inputSchema: { properties: { url: {} } } },
+          ],
+        };
+      } else if (request.method === "tools/call" && request.params.name === "download_video") {
+        downloadCalls += 1;
+        result = {
+          isError: true,
+          content: [{
+            type: "text",
+            text: "Rate limit exceeded at https://signed.example/video?token=url-secret Authorization: Bearer bearer-secret api_key=api-key-value password=password-value passwd=passwd-value client_secret=client-secret-value app_secret=app-secret-value refresh_token=refresh-token-value id_token=id-token-value session=session-value cookie=cookie-value set-cookie=set-cookie-value sk-providersecret123456789",
+          }],
+        };
+      } else if (request.method === "tools/call") {
+        transcriptCalls += 1;
+      }
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: request.id, result }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  };
+  try {
+    await assert.rejects(
+      tokscript.fetchTikTok(
+        "https://www.tiktok.com/@creator/video/7600715017335491895",
+        undefined,
+        { includeCover: false },
+      ),
+      (error) => {
+        assert.equal(error.name, "TokScriptToolCallError");
+        assert.match(error.message, /stage=download/);
+        assert.match(error.message, /category=rate_limit/);
+        assert.match(error.message, /attempts=2/);
+        assert.equal(
+          error.message,
+          "TokScript 工具返回错误（stage=download; category=rate_limit; attempts=2）：服务请求受限",
+        );
+        assert.equal("cause" in error, false);
+        const durableErrorSurface = `${error.name}\n${error.message}\n${JSON.stringify(error)}`;
+        for (const injected of [
+          "signed.example", "url-secret", "bearer-secret", "api-key-value", "password-value", "passwd-value",
+          "client-secret-value", "app-secret-value", "refresh-token-value", "id-token-value", "session-value",
+          "cookie-value", "set-cookie-value", "sk-providersecret123456789",
+        ]) {
+          assert.doesNotMatch(durableErrorSurface, new RegExp(injected));
+        }
+        return true;
+      },
+    );
+    assert.equal(downloadCalls, 2);
+    assert.equal(transcriptCalls, 0);
+  } finally {
+    delete globalThis.__tokscriptSourceHooks;
+  }
+});
+
+test("a tool network exception is contained to two calls and reduced to fixed text", async () => {
+  let downloadCalls = 0;
+  globalThis.__tokscriptSourceHooks = {
+    fetchWithProxy: async (_url, init) => {
+      const request = JSON.parse(String(init.body || "{}"));
+      if (request.method === "tools/call") {
+        downloadCalls += 1;
+        throw new TypeError("fetch failed at https://signed.example/video?token=network-secret");
+      }
+      const result = request.method === "tools/list"
+        ? {
+          tools: [
+            { name: "download_video", inputSchema: { properties: { url: {} } } },
+            { name: "get_tiktok_transcript", inputSchema: { properties: { url: {} } } },
+          ],
+        }
+        : {};
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: request.id, result }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  };
+  try {
+    await assert.rejects(
+      tokscript.fetchTikTok(
+        "https://www.tiktok.com/@creator/video/7600715017335491895",
+        undefined,
+        { includeCover: false },
+      ),
+      (error) => {
+        assert.equal(error.name, "TokScriptToolCallError");
+        assert.match(error.message, /stage=download/);
+        assert.match(error.message, /category=network_error/);
+        assert.match(error.message, /attempts=2/);
+        assert.equal(
+          error.message,
+          "TokScript 工具返回错误（stage=download; category=network_error; attempts=2）：服务网络异常",
+        );
+        assert.doesNotMatch(error.message, /fetch failed|https?:|signed\.example|network-secret/);
+        return true;
+      },
+    );
+    assert.equal(downloadCalls, 2);
   } finally {
     delete globalThis.__tokscriptSourceHooks;
   }

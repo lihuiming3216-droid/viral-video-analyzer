@@ -122,6 +122,63 @@ test("a throwing diagnostic callback cannot alter a successful analysis", async 
   assert.equal(callbackCalls, 1);
 });
 
+test("every Qwen request receives an exact ten-minute timeout", async () => {
+  const originalTimeout = AbortSignal.timeout;
+  const observedTimeouts = [];
+  const fetchSignals = [];
+  AbortSignal.timeout = (milliseconds) => {
+    observedTimeouts.push(milliseconds);
+    return new AbortController().signal;
+  };
+  try {
+    const parentController = new AbortController();
+    for (const signal of [undefined, parentController.signal]) {
+      await withMockedFetch(async (_url, init) => {
+        fetchSignals.push(init.signal);
+        return successfulStream();
+      }, () => qwen.analyzeVideoWithQwen({
+        prompt: "分析",
+        localVideoPath: videoPath,
+        signal,
+      }));
+    }
+  } finally {
+    AbortSignal.timeout = originalTimeout;
+  }
+
+  assert.deepEqual(observedTimeouts, [600_000, 600_000]);
+  assert.equal(fetchSignals.length, 2);
+  assert.ok(fetchSignals.every((signal) => signal instanceof AbortSignal));
+});
+
+test("the parent task signal can stop Qwen before the ten-minute ceiling", async () => {
+  const controller = new AbortController();
+  let fetchSignal;
+  let diagnostic;
+
+  await withMockedFetch((_url, init) => new Promise((_resolve, reject) => {
+    fetchSignal = init.signal;
+    const rejectFromAbort = () => reject(init.signal.reason || new Error("parent task stopped"));
+    if (init.signal.aborted) rejectFromAbort();
+    else init.signal.addEventListener("abort", rejectFromAbort, { once: true });
+  }), async () => {
+    const analysis = qwen.analyzeVideoWithQwen({
+      prompt: "分析",
+      localVideoPath: videoPath,
+      signal: controller.signal,
+      onDiagnostic(value) {
+        diagnostic = value;
+      },
+    });
+    controller.abort(new Error("parent task stopped"));
+    await assert.rejects(analysis, /parent task stopped/);
+  });
+
+  assert.equal(fetchSignal.aborted, true);
+  assert.equal(diagnostic.outcome, "aborted");
+  assert.ok(diagnostic.totalMs < 600_000);
+});
+
 test("timeout failures emit a timeout diagnostic", async () => {
   let diagnostic;
   await withMockedFetch(async () => {

@@ -163,6 +163,8 @@ function isConfigured(provider: "qwen") {
 }
 
 function transientNetworkFailure(error: unknown) {
+  if (error instanceof Error && error.name === "TokScriptToolCallError") return false;
+  if (error instanceof Error && error.name === "TokScriptRetryableError") return true;
   const message = error instanceof Error ? error.message : String(error || "");
   return /(?:timeout|timed out|aborted due to timeout|fetch failed|econnreset|etimedout|socket|und_err)/i.test(message);
 }
@@ -185,6 +187,7 @@ async function withOneNetworkRetry<T>(
 
 function userFacingAnalysisError(error: unknown) {
   const message = error instanceof Error ? error.message : "未知错误";
+  if (error instanceof Error && error.name === "TokScriptRetryableError") return message;
   if (transientNetworkFailure(error)) {
     if (/Qwen/i.test(message)) return "Qwen 完整视频分析超时，系统已自动重试一次";
     if (/TokScript/i.test(message)) return "TokScript 获取视频超时，系统已自动重试一次";

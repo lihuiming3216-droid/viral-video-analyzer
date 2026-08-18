@@ -95,6 +95,8 @@ test("one attempt uses one local complete MP4, persists two Qwen calls, and neve
       targetAudience: "",
       usageScenes: "",
     }),
+    // A stalled text-only translation must not block the full-video analysis.
+    translateTranscriptWithQwen: () => new Promise(() => {}),
     updateVideo: (_id, patch) => patches.push(patch),
     replaceScenes: () => undefined,
     extractVideoAssets: async () => ({

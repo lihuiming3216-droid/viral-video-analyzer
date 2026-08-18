@@ -8,6 +8,7 @@ import { requireProvider } from "@/lib/provider-config";
 
 const MAX_INLINE_VIDEO_BYTES = 6 * 1024 * 1024;
 const QWEN_REQUEST_TIMEOUT_MS = 10 * 60 * 1_000;
+const QWEN_TRANSLATION_TIMEOUT_MS = 60 * 1_000;
 
 function qwenVideoFps() {
   const configured = Number(process.env.QWEN_VIDEO_FPS || 2);
@@ -247,7 +248,9 @@ export async function translateTranscriptWithQwen(input: {
   const transcript = input.transcript.trim();
   if (!transcript) return "";
   const config = requireProvider("qwen");
-  const timeoutSignal = AbortSignal.timeout(QWEN_REQUEST_TIMEOUT_MS);
+  // Translation is deliberately shorter than full-video analysis. It runs in
+  // the background and must never occupy a video worker for ten minutes.
+  const timeoutSignal = AbortSignal.timeout(QWEN_TRANSLATION_TIMEOUT_MS);
   const signal = input.signal ? AbortSignal.any([input.signal, timeoutSignal]) : timeoutSignal;
   const response = await fetch(`${config.baseUrl}/chat/completions`, {
     method: "POST",

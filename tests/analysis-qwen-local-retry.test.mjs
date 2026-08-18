@@ -59,6 +59,14 @@ function qwenDiagnostic(requestIndex, inputSha256) {
   };
 }
 
+function retryableQwenError(message = "Qwen 完整视频网络连接失败") {
+  const error = new Error(message);
+  error.name = "QwenRequestError";
+  error.code = "network_error";
+  error.retryable = true;
+  return error;
+}
+
 test("one attempt uses one local complete MP4, persists two Qwen calls, and never overwrites the original", async () => {
   const videoId = "local-qwen-retry";
   const attemptNumber = 7;
@@ -129,15 +137,23 @@ test("one attempt uses one local complete MP4, persists two Qwen calls, and neve
     analyzeVideoWithQwen: async (input) => {
       const requestIndex = qwenInputs.length + 1;
       qwenInputs.push(input);
-      input.onDiagnostic(qwenDiagnostic(requestIndex, inputSha256));
       if (requestIndex === 1) {
-        return { summary: "第一轮缺少翻译", translationZh: "" };
+        input.onDiagnostic({
+          ...qwenDiagnostic(requestIndex, inputSha256),
+          requestId: "",
+          httpStatus: null,
+          headersMs: null,
+          firstTokenMs: null,
+          outcome: "network_error",
+          responseSha256: "",
+        });
+        throw retryableQwenError();
       }
       if (requestIndex === 2) {
+        input.onDiagnostic(qwenDiagnostic(requestIndex, inputSha256));
         return {
           summary: "第二轮完整",
           language: "en",
-          translationZh: "这是完整的中文口播翻译。",
           hook: { timeRange: "00:00-00:03", type: "钩子", description: "直击痛点", whyItWorks: "信息直接" },
           viralPoints: [],
           strengths: [],
@@ -154,10 +170,17 @@ test("one attempt uses one local complete MP4, persists two Qwen calls, and neve
     },
   });
 
-  await analysis.analyzeVideo(videoId, undefined, attemptNumber);
+  const priorRetryDelay = process.env.QWEN_RETRY_BASE_MS;
+  process.env.QWEN_RETRY_BASE_MS = "0";
+  try {
+    await analysis.analyzeVideo(videoId, undefined, attemptNumber);
+  } finally {
+    if (priorRetryDelay === undefined) delete process.env.QWEN_RETRY_BASE_MS;
+    else process.env.QWEN_RETRY_BASE_MS = priorRetryDelay;
+  }
 
   assert.deepEqual(prepared, [[videoId, originalPath, 12.5, undefined]]);
-  assert.equal(qwenInputs.length, 2, "an unusable first response permits exactly one retry");
+  assert.equal(qwenInputs.length, 2, "a retryable network failure permits exactly one retry");
   assert.ok(qwenInputs.every((input) => input.localVideoPath === proxyAbsolutePath));
   assert.ok(qwenInputs.every((input) => !("remoteVideoUrl" in input)));
 
@@ -174,6 +197,71 @@ test("one attempt uses one local complete MP4, persists two Qwen calls, and neve
   );
   assert.equal(initial.originalPath, originalPath);
   assert.equal(patches.at(-1).status, "completed");
+});
+
+test("a structurally incomplete Qwen response fails without uploading the same video twice", async () => {
+  const videoId = "local-qwen-incomplete";
+  const attemptNumber = 2;
+  const patches = [];
+  let qwenCalls = 0;
+  const initial = {
+    id: videoId,
+    productId: "product-1",
+    sourceType: "tiktok",
+    sourceUrl: "https://www.tiktok.com/@example/video/456",
+    analysisMode: "product_doc",
+    originalPath: `${videoId}/original.mp4`,
+    remoteVideoUrl: null,
+    transcriptOriginal: "Complete spoken script.",
+    transcriptZh: "完整口播翻译。",
+    attemptCount: attemptNumber,
+    title: "test video",
+    coverPath: null,
+  };
+  const analysis = await loadAnalysis({
+    getVideo: () => initial,
+    getProduct: () => ({
+      id: "product-1",
+      name: "测试产品",
+      pid: "pid-1",
+      coreFunctions: [],
+      usageMethod: "",
+      targetAudience: "",
+      usageScenes: "",
+    }),
+    updateVideo: (_id, patch) => patches.push(patch),
+    replaceScenes: () => undefined,
+    extractVideoAssets: async () => ({
+      duration: 8,
+      scenes: [{
+        shotIndex: 1,
+        startSeconds: 0,
+        endSeconds: 8,
+        screenshotPath: `${videoId}/shot-1.jpg`,
+      }],
+    }),
+    prepareLocalVideoForQwen: async () => `${videoId}/qwen-full-video.mp4`,
+    resolveMediaPath: () => `/private/media/${videoId}/qwen-full-video.mp4`,
+    validateCompleteVideoForQwen: async () => ({
+      duration: 8,
+      width: 720,
+      height: 1280,
+      videoCodec: "h264",
+      audioCodec: "aac",
+    }),
+    analyzeVideoWithQwen: async () => {
+      qwenCalls += 1;
+      return { summary: "只有摘要，结构不完整" };
+    },
+  });
+
+  await assert.rejects(
+    analysis.analyzeVideo(videoId, undefined, attemptNumber),
+    /Qwen 未返回完整的视频分析/,
+  );
+  assert.equal(qwenCalls, 1);
+  assert.equal(patches.at(-1).status, "failed");
+  assert.equal(patches.at(-1).error_message, "Qwen 未返回完整的视频分析，请重试该链接");
 });
 
 test("a finalized TokScript tool error is not retried as a whole fetch", async () => {

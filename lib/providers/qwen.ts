@@ -9,14 +9,92 @@ import { requireProvider } from "@/lib/provider-config";
 const MAX_INLINE_VIDEO_BYTES = 6 * 1024 * 1024;
 const QWEN_REQUEST_TIMEOUT_MS = 10 * 60 * 1_000;
 const QWEN_TRANSLATION_TIMEOUT_MS = 60 * 1_000;
+const MAX_CONCURRENT_QWEN_REQUESTS = 2;
+
+type QwenRequestPriority = "video" | "translation";
+type QwenSchedulerGlobal = typeof globalThis & {
+  __qwenRequestActive?: number;
+  __qwenVideoWaiters?: Array<() => void>;
+  __qwenTranslationWaiters?: Array<() => void>;
+};
+
+const qwenScheduler = globalThis as QwenSchedulerGlobal;
+qwenScheduler.__qwenRequestActive ??= 0;
+qwenScheduler.__qwenVideoWaiters ??= [];
+qwenScheduler.__qwenTranslationWaiters ??= [];
+
+function drainQwenRequests() {
+  while (qwenScheduler.__qwenRequestActive! < MAX_CONCURRENT_QWEN_REQUESTS) {
+    const grant = qwenScheduler.__qwenVideoWaiters!.shift()
+      || qwenScheduler.__qwenTranslationWaiters!.shift();
+    if (!grant) return;
+    qwenScheduler.__qwenRequestActive! += 1;
+    grant();
+  }
+}
+
+function acquireQwenRequestSlot(priority: QwenRequestPriority, signal?: AbortSignal) {
+  return new Promise<() => void>((resolve, reject) => {
+    const waiters = priority === "video"
+      ? qwenScheduler.__qwenVideoWaiters!
+      : qwenScheduler.__qwenTranslationWaiters!;
+    let granted = false;
+    const grant = () => {
+      granted = true;
+      signal?.removeEventListener("abort", onAbort);
+      let released = false;
+      resolve(() => {
+        if (released) return;
+        released = true;
+        qwenScheduler.__qwenRequestActive = Math.max(0, qwenScheduler.__qwenRequestActive! - 1);
+        drainQwenRequests();
+      });
+    };
+    const onAbort = () => {
+      if (granted) return;
+      const index = waiters.indexOf(grant);
+      if (index >= 0) waiters.splice(index, 1);
+      reject(signal?.reason instanceof Error ? signal.reason : new Error("Qwen 请求已停止"));
+    };
+    if (signal?.aborted) {
+      onAbort();
+      return;
+    }
+    waiters.push(grant);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    drainQwenRequests();
+  });
+}
+
+export type QwenRequestErrorCode = "timeout" | "network_error" | "http_error" | "invalid_response";
+
+export class QwenRequestError extends Error {
+  override readonly name = "QwenRequestError";
+
+  constructor(
+    readonly code: QwenRequestErrorCode,
+    readonly retryable: boolean,
+    message: string,
+    readonly httpStatus: number | null = null,
+  ) {
+    super(message);
+  }
+}
 
 function qwenVideoFps() {
   const configured = Number(process.env.QWEN_VIDEO_FPS || 2);
   return Number.isFinite(configured) ? Math.max(0.1, Math.min(10, configured)) : 2;
 }
 
-function qwenVideoModel() {
-  return process.env.QWEN_VIDEO_MODEL?.trim() || "qwen3.5-omni-plus";
+function supportedQwenVideoModel(value: string) {
+  return /^qwen(?:3\.5-omni-(?:plus|flash)|3-omni-flash)(?:-\d{4}-\d{2}-\d{2})?$/.test(value);
+}
+
+function qwenVideoModel(configuredModel = "") {
+  const candidates = [process.env.QWEN_VIDEO_MODEL, configuredModel]
+    .map((value) => String(value || "").trim())
+    .filter(Boolean);
+  return candidates.find(supportedQwenVideoModel) || "qwen3.5-omni-plus";
 }
 
 function videoMimeType(videoPath: string) {
@@ -146,7 +224,17 @@ export async function testQwenConnection() {
     headers: { Authorization: `Bearer ${config.apiKey}` },
   });
   if (!response.ok) throw new Error(`Qwen 连接失败（${response.status}），请确认 Base URL 所在地域与 Key 一致`);
-  return { ok: true, message: `连接成功，视频模型 ${qwenVideoModel()}` };
+  const sharedEndpoint = (() => {
+    try {
+      return new URL(config.baseUrl).hostname === "dashscope.aliyuncs.com";
+    } catch {
+      return false;
+    }
+  })();
+  return {
+    ok: true,
+    message: `连接成功，视频模型 ${qwenVideoModel(config.model)}${sharedEndpoint ? "；建议改用与当前 Key 同地域的 Workspace 专属地址" : ""}`,
+  };
 }
 
 export async function analyzeVideoWithQwen(input: {
@@ -157,7 +245,7 @@ export async function analyzeVideoWithQwen(input: {
   onDiagnostic?: (diagnostic: QwenRequestDiagnostic) => void;
 }) {
   const config = requireProvider("qwen");
-  const model = qwenVideoModel();
+  const model = qwenVideoModel(config.model);
   const video = completeVideoInput(input);
   const content: Array<Record<string, unknown>> = [
     video.item,
@@ -173,7 +261,9 @@ export async function analyzeVideoWithQwen(input: {
   let firstTokenMs: number | null = null;
   let responseSha256 = "";
   let outcome: QwenRequestDiagnostic["outcome"] = "network_error";
+  let releaseSlot: (() => void) | undefined;
   try {
+    releaseSlot = await acquireQwenRequestSlot("video", input.signal);
     response = await fetch(`${config.baseUrl}/chat/completions`, {
       method: "POST",
       headers: { Authorization: `Bearer ${config.apiKey}`, "Content-Type": "application/json" },
@@ -208,14 +298,24 @@ export async function analyzeVideoWithQwen(input: {
     const message = error instanceof Error ? error.message : String(error || "");
     if (/(?:timeout|timed out|aborted due to timeout|etimedout)/i.test(message)) {
       outcome = "timeout";
-      throw new Error("Qwen 完整视频分析超时");
+      throw new QwenRequestError("timeout", true, "Qwen 完整视频分析超时");
     }
-    outcome = response && !response.ok
-      ? "http_error"
-      : error instanceof SyntaxError || /(?:JSON|没有返回|流式响应)/i.test(message)
-        ? "invalid_response"
-        : "network_error";
-    throw error;
+    if (response && !response.ok) {
+      outcome = "http_error";
+      const retryable = response.status === 408 || response.status === 429 || response.status >= 500;
+      throw new QwenRequestError(
+        "http_error",
+        retryable,
+        `Qwen 完整视频请求失败（HTTP ${response.status}）`,
+        response.status,
+      );
+    }
+    if (error instanceof SyntaxError || /(?:JSON|没有返回|流式响应)/i.test(message)) {
+      outcome = "invalid_response";
+      throw new QwenRequestError("invalid_response", false, "Qwen 没有返回可用的视频分析结构");
+    }
+    outcome = "network_error";
+    throw new QwenRequestError("network_error", true, "Qwen 完整视频网络连接失败");
   } finally {
     try {
       input.onDiagnostic?.({
@@ -233,6 +333,7 @@ export async function analyzeVideoWithQwen(input: {
     } catch {
       // Diagnostics must never alter the analysis result.
     }
+    releaseSlot?.();
   }
 }
 
@@ -250,30 +351,36 @@ export async function translateTranscriptWithQwen(input: {
   const config = requireProvider("qwen");
   // Translation is deliberately shorter than full-video analysis. It runs in
   // the background and must never occupy a video worker for ten minutes.
-  const timeoutSignal = AbortSignal.timeout(QWEN_TRANSLATION_TIMEOUT_MS);
-  const signal = input.signal ? AbortSignal.any([input.signal, timeoutSignal]) : timeoutSignal;
-  const response = await fetch(`${config.baseUrl}/chat/completions`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${config.apiKey}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: qwenVideoModel(),
-      messages: [{
-        role: "user",
-        content: [{
-          type: "text",
-          text: `把下面 TokScript 提供的完整口播原文翻译成自然、准确、完整的简体中文。只返回 JSON，不要解释：{"translationZh":""}。不要删减、总结、补写。原文：${JSON.stringify(transcript)}`,
+  let releaseSlot: (() => void) | undefined;
+  try {
+    releaseSlot = await acquireQwenRequestSlot("translation", input.signal);
+    const timeoutSignal = AbortSignal.timeout(QWEN_TRANSLATION_TIMEOUT_MS);
+    const signal = input.signal ? AbortSignal.any([input.signal, timeoutSignal]) : timeoutSignal;
+    const response = await fetch(`${config.baseUrl}/chat/completions`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${config.apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: qwenVideoModel(config.model),
+        messages: [{
+          role: "user",
+          content: [{
+            type: "text",
+            text: `把下面 TokScript 提供的完整口播原文翻译成自然、准确、完整的简体中文。只返回 JSON，不要解释：{"translationZh":""}。不要删减、总结、补写。原文：${JSON.stringify(transcript)}`,
+          }],
         }],
-      }],
-      modalities: ["text"],
-      enable_thinking: false,
-      stream: true,
-      max_tokens: 4_500,
-    }),
-    signal,
-  });
-  const parsed = await parseOmniStream(response, () => undefined);
-  const result = parsed.result as Record<string, unknown>;
-  const translation = String(result.translationZh || result.translation_zh || result.translation || "").trim();
-  if (!translation) throw new Error("Qwen 未返回口播中文翻译");
-  return translation;
+        modalities: ["text"],
+        enable_thinking: false,
+        stream: true,
+        max_tokens: 4_500,
+      }),
+      signal,
+    });
+    const parsed = await parseOmniStream(response, () => undefined);
+    const result = parsed.result as Record<string, unknown>;
+    const translation = String(result.translationZh || result.translation_zh || result.translation || "").trim();
+    if (!translation) throw new Error("Qwen 未返回口播中文翻译");
+    return translation;
+  } finally {
+    releaseSlot?.();
+  }
 }

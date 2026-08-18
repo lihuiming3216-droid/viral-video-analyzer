@@ -134,16 +134,14 @@ function buildPrompt(input: {
     };
     return `你是 TikTok 带货短视频拆解专家。请用中文输出极简的产品样片分析。
 
-只输出：核心判断、开头钩子、分析爆点、内容结构、产品呈现、用户痛点或情绪、转化方式、可借鉴点，以及完整的中文口播翻译。不要输出评分、原视频链接、复拍口播稿或分镜脚本。不要臆造页面或视频没有提供的信息。
-除 translationZh 外，所有分析都用短语，不写解释句；只保留“动作+结果”。summary 不超过30个汉字；hook.description、每条 viralPoints、strengths 和 structureFormula 均不超过18个汉字。删除“通过、进行、能够、可以、有效提升、有助于、让用户”等套话。
-translationZh 必须是完整原口播的自然中文翻译，不要只翻译其中几句；听不清的部分标记为“[听不清]”。
-如果视频没有口播，translationZh 必须写“无口播”，仍需根据画面完成其余分析。
-严格使用以下 JSON 结构：{"summary":"","language":"","translationZh":"","hook":{"timeRange":"","type":"","description":"","whyItWorks":""},"viralPoints":[{"timeRange":"","description":"","reason":""}],"strengths":[""],"structureFormula":""}。
+只输出：核心判断、开头钩子、分析爆点、内容结构、产品呈现、用户痛点或情绪、转化方式和可借鉴点。中文翻译由 TokScript 独立链路处理，本请求禁止生成 translationZh 或重复翻译口播。不要输出评分、原视频链接、复拍口播稿或分镜脚本。不要臆造页面或视频没有提供的信息。
+所有分析都用短语，不写解释句；只保留“动作+结果”。summary 不超过30个汉字；hook.description、每条 viralPoints、strengths 和 structureFormula 均不超过18个汉字。删除“通过、进行、能够、可以、有效提升、有助于、让用户”等套话。
+严格使用以下 JSON 结构：{"summary":"","language":"","hook":{"timeRange":"","type":"","description":"","whyItWorks":""},"viralPoints":[{"timeRange":"","description":"","reason":""}],"strengths":[""],"structureFormula":""}。
 
 产品：${JSON.stringify(productContext)}
 镜头时间轴：${JSON.stringify(timeline)}`;
   }
-  return `你是 TikTok 带货短视频拆解专家。请用中文输出，原文案保留英语或西语，并逐段给出中文翻译。translationZh 字段必须给出完整口播的中文翻译。
+  return `你是 TikTok 带货短视频拆解专家。请用中文输出视频分析。中文翻译由 TokScript 独立链路处理，本请求禁止生成 translationZh 或重复翻译口播。
 
 目标：分别判断流量潜力和带货转化，不要因为播放量高就默认转化高。分析每个镜头的画面、声音、清晰度、美感、光线、产品主体是否清晰、节奏、情绪和商业作用。
 
@@ -178,6 +176,39 @@ function transientNetworkFailure(error: unknown) {
   return /(?:timeout|timed out|aborted due to timeout|fetch failed|econnreset|etimedout|socket|und_err)/i.test(message);
 }
 
+function qwenRequestFailure(error: unknown) {
+  if (!(error instanceof Error) || error.name !== "QwenRequestError") return null;
+  return error as Error & { code?: string; retryable?: boolean };
+}
+
+function retryableQwenFailure(error: unknown) {
+  return qwenRequestFailure(error)?.retryable === true;
+}
+
+function qwenRetryDelayMs() {
+  const configured = Number(process.env.QWEN_RETRY_BASE_MS ?? 3_000);
+  const base = Number.isFinite(configured) ? Math.max(0, Math.min(30_000, configured)) : 3_000;
+  if (!base) return 0;
+  return base + Math.floor(Math.random() * Math.min(2_000, base));
+}
+
+async function waitForQwenRetry(signal?: AbortSignal) {
+  const delayMs = qwenRetryDelayMs();
+  signal?.throwIfAborted();
+  if (!delayMs) return;
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, delayMs);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal?.reason instanceof Error ? signal.reason : new Error("视频任务已停止"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 async function withOneNetworkRetry<T>(
   operation: () => Promise<T>,
   onRetry: () => void,
@@ -196,6 +227,8 @@ async function withOneNetworkRetry<T>(
 
 function userFacingAnalysisError(error: unknown) {
   const message = error instanceof Error ? error.message : "未知错误";
+  const qwenFailure = qwenRequestFailure(error);
+  if (qwenFailure) return qwenFailure.retryable ? `${message}，系统已自动重试一次` : message;
   if (error instanceof Error && error.name === "TokScriptRetryableError") return message;
   if (transientNetworkFailure(error)) {
     if (/Qwen/i.test(message)) return "Qwen 完整视频分析超时，系统已自动重试一次";
@@ -301,11 +334,36 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
   if (!product) throw new Error("产品档案不存在");
   const analysisMode = initial.analysisMode;
   const trace: string[] = [];
+  let transcript = initial.transcriptOriginal;
+  let transcriptZh = String(initial.transcriptZh || "");
+  let translationScheduled = false;
+  const scheduleTranscriptTranslation = () => {
+    if (translationScheduled || !transcript.trim() || transcriptZh.trim() || !isConfigured("qwen")) return;
+    translationScheduled = true;
+    const transcriptForTranslation = transcript;
+    const timer = setTimeout(() => {
+      void (async () => {
+        try {
+          const translated = await translateTranscriptWithQwen({ transcript: transcriptForTranslation });
+          if (!translated.trim() || !ownsVideoAttempt(videoId, expectedAttemptNumber)) return;
+          updateVideo(videoId, { transcript_zh: translated });
+          emitVideoProgress(videoId);
+          const latest = getVideo(videoId, false);
+          if (latest?.status === "completed" && latest.analysisMode === "product_doc") {
+            void import("@/lib/feishu/product-doc-sync")
+              .then(({ syncCompletedVideoToProductDocument }) => syncCompletedVideoToProductDocument(videoId))
+              .catch(() => false);
+          }
+        } catch {
+          // Translation remains independent from the video task result.
+        }
+      })().catch(() => undefined);
+    }, 0);
+    timer.unref?.();
+  };
   try {
     assertVideoAttempt(videoId, signal, expectedAttemptNumber);
     let relativeVideoPath = initial.originalPath;
-    let transcript = initial.transcriptOriginal;
-    let transcriptZh = String(initial.transcriptZh || "");
     let transcriptSegments: Array<{ start: number; end: number; text: string }> = [];
 
     const storedTokScriptFailure = initial.sourceType === "tiktok"
@@ -374,28 +432,6 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
       }
     } else if (initial.sourceType === "tiktok") {
       trace.push("本地缓存：复用已保存的 TikTok 原片和文案");
-    }
-
-    // Translate independently in the background. A text-only translation
-    // must never occupy a video worker or delay the full MP4 analysis.
-    if (transcript.trim() && !transcriptZh.trim() && isConfigured("qwen")) {
-      const transcriptForTranslation = transcript;
-      void (async () => {
-        try {
-          const translated = await translateTranscriptWithQwen({ transcript: transcriptForTranslation, signal });
-          if (!translated.trim() || signal?.aborted || !ownsVideoAttempt(videoId, expectedAttemptNumber)) return;
-          updateVideo(videoId, { transcript_zh: translated });
-          emitVideoProgress(videoId);
-          const latest = getVideo(videoId, false);
-          if (latest?.status === "completed" && latest.analysisMode === "product_doc") {
-            void import("@/lib/feishu/product-doc-sync")
-              .then(({ syncCompletedVideoToProductDocument }) => syncCompletedVideoToProductDocument(videoId))
-              .catch(() => false);
-          }
-        } catch {
-          // Translation failure must not fail or retry video analysis.
-        }
-      })().catch(() => undefined);
     }
 
     if (!relativeVideoPath) throw new Error("没有可分析的视频文件");
@@ -468,36 +504,39 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
     };
     setStage(videoId, "analyzing", "正在观看完整视频并分析画面、声音、钩子和转化结构", 66);
 
+    const qwenConfigured = isConfigured("qwen");
     let qwenContext: Record<string, unknown> | undefined;
-    if (isConfigured("qwen")) {
+    let firstQwenError: unknown;
+    if (qwenConfigured) {
       try {
         qwenContext = await runQwenRequest(1);
         assertVideoAttempt(videoId, signal, expectedAttemptNumber);
         trace.push("Qwen Omni：完整 MP4 画面与原始音轨分析");
       } catch (error) {
         if (signal?.aborted) throw error;
+        firstQwenError = error;
         trace.push(`Qwen 初审未采用：${error instanceof Error ? error.message : "未知错误"}`);
       }
     }
 
     assertVideoAttempt(videoId, signal, expectedAttemptNumber);
-    setStage(videoId, "analyzing", analysisMode === "product_doc" ? "正在生成轻量视频分析和中文翻译" : "正在生成中文深度报告和复拍脚本", 82);
+    setStage(videoId, "analyzing", analysisMode === "product_doc" ? "正在生成轻量视频分析" : "正在生成中文深度报告和复拍脚本", 82);
     let rawAnalysis: Partial<AnalysisResult>;
     if (isUsableAnalysis(qwenContext, assets.scenes.length, analysisMode, transcript)) {
       rawAnalysis = qwenContext as Partial<AnalysisResult>;
       trace.push("自动路由：Qwen 结果完整，直接生成快速报告");
-    } else if (isConfigured("qwen")) {
-      try {
-        rawAnalysis = await runQwenRequest(2);
-        assertVideoAttempt(videoId, signal, expectedAttemptNumber);
-        trace.push("Qwen：首次结果不完整，已重试一次");
-      } catch (error) {
-        if (signal?.aborted) throw error;
-        if (!qwenContext) throw error;
-        rawAnalysis = qwenContext as Partial<AnalysisResult>;
-      }
-    } else {
+    } else if (!qwenConfigured) {
       throw new Error("请先配置并启用 Qwen，所有 AI 分析只使用 Qwen");
+    } else if (!firstQwenError) {
+      throw new Error("Qwen 未返回完整的视频分析，请重试该链接");
+    } else {
+      if (!retryableQwenFailure(firstQwenError)) throw firstQwenError;
+      trace.push("Qwen：首次请求为可重试故障，短暂退避后重试一次");
+      await waitForQwenRetry(signal);
+      assertVideoAttempt(videoId, signal, expectedAttemptNumber);
+      rawAnalysis = await runQwenRequest(2);
+      assertVideoAttempt(videoId, signal, expectedAttemptNumber);
+      trace.push("Qwen：网络或服务故障后已重试一次");
     }
 
     if (!isUsableAnalysis(rawAnalysis as Record<string, unknown>, assets.scenes.length, analysisMode, transcript)) {
@@ -591,6 +630,7 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
     } catch {
       // 学习档案失败不能影响已经完成的视频报告。
     }
+    scheduleTranscriptTranslation();
   } catch (error) {
     const abortReason = signal?.aborted && signal.reason instanceof Error ? signal.reason : null;
     const timedOut = abortReason?.name === "VideoTaskTimeoutError";
@@ -609,6 +649,7 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
         .catch(() => undefined);
       emitVideoProgress(videoId);
     }
+    scheduleTranscriptTranslation();
     throw error;
   }
 }

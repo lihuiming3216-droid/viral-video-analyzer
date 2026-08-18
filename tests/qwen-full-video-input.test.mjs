@@ -11,7 +11,7 @@ const stubSource = `
   export const requireProvider = () => ({
     apiKey: "test-key",
     baseUrl: "https://qwen.test/v1",
-    model: "qwen3.7-plus"
+    model: globalThis.__qwenProviderModel || "qwen3.7-plus"
   });
   export const parseJsonLoose = JSON.parse;
 `;
@@ -52,6 +52,14 @@ async function withMockedFetch(fetchImpl, task) {
   } finally {
     globalThis.fetch = originalFetch;
   }
+}
+
+async function waitUntil(predicate, message) {
+  for (let index = 0; index < 100; index += 1) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  throw new Error(message);
 }
 
 test("Qwen always sends the local complete MP4 and ignores a residual remote URL", async () => {
@@ -120,6 +128,72 @@ test("a throwing diagnostic callback cannot alter a successful analysis", async 
 
   assert.deepEqual(result, { summary: "still-ok" });
   assert.equal(callbackCalls, 1);
+});
+
+test("a supported Omni model from provider settings is used for both video and translation", async () => {
+  const priorEnvironmentModel = process.env.QWEN_VIDEO_MODEL;
+  delete process.env.QWEN_VIDEO_MODEL;
+  globalThis.__qwenProviderModel = "qwen3.5-omni-flash";
+  const models = [];
+  try {
+    await withMockedFetch(async (_url, init) => {
+      const body = JSON.parse(String(init.body));
+      models.push(body.model);
+      const isTranslation = JSON.stringify(body).includes("TokScript 提供的完整口播原文");
+      return successfulStream({
+        result: isTranslation ? { translationZh: "中文翻译" } : { summary: "视频分析" },
+      });
+    }, async () => {
+      await qwen.analyzeVideoWithQwen({ prompt: "分析", localVideoPath: videoPath });
+      await qwen.translateTranscriptWithQwen({ transcript: "spoken script" });
+    });
+  } finally {
+    delete globalThis.__qwenProviderModel;
+    if (priorEnvironmentModel === undefined) delete process.env.QWEN_VIDEO_MODEL;
+    else process.env.QWEN_VIDEO_MODEL = priorEnvironmentModel;
+  }
+  assert.deepEqual(models, ["qwen3.5-omni-flash", "qwen3.5-omni-flash"]);
+});
+
+test("video requests share a two-slot Qwen limit and jump ahead of queued translations", async () => {
+  const started = [];
+  const heldResolvers = [];
+  await withMockedFetch((_url, init) => {
+    const body = JSON.parse(String(init.body));
+    const serialized = JSON.stringify(body);
+    const label = serialized.includes("视频一")
+      ? "video-one"
+      : serialized.includes("视频二")
+        ? "video-two"
+        : serialized.includes("视频三")
+          ? "video-three"
+          : "translation";
+    started.push(label);
+    if (started.length <= 2) {
+      return new Promise((resolve) => {
+        heldResolvers.push(() => resolve(successfulStream({ result: { summary: label } })));
+      });
+    }
+    return Promise.resolve(successfulStream({
+      result: label === "translation" ? { translationZh: "中文" } : { summary: label },
+    }));
+  }, async () => {
+    const first = qwen.analyzeVideoWithQwen({ prompt: "视频一", localVideoPath: videoPath });
+    const second = qwen.analyzeVideoWithQwen({ prompt: "视频二", localVideoPath: videoPath });
+    await waitUntil(() => started.length === 2, "two video requests did not start");
+
+    const translation = qwen.translateTranscriptWithQwen({ transcript: "translate me" });
+    const third = qwen.analyzeVideoWithQwen({ prompt: "视频三", localVideoPath: videoPath });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.deepEqual(started, ["video-one", "video-two"]);
+
+    heldResolvers[0]();
+    await waitUntil(() => started.length >= 3, "the next queued request did not start");
+    assert.equal(started[2], "video-three");
+    heldResolvers[1]();
+    await Promise.all([first, second, third, translation]);
+  });
+  assert.deepEqual(started, ["video-one", "video-two", "video-three", "translation"]);
 });
 
 test("every Qwen request receives an exact ten-minute timeout", async () => {
@@ -222,7 +296,7 @@ test("HTTP failures emit the response status and request ID", async () => {
             diagnostic = value;
           },
         }),
-        /rate limited/,
+        /Qwen 完整视频请求失败（HTTP 429）/,
       );
     },
   );
@@ -232,6 +306,33 @@ test("HTTP failures emit the response status and request ID", async () => {
   assert.equal(diagnostic.httpStatus, 429);
   assert.equal(typeof diagnostic.headersMs, "number");
   assert.equal(diagnostic.firstTokenMs, null);
+});
+
+test("network failures are retryable but never expose the raw provider error", async () => {
+  let diagnostic;
+  await withMockedFetch(async () => {
+    throw new Error("socket failed at https://signed.example/video?token=secret");
+  }, async () => {
+    await assert.rejects(
+      qwen.analyzeVideoWithQwen({
+        prompt: "分析",
+        localVideoPath: videoPath,
+        onDiagnostic(value) {
+          diagnostic = value;
+        },
+      }),
+      (error) => {
+        assert.equal(error.name, "QwenRequestError");
+        assert.equal(error.code, "network_error");
+        assert.equal(error.retryable, true);
+        assert.equal(error.message, "Qwen 完整视频网络连接失败");
+        assert.doesNotMatch(error.message, /signed|token|secret/);
+        return true;
+      },
+    );
+  });
+  assert.equal(diagnostic.outcome, "network_error");
+  assert.equal(diagnostic.httpStatus, null);
 });
 
 test("an empty successful stream emits an invalid-response diagnostic", async () => {
@@ -250,7 +351,7 @@ test("an empty successful stream emits an invalid-response diagnostic", async ()
             diagnostic = value;
           },
         }),
-        /没有返回视频分析内容/,
+        /Qwen 没有返回可用的视频分析结构/,
       );
     },
   );

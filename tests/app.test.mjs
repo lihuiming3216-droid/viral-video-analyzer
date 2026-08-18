@@ -67,7 +67,8 @@ test("product documents auto-sync in lightweight mode and keep the manual prop a
   assert.match(analysis, /analysisMode === "product_doc" \? 2_000 : 4_500/);
   assert.match(analysis, /learningContext = analysisMode === "product_doc" \? null/);
   assert.match(analysis, /includeCover: analysisMode !== "product_doc"/);
-  assert.match(analysis, /translationZh 必须写“无口播”/);
+  assert.match(analysis, /中文翻译由 TokScript 独立链路处理/);
+  assert.match(analysis, /禁止生成 translationZh/);
   assert.match(formatter, /爆点/);
   assert.doesNotMatch(formatter, /原视频链接|复拍口播稿|分镜脚本/);
   assert.match(qwen, /max_tokens: input\.maxTokens \|\| 4_500/);

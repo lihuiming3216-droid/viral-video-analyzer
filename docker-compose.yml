@@ -1,23 +1,51 @@
+# Existing production stack only. Local tests must use isolated resources.
+name: viral-video-analyzer
+
 services:
+  mysql:
+    image: mysql:8.0.46
+    container_name: viral-mysql
+    restart: unless-stopped
+    mem_limit: 400m
+    command: ["--innodb-buffer-pool-size=128M", "--performance-schema=OFF", "--max-connections=50"]
+    volumes:
+      - mysql_data:/var/lib/mysql
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-viral_video_analyzer}
+      MYSQL_USER: ${MYSQL_USER:-viral}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?MYSQL_PASSWORD is required in the server env file}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD is required in the server env file}
+    healthcheck:
+      test: ["CMD-SHELL", "MYSQL_PWD=\"$${MYSQL_ROOT_PASSWORD}\" mysql --host=127.0.0.1 --user=root --execute='SELECT 1' >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
   viral-analyzer:
-    image: viral-video-analyzer:latest
-    build:
-      context: .
+    image: ${VIRAL_APP_IMAGE:-viral-video-analyzer:latest}
     container_name: viral-video-analyzer
     restart: unless-stopped
     ports:
       - "127.0.0.1:3000:3000"
     volumes:
       - viral_data:/app/.data
+    depends_on:
+      mysql:
+        condition: service_healthy
     environment:
       NODE_ENV: production
       NEXT_TELEMETRY_DISABLED: "1"
       PRODUCT_DOC_SYNC_INTERVAL_MS: "20000"
       PRODUCT_DOC_SYNC_BATCH_SIZE: "12"
-      FEISHU_AUTOMATION_WEBHOOK_SECRET: ${FEISHU_AUTOMATION_WEBHOOK_SECRET:-}
+      MYSQL_HOST: mysql
+      MYSQL_PORT: "3306"
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-viral_video_analyzer}
+      MYSQL_USER: ${MYSQL_USER:-viral}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?MYSQL_PASSWORD is required in the server env file}
+      FEISHU_AUTOMATION_WEBHOOK_SECRET: ${FEISHU_AUTOMATION_WEBHOOK_SECRET:?Feishu webhook secret is required}
+      FEISHU_SUBTITLE_BRIDGE_SECRET: ${FEISHU_SUBTITLE_BRIDGE_SECRET:?Feishu subtitle secret is required}
       FEISHU_PRODUCT_DOCUMENT_OWNER_OPEN_ID: ${FEISHU_PRODUCT_DOCUMENT_OWNER_OPEN_ID:-}
-      APP_BASIC_AUTH_USER: ${APP_BASIC_AUTH_USER:-}
-      APP_BASIC_AUTH_PASSWORD: ${APP_BASIC_AUTH_PASSWORD:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_PRODUCT_MODEL: ${OPENAI_PRODUCT_MODEL:-gpt-5.6-terra}
       HTTPS_PROXY: ${HTTPS_PROXY:-}
@@ -29,5 +57,15 @@ services:
       retries: 5
       start_period: 30s
 
+networks:
+  default:
+    external: true
+    name: viral-video-analyzer_default
+
 volumes:
+  mysql_data:
+    external: true
+    name: viral-video-analyzer_mysql_data
   viral_data:
+    external: true
+    name: viral-video-analyzer_viral_data

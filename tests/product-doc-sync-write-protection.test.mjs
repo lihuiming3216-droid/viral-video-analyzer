@@ -40,6 +40,8 @@ async function loadSyncModule() {
       rowBindings.delete(documentId + ":" + linkBlockId);
     };
     export const getProduct = (...args) => hooks().getProduct?.(...args) || null;
+    export const getCachedDocumentRevision = async (...args) => hooks().getCachedDocumentRevision?.(...args) ?? null;
+    export const setCachedDocumentRevision = async (...args) => hooks().setCachedDocumentRevision?.(...args);
     export const getProductDocumentVideoRow = (documentId, linkBlockId) => { const current = resetState(); return current.getProductDocumentVideoRow?.(documentId, linkBlockId) || rowBindings.get(documentId + ":" + linkBlockId) || null; };
     export const getProductDocumentVideoRowByVideoId = (videoId) => { const current = resetState(); return current.getProductDocumentVideoRowByVideoId?.(videoId) || [...rowBindings.values()].find((row) => row.videoId === videoId) || null; };
     export const getVideo = (id, ...args) => { resetState(); return rememberVideo(hooks().getVideo?.(id, ...args) || seenVideos.get(id)); };
@@ -123,6 +125,240 @@ function documentBlocks(rows) {
 
 const syncModule = await loadSyncModule();
 
+async function withResultCellFixture(run, overrides = {}) {
+  const link = "https://www.tiktok.com/@demo/video/123456789";
+  const fixture = documentBlocks([{ link, status: "", analysis: "", translation: "" }]);
+  const { blocks, rowTextIds: [ids] } = fixture;
+  const video = {
+    id: "whole-cell-video", productId: "p", sourceType: "tiktok", sourceUrl: link,
+    analysisMode: "product_doc", status: "completed", attemptCount: 1,
+    transcriptZh: "自动中文", originalPath: "fixture.mp4", ...overrides,
+  };
+  const writes = [], enqueued = [], updates = [], cached = [], reads = [];
+  const state = { revision: 10, onPreview: () => {}, onWrite: () => {} };
+  const client = { request: async ({ url, params }) => {
+    if (!String(url).includes("/blocks/")) return { data: { document: { revision_id: state.revision } } };
+    const id = decodeURIComponent(url.split("/").at(-1));
+    reads.push({ id, revision: Number(params.document_revision_id) });
+    return { data: { block: blocks.find(b => b.block_id === id) } };
+  } };
+  const append = (field, payload) => {
+    const cell = blocks.find(b => b.block_id === `row-1-${field}`);
+    const block = { block_id: `${cell.block_id}-extra-${cell.children.length}`, ...payload };
+    cell.children.push(block.block_id);
+    blocks.push(block);
+    return block;
+  };
+  globalThis.__productDocSyncWriteProtectionHooks = {
+    listFeishuDocumentBlocks: () => structuredClone(blocks),
+    getVideoBySourceUrl: () => video,
+    getVideo: () => video,
+    ensureFeishuVideoPreview: async () => state.onPreview(),
+    updateFeishuTextBlock: async (_c, _d, id, content, options) => {
+      state.onWrite();
+      assert.equal(options.documentRevisionId, state.revision, "never write at a stale revision");
+      writes.push({ id, content });
+      blocks.find(b => b.block_id === id).text = { elements: [{ text_run: { content } }] };
+      state.revision += 1;
+    },
+    enqueueVideos: ids => enqueued.push(...ids),
+    updateVideo: (_id, patch) => updates.push(patch),
+    setCachedDocumentRevision: (...args) => cached.push(args),
+  };
+  const sync = () => syncModule.syncProductDocument(client, { id: "p", documentId: "whole-cell-doc" });
+  try { await run({ blocks, ids, video, writes, enqueued, updates, cached, reads, state, append, sync }); }
+  finally { delete globalThis.__productDocSyncWriteProtectionHooks; }
+}
+
+const manualParagraph = () => ({ block_type: 2, text: { elements: [{ text_run: { content: "人工第二段" } }] } });
+
+for (const status of ["completed", "analyzing", "failed", "stopped"]) {
+  for (const timing of ["before scan", "during preview"]) {
+    test(`whole-cell guard preserves later manual paragraphs: ${status}, ${timing}`, async () => {
+      await withResultCellFixture(async ({ append, state, writes, enqueued, updates, sync }) => {
+        const fill = () => {
+          append("analysis", manualParagraph());
+          append("translation", manualParagraph());
+          state.revision += 1;
+        };
+        if (timing === "before scan") fill();
+        else state.onPreview = fill;
+        await sync();
+        assert.deepEqual(writes, [], "any manual paragraph owns the entire result cell");
+        assert.deepEqual(enqueued, [], "an empty first paragraph is not a cleared failure cell");
+        assert.deepEqual(updates, [], "do not reset a delivered failure while manual text remains");
+      }, { status, productDocFailureDelivered: true });
+    });
+  }
+}
+
+for (const [kind, content] of [
+  ["heading", { heading1: { elements: [{ text_run: { content: "人工标题" } }] } }],
+  ["styled text", { text: { elements: [{ text_run: { content: "人工加粗", text_element_style: { bold: true } } }] } }],
+  ["mention", { text: { elements: [{ mention_user: { user_id: "isolated-user" } }] } }],
+  ["nested paragraph", { children: ["nested-manual"], quote_container: {} }],
+]) {
+  test(`whole-cell guard protects ${kind} inserted after the scan`, async () => {
+    await withResultCellFixture(async ({ blocks, append, state, writes, sync }) => {
+      state.onPreview = () => {
+        append("analysis", structuredClone(content));
+        blocks.push({ block_id: "nested-manual", ...manualParagraph() });
+        state.revision += 1;
+      };
+      await sync();
+      assert.deepEqual(writes.map(w => w.content), ["自动中文"], "the independent empty translation still fills");
+    });
+  });
+}
+
+test("whole-cell guard checks every paragraph at the write revision and still fills truly empty cells", async () => {
+  await withResultCellFixture(async ({ append, state, reads, writes, ids, sync }) => {
+    const extra = append("analysis", { text: { elements: [{ text_run: { content: " \n　 " } }] } });
+    state.onPreview = () => { state.revision = 20; };
+    await sync();
+    assert.deepEqual(writes, [{ id: ids.translation, content: "自动中文" }, { id: ids.analysis, content: "自动视频分析" }]);
+    assert.ok(reads.some(r => r.id === "row-1-analysis" && r.revision === 21));
+    assert.ok(reads.some(r => r.id === extra.block_id && r.revision === 21));
+  });
+});
+
+test("whole-cell guard uses the current empty paragraph rather than a removed scan-time target", async () => {
+  await withResultCellFixture(async ({ blocks, append, state, writes, sync }) => {
+    let replacement;
+    state.onPreview = () => {
+      replacement = append("analysis", { text: { elements: [] } });
+      blocks.find(b => b.block_id === "row-1-analysis").children = [replacement.block_id];
+      state.revision += 1;
+    };
+    await sync();
+    assert.equal(writes.at(-1).id, replacement.block_id);
+  });
+});
+
+for (const failure of ["missing paragraph", "cycle", "revision conflict"]) {
+  test(`whole-cell guard fails closed on ${failure}`, async () => {
+    await withResultCellFixture(async ({ blocks, state, writes, cached, sync }) => {
+      state.onPreview = () => {
+        blocks.find(b => b.block_id === "row-1-translation").children.push(
+          failure === "cycle" ? "row-1-translation" : failure === "missing paragraph" ? "missing-child" : "row-1-translation-text",
+        );
+        if (failure === "revision conflict") {
+          blocks.find(b => b.block_id === "row-1-translation").children.pop();
+          state.onWrite = () => { state.revision += 1; };
+        }
+      };
+      await sync();
+      assert.deepEqual(writes, []);
+      assert.deepEqual(cached, [], "an incomplete read or rejected write must remain retryable");
+    });
+  });
+}
+
+for (const status of ["analyzing", "failed", "completed"]) {
+  test(`direct ${status} delivery bypasses unchanged revisions and preserves manual cells`, async () => {
+    const link = "https://www.tiktok.com/@demo/video/123456789";
+    const { blocks, rowTextIds } = documentBlocks([
+      { link: "", status: "", analysis: "", translation: "" },
+      { link, status: "", analysis: "人工分析", translation: "" },
+    ]);
+    blocks.find(b => b.block_id === "header-1-text").text.elements[0].text_run.content = "视频文件";
+    const video = {
+      id: "partial-result", productId: "product", sourceType: "tiktok", sourceUrl: link,
+      analysisMode: "product_doc", status, transcriptZh: "独立翻译", originalPath: "fake-original.mp4", attemptCount: 1,
+    };
+    const binding = { videoId: video.id, documentId: "partial-doc", linkBlockId: rowTextIds[1].link, sourceUrl: link };
+    const writes = [], enqueued = [];
+    let previews = 0, revisionReads = 0;
+    const client = { request: async ({ url }) => {
+      if (!String(url).includes("/blocks/")) {
+        revisionReads += 1;
+        return { data: { document: { revision_id: 20 } } };
+      }
+      return { data: { block: blocks.find(b => b.block_id === decodeURIComponent(url.split("/").at(-1))) } };
+    } };
+    globalThis.__productDocSyncWriteProtectionHooks = {
+      getVideo: () => video,
+      getProduct: () => ({ id: "product", documentId: "partial-doc" }),
+      getProductDocumentVideoRow: () => binding,
+      getCachedDocumentRevision: () => 20,
+      getConnectedFeishuChannel: () => ({ rawClient: client }),
+      listFeishuDocumentBlocks: () => blocks,
+      updateFeishuTextBlock: async (_client, _doc, blockId, content) => writes.push({ blockId, content }),
+      deleteProductDocumentVideoRow: () => { throw new Error("must not mutate another row"); },
+      ensureFeishuVideoPreview: async () => { previews += 1; throw new Error("simulated upload failure"); },
+      enqueueVideos: ids => enqueued.push(...ids),
+    };
+    try {
+      await syncModule.syncVideoToProductDocument(video.id);
+      assert.equal(previews, 1);
+      assert.equal(revisionReads, 1, "only the final blank-cell guard reads a revision");
+      assert.deepEqual(writes, [{ blockId: rowTextIds[1].translation, content: "独立翻译" }]);
+      assert.deepEqual(enqueued, []);
+    } finally { delete globalThis.__productDocSyncWriteProtectionHooks; }
+  });
+}
+
+test("a late failed-task translation never requeues analysis after the user clears its failure", async () => {
+  const link = "https://www.tiktok.com/@demo/video/123456789";
+  const { blocks, rowTextIds } = documentBlocks([{ link, status: "", analysis: "", translation: "" }]);
+  const video = { id: "late-failure", productId: "p", sourceUrl: link, sourceType: "tiktok",
+    status: "failed", analysisMode: "product_doc", productDocFailureDelivered: true,
+    transcriptZh: "迟到的翻译", attemptCount: 1 };
+  const binding = { videoId: video.id, documentId: "doc-late", linkBlockId: rowTextIds[0].link, sourceUrl: link };
+  const writes = [], enqueued = [];
+  const client = { request: async ({ url }) => String(url).includes("/blocks/")
+    ? { data: { block: blocks.find(b => b.block_id === decodeURIComponent(url.split("/").at(-1))) } }
+    : { data: { document: { revision_id: 10 } } } };
+  globalThis.__productDocSyncWriteProtectionHooks = {
+    getVideo: () => video, getProduct: () => ({ id: "p", documentId: "doc-late" }),
+    getProductDocumentVideoRow: () => binding, getConnectedFeishuChannel: () => ({ rawClient: client }),
+    listFeishuDocumentBlocks: () => blocks,
+    updateFeishuTextBlock: async (_c, _d, blockId, content) => writes.push({ blockId, content }),
+    enqueueVideos: ids => enqueued.push(...ids),
+  };
+  try {
+    await syncModule.syncVideoToProductDocument(video.id);
+    assert.deepEqual(writes, [{ blockId: rowTextIds[0].translation, content: "迟到的翻译" }]);
+    assert.deepEqual(enqueued, []);
+  } finally { delete globalThis.__productDocSyncWriteProtectionHooks; }
+});
+
+test("a failed immediate delivery invalidates an unchanged document revision for polling recovery", async () => {
+  let revision = 20;
+  const video = { id: "event", productId: "p", status: "failed" };
+  globalThis.__productDocSyncWriteProtectionHooks = {
+    getVideo: () => video, getProduct: () => ({ id: "p", documentId: "doc-event" }),
+    getConnectedFeishuChannel: () => ({ rawClient: {} }),
+    isProductDocumentVideoRowsInitialized: () => true,
+    setCachedDocumentRevision: (_doc, value) => { revision = value; },
+    listFeishuDocumentBlocks: () => { throw new Error("temporary Feishu outage"); },
+  };
+  try {
+    await assert.rejects(syncModule.syncVideoToProductDocument(video.id), /temporary Feishu outage/);
+    assert.equal(revision, -1);
+  } finally { delete globalThis.__productDocSyncWriteProtectionHooks; }
+});
+
+test("a failed row write is not marked as a successfully processed document revision", async () => {
+  const link = "https://www.tiktok.com/@demo/video/123456789";
+  const { blocks } = documentBlocks([{ link, status: "", analysis: "", translation: "" }]);
+  const cached = [];
+  const client = { request: async ({ url }) => String(url).includes("/blocks/")
+    ? { data: { block: blocks.find(b => b.block_id === decodeURIComponent(url.split("/").at(-1))) } }
+    : { data: { document: { revision_id: 20 } } } };
+  globalThis.__productDocSyncWriteProtectionHooks = {
+    getCachedDocumentRevision: () => 19,
+    setCachedDocumentRevision: (...args) => cached.push(args),
+    listFeishuDocumentBlocks: () => blocks,
+    getVideoBySourceUrl: () => ({ id: "delivery-error", sourceUrl: link, status: "completed", transcriptZh: "译文" }),
+    updateFeishuTextBlock: () => { throw new Error("temporary row write failure"); },
+  };
+  try {
+    await syncModule.syncProductDocument(client, { id: "p", documentId: "doc-write-error" });
+    assert.deepEqual(cached, []);
+  } finally { delete globalThis.__productDocSyncWriteProtectionHooks; }
+});
+
 test("writes to the same Feishu document are serialized", async () => {
   let releaseFirst;
   const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
@@ -175,7 +411,7 @@ test("completed document sync fills only independently blank analysis and transl
   const writes = [];
   let freshReadRequests = 0;
   const latestText = new Map(blocks
-    .filter((block) => block.block_id && block.text)
+    .filter((block) => block.block_id)
     .map((block) => [block.block_id, block]));
   globalThis.__productDocSyncWriteProtectionHooks = {
     listFeishuDocumentBlocks: () => blocks,
@@ -218,8 +454,8 @@ test("completed document sync fills only independently blank analysis and transl
     assert.equal(writes.some((write) => write.blockId === rowTextIds[0].translation), false);
     assert.equal(
       freshReadRequests,
-      12,
-      "each of the four writable cells reads one revision plus its link and result blocks",
+      17,
+      "one scan revision plus each writable cell's revision, link, cell and paragraph blocks",
     );
 
     assert.equal(writes.some((write) => write.blockId === rowTextIds[1].analysis), false);
@@ -351,7 +587,7 @@ test("a newly completed video is delivered to only its bound document row", asyn
   const scans = [];
   const writes = [];
   const latestText = new Map(blocks
-    .filter((block) => block.block_id && block.text)
+    .filter((block) => block.block_id)
     .map((block) => [block.block_id, block]));
   const client = {
     request: async ({ url }) => {
@@ -387,12 +623,12 @@ test("a newly completed video is delivered to only its bound document row", asyn
   };
 
   try {
-    assert.equal(await syncModule.syncCompletedVideoToProductDocument(video.id), true);
+    assert.equal(await syncModule.syncVideoToProductDocument(video.id), true);
     assert.deepEqual(scans, documentIds, "the canonical document duplicated by its mapping is scanned once");
     assert.deepEqual(writes.filter((write) => write.documentId === documentIds[0]), [
       { documentId: documentIds[0], blockId: rowTextIds[0].status, content: "" },
-      { documentId: documentIds[0], blockId: rowTextIds[0].analysis, content: "直接写入的视频分析" },
       { documentId: documentIds[0], blockId: rowTextIds[0].translation, content: "直接写入的翻译" },
+      { documentId: documentIds[0], blockId: rowTextIds[0].analysis, content: "直接写入的视频分析" },
     ]);
     assert.deepEqual(writes.filter((write) => write.documentId === documentIds[1]), [], "one task is bound to one document row");
   } finally {
@@ -493,7 +729,7 @@ test("a result cell filled after the table scan is re-read and never overwritten
     translation: "",
   }]);
   const latestText = new Map(blocks
-    .filter((block) => block.block_id && block.text)
+    .filter((block) => block.block_id)
     .map((block) => [block.block_id, structuredClone(block)]));
   const writes = [];
   const client = {
@@ -545,7 +781,7 @@ test("automatic result writes carry the freshly read document revision", async (
     translation: "",
   }]);
   const latestText = new Map(blocks
-    .filter((block) => block.block_id && block.text)
+    .filter((block) => block.block_id)
     .map((block) => [block.block_id, block]));
   let revision = 40;
   const writes = [];
@@ -572,8 +808,8 @@ test("automatic result writes carry the freshly read document revision", async (
     await syncModule.syncProductDocument(client, { id: "product-revision", documentId: "document-revision" });
     assert.deepEqual(writes, [
       { blockId: rowTextIds[0].status, content: "", revision: undefined },
-      { blockId: rowTextIds[0].analysis, content: "自动分析", revision: 41 },
-      { blockId: rowTextIds[0].translation, content: "自动翻译", revision: 42 },
+      { blockId: rowTextIds[0].translation, content: "自动翻译", revision: 41 },
+      { blockId: rowTextIds[0].analysis, content: "自动分析", revision: 42 },
     ]);
   } finally {
     delete globalThis.__productDocSyncWriteProtectionHooks;
@@ -697,7 +933,7 @@ test("failed product-document analysis is reported without automatically requeue
     errorMessage: "临时失败",
     transcriptZh: "这是 TokScript 原口播的中文翻译。",
   };
-  const latestText = new Map(blocks.filter((block) => block.text).map((block) => [block.block_id, block]));
+  const latestText = new Map(blocks.map((block) => [block.block_id, block]));
   const client = {
     request: async ({ url }) => {
       if (!String(url).includes("/blocks/")) return { data: { document: { revision_id: 49 } } };
@@ -744,7 +980,7 @@ test("a stopped document task stays stopped and is shown without automatic reque
     analysisMode: "product_doc",
     errorMessage: "用户停止",
   };
-  const latestText = new Map(blocks.filter((block) => block.text).map((block) => [block.block_id, block]));
+  const latestText = new Map(blocks.map((block) => [block.block_id, block]));
   const writes = [];
   const enqueued = [];
   const client = {
@@ -784,7 +1020,7 @@ test("clearing a persistently delivered terminal error requests a fresh analysis
     productDocFailureDelivered: true,
     errorMessage: "最终失败",
   };
-  const latestText = new Map(blocks.filter((block) => block.text).map((block) => [block.block_id, block]));
+  const latestText = new Map(blocks.map((block) => [block.block_id, block]));
   const client = {
     request: async ({ url }) => {
       if (!String(url).includes("/blocks/")) return { data: { document: { revision_id: 50 } } };
@@ -825,7 +1061,7 @@ test("an observed failure cell restores the durable manual-retry marker", async 
     productDocFailureDelivered: false,
     errorMessage: "此前已写入",
   };
-  const latestText = new Map(blocks.filter((block) => block.text).map((block) => [block.block_id, block]));
+  const latestText = new Map(blocks.map((block) => [block.block_id, block]));
   const client = {
     request: async ({ url }) => {
       if (!String(url).includes("/blocks/")) return { data: { document: { revision_id: 51 } } };
@@ -868,7 +1104,7 @@ test("a manual analysis entered during preview upload prevents a stale retry", a
     attemptCount: 1,
     errorMessage: "此前失败",
   };
-  const latestText = new Map(blocks.filter((block) => block.text).map((block) => [block.block_id, structuredClone(block)]));
+  const latestText = new Map(blocks.map((block) => [block.block_id, structuredClone(block)]));
   const client = {
     request: async ({ url }) => {
       if (!String(url).includes("/blocks/")) return { data: { document: { revision_id: 61 } } };
@@ -961,7 +1197,7 @@ test("changing link A to B during preview prevents A's preview and completed res
     analysis: { summary: "A的分析" },
     transcriptZh: "A的翻译",
   };
-  const latestText = new Map(blocks.filter((block) => block.text).map((block) => [block.block_id, structuredClone(block)]));
+  const latestText = new Map(blocks.map((block) => [block.block_id, structuredClone(block)]));
   const client = {
     request: async ({ url }) => {
       if (!String(url).includes("/blocks/")) return { data: { document: { revision_id: 71 } } };
@@ -1012,7 +1248,7 @@ test("changing link A to B during preview prevents A's cleared failure from requ
     attemptCount: 2,
     errorMessage: "A此前失败",
   };
-  const latestText = new Map(blocks.filter((block) => block.text).map((block) => [block.block_id, structuredClone(block)]));
+  const latestText = new Map(blocks.map((block) => [block.block_id, structuredClone(block)]));
   const client = {
     request: async ({ url }) => {
       if (!String(url).includes("/blocks/")) return { data: { document: { revision_id: 72 } } };

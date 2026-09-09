@@ -37,39 +37,39 @@ function timeoutError() {
   return error;
 }
 
-function cleanTimedOutVideo(videoId: string) {
-  const video = getVideo(videoId, false);
+async function cleanTimedOutVideo(videoId: string) {
+  const video = await getVideo(videoId, false);
   if (!video) return;
   const preservedUpload = video.sourceType === "upload" ? video.originalPath : null;
   deleteVideoAttemptCache(videoId, preservedUpload);
-  replaceScenes(videoId, []);
-  updateVideo(videoId, {
+  await replaceScenes(videoId, []);
+  await updateVideo(videoId, {
     cover_path: null,
     ...(video.sourceType === "tiktok" ? { original_path: null } : {}),
   });
 }
 
-function safeVideo(videoId: string) {
+async function safeVideo(videoId: string) {
   try {
-    return getVideo(videoId, false);
+    return await getVideo(videoId, false);
   } catch {
     return null;
   }
 }
 
-function settleAttempt(
-  attempt: ReturnType<typeof startVideoAttempt> | null,
+async function settleAttempt(
+  attempt: Awaited<ReturnType<typeof startVideoAttempt>> | null,
   videoId: string,
   status: "completed" | "failed" | "stopped",
   errorMessage: string,
 ) {
   if (!attempt) return;
-  // A one-off SQLite/filesystem fault must not turn into an unhandled promise
+  // A one-off MySQL/filesystem fault must not turn into an unhandled promise
   // rejection or leave the worker slot occupied. Retry the durable write once;
   // terminal failed/stopped attempts also have a broad fallback for old rows.
   for (let retry = 0; retry < 2; retry += 1) {
     try {
-      finishVideoAttempt(attempt.attemptId, videoId, status, errorMessage);
+      await finishVideoAttempt(attempt.attemptId, videoId, status, errorMessage);
       return;
     } catch {
       // Retry once below.
@@ -77,7 +77,7 @@ function settleAttempt(
   }
   if (status !== "completed") {
     try {
-      finishOpenVideoAttempts(videoId, status, errorMessage);
+      await finishOpenVideoAttempts(videoId, status, errorMessage);
     } catch {
       // The video row is already terminal; a later maintenance pass can repair
       // an unavailable attempt log without blocking the queue.
@@ -105,11 +105,11 @@ function waitForAbort(signal: AbortSignal) {
 async function runVideo(videoId: string) {
   const controller = new AbortController();
   state.__viralQueueControllers!.set(videoId, controller);
-  let attempt: ReturnType<typeof startVideoAttempt> | null = null;
+  let attempt: Awaited<ReturnType<typeof startVideoAttempt>> | null = null;
   const reason = timeoutError();
   let timer: ReturnType<typeof setTimeout> | null = null;
   try {
-    attempt = startVideoAttempt(videoId);
+    attempt = await startVideoAttempt(videoId);
     const aborted = waitForAbort(controller.signal);
     timer = setTimeout(() => {
       if (!controller.signal.aborted) controller.abort(reason);
@@ -125,10 +125,10 @@ async function runVideo(videoId: string) {
       aborted.remove();
     }
   } catch (error) {
-    const latest = safeVideo(videoId);
+    const latest = await safeVideo(videoId);
     const timedOut = controller.signal.reason === reason;
     if (latest && latest.status !== "completed" && timedOut) {
-      updateVideo(videoId, {
+      await updateVideo(videoId, {
         status: "stopped",
         stage: "处理超时",
         error_message: VIDEO_TASK_TIMEOUT_MESSAGE,
@@ -136,7 +136,7 @@ async function runVideo(videoId: string) {
       });
     } else if (latest && !["failed", "stopped", "completed"].includes(latest.status)) {
       const message = error instanceof Error ? error.message : "分析失败";
-      updateVideo(videoId, {
+      await updateVideo(videoId, {
         status: controller.signal.aborted ? "stopped" : "failed",
         stage: controller.signal.aborted ? "已停止" : "分析失败",
         error_message: controller.signal.aborted ? null : message,
@@ -145,17 +145,17 @@ async function runVideo(videoId: string) {
     }
   } finally {
     if (timer) clearTimeout(timer);
-    let latest = safeVideo(videoId);
+    let latest = await safeVideo(videoId);
     if (controller.signal.reason === reason && latest?.status !== "completed") {
       let cleanupFailed = false;
       try {
-        cleanTimedOutVideo(videoId);
+        await cleanTimedOutVideo(videoId);
       } catch {
         cleanupFailed = true;
       }
       if (cleanupFailed) {
         try {
-          updateVideo(videoId, {
+          await updateVideo(videoId, {
             status: "stopped",
             stage: "处理超时",
             error_message: `${VIDEO_TASK_TIMEOUT_MESSAGE}；部分缓存清理失败，请人工检查`,
@@ -165,14 +165,14 @@ async function runVideo(videoId: string) {
           // The queue must still release this worker slot.
         }
       }
-      latest = safeVideo(videoId);
+      latest = await safeVideo(videoId);
     }
     const status = latest?.status === "completed"
       ? "completed"
       : latest?.status === "stopped"
         ? "stopped"
         : "failed";
-    settleAttempt(attempt, videoId, status, latest?.errorMessage || "");
+    await settleAttempt(attempt, videoId, status, latest?.errorMessage || "");
     if (controller.signal.reason === reason) {
       try {
         // The hard-timeout path may win while analyzeVideo is permanently
@@ -209,28 +209,28 @@ function schedule() {
   }
 }
 
-export function enqueueVideos(ids: string[]) {
-  ids.forEach((id) => {
-    if (state.__viralQueueActiveIds!.has(id)) return;
-    updateVideo(id, { status: "queued", stage: "已加入队列", progress: 2, error_message: null });
+export async function enqueueVideos(ids: string[]) {
+  for (const id of ids) {
+    if (state.__viralQueueActiveIds!.has(id)) continue;
+    await updateVideo(id, { status: "queued", stage: "已加入队列", progress: 2, error_message: null });
     emitVideoProgress(id);
     state.__viralQueue!.add(id);
-  });
+  }
   schedule();
 }
 
-export function resumePendingVideos() {
+export async function resumePendingVideos() {
   const cutoff = new Date(Date.now() - VIDEO_TASK_TIMEOUT_MS).toISOString();
-  const staleIds = new Set(getStaleProcessingVideoIds(cutoff));
-  staleIds.forEach((id) => {
+  const staleIds = new Set(await getStaleProcessingVideoIds(cutoff));
+  for (const id of staleIds) {
     let message = VIDEO_TASK_TIMEOUT_MESSAGE;
     try {
-      cleanTimedOutVideo(id);
+      await cleanTimedOutVideo(id);
     } catch {
       message += "；部分缓存清理失败，请人工检查";
     }
     try {
-      updateVideo(id, {
+      await updateVideo(id, {
         status: "stopped",
         stage: "处理超时",
         progress: 0,
@@ -241,7 +241,7 @@ export function resumePendingVideos() {
       // Continue closing the durable attempt and the remaining stale tasks.
     }
     try {
-      finishOpenVideoAttempts(id, "stopped", message);
+      await finishOpenVideoAttempts(id, "stopped", message);
     } catch {
       // Startup must not fail because one historical attempt log is unavailable.
     }
@@ -250,18 +250,19 @@ export function resumePendingVideos() {
     } catch {
       // Progress delivery is best-effort.
     }
-  });
-  getPendingVideoIds().forEach((id) => {
+  }
+  const pending = await getPendingVideoIds();
+  pending.forEach((id) => {
     if (!staleIds.has(id) && !state.__viralQueueActiveIds!.has(id)) state.__viralQueue!.add(id);
   });
   schedule();
 }
 
-export function stopVideo(id: string) {
+export async function stopVideo(id: string) {
   const removedFromQueue = state.__viralQueue!.delete(id);
   const controller = state.__viralQueueControllers!.get(id);
   if (controller && !controller.signal.aborted) controller.abort(new Error("用户停止分析"));
-  updateVideo(id, { status: "stopped", stage: "已停止", error_message: null, processing_started_at: null });
+  await updateVideo(id, { status: "stopped", stage: "已停止", error_message: null, processing_started_at: null });
   emitVideoProgress(id);
   return Boolean(removedFromQueue || controller || state.__viralQueueActiveIds!.has(id));
 }

@@ -1,0 +1,38 @@
+name: Verify hand-card without deployment
+
+on:
+  push:
+    branches: ['codex/verify-handcard-*']
+    paths-ignore: ['**/*.md', 'ONLINE_BASELINE_MANIFEST.json']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: handcard-verification-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    if: startsWith(github.ref, 'refs/heads/codex/verify-handcard-')
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Build versioned Linux image
+        run: docker build --build-arg VCS_REF="$GITHUB_SHA" -t "viral-video-analyzer:$GITHUB_SHA" .
+
+      - name: Test deployment and verification guards offline
+        run: |
+          docker run --rm --network none --entrypoint node -v "$PWD/tests:/app/tests:ro" -v "$PWD/deploy:/app/deploy:ro" -v "$PWD/docker-compose.yml:/app/docker-compose.yml:ro" -v "$PWD/.github:/app/.github:ro" -v "$PWD/Dockerfile:/app/Dockerfile:ro" -v "$PWD/.dockerignore:/app/.dockerignore:ro" "viral-video-analyzer:$GITHUB_SHA" --test tests/deployment-config.test.mjs tests/openai-deploy-config.test.mjs tests/verification-workflow.test.mjs
+
+      - name: Test hand-card video regression offline
+        run: |
+          docker run --rm --network none --entrypoint node -v "$PWD/tests:/app/tests:ro" "viral-video-analyzer:$GITHUB_SHA" --test --test-concurrency=2 tests/qwen-full-video-input.test.mjs tests/qwen-transport.test.mjs tests/qwen-diagnostics-safety.test.mjs tests/analysis-qwen-local-retry.test.mjs tests/product-doc-sync-write-protection.test.mjs tests/video-queue-hard-timeout.test.mjs tests/transcript-validation.test.mjs tests/product-doc-analysis.test.mjs tests/feishu-parser-duplicates.test.mjs tests/video-processing-av-integrity.test.mjs
+
+      - name: Smoke test with an isolated empty MySQL
+        run: bash deploy/smoke-test.sh "viral-video-analyzer:$GITHUB_SHA"

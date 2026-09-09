@@ -3,6 +3,14 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import ts from "typescript";
 
+async function waitFor(check) {
+  for (let i = 0; i < 200; i += 1) {
+    if (check()) return;
+    await new Promise(resolve => setTimeout(resolve, 2));
+  }
+  throw new Error("expected task event did not arrive");
+}
+
 const source = await readFile(new URL("../lib/analysis.ts", import.meta.url), "utf8");
 
 async function loadAnalysis(hooks) {
@@ -13,15 +21,23 @@ async function loadAnalysis(hooks) {
     export const getVideo = (...args) => hooks().getVideo(...args);
     export const replaceScenes = (...args) => hooks().replaceScenes?.(...args);
     export const updateVideo = (...args) => hooks().updateVideo?.(...args);
-    export const updateVideoAttemptDiagnostics = (...args) => hooks().updateVideoAttemptDiagnostics?.(...args);
+    export const updateVideoAttemptDiagnostics = async (...args) => hooks().updateVideoAttemptDiagnostics?.(...args);
+    export const getPromptTemplate = async (_slug, _label, template) => ({ template });
+    export const savePromptDebugCapture = async () => {};
     export const clampScore = (value) => Number(value) || 0;
     export const formatTime = (value) => String(value);
     export const getLearningContext = () => null;
     export const learnFromVideo = (...args) => hooks().learnFromVideo?.(...args);
     export const getProviderConfig = () => ({ enabled: true, apiKey: "test-key" });
     export const analyzeVideoWithQwen = (...args) => hooks().analyzeVideoWithQwen(...args);
+    export class QwenRequestError extends Error {
+      name = "QwenRequestError";
+      constructor(code, retryable, message) { super(message); this.code = code; this.retryable = retryable; }
+    }
     export const translateTranscriptWithQwen = (...args) => hooks().translateTranscriptWithQwen?.(...args) || Promise.resolve("");
     export const fetchTikTok = (...args) => hooks().fetchTikTok?.(...args);
+    export const resolveTokScriptVideoUrl = async (url) => url;
+    export const downloadTikTokVideoWithYtDlp = () => { throw new Error("unexpected yt-dlp fallback"); };
     export const tokScriptTranscriptFailure = () => false;
     export const transcriptAndTranslationAgree = () => true;
     export const emitVideoProgress = (...args) => hooks().emitVideoProgress?.(...args);
@@ -31,7 +47,9 @@ async function loadAnalysis(hooks) {
     export const prepareLocalVideoForQwen = (...args) => hooks().prepareLocalVideoForQwen(...args);
     export const resolveMediaPath = (...args) => hooks().resolveMediaPath(...args);
     export const validateCompleteVideoForQwen = (...args) => hooks().validateCompleteVideoForQwen(...args);
-    export const syncCompletedVideoToProductDocument = (...args) => hooks().syncCompletedVideoToProductDocument?.(...args);
+    export const syncVideoToProductDocument = (...args) => hooks().syncVideoToProductDocument?.(...args);
+    export const deliverEarlyTranscript = async (...args) => hooks().deliverEarlyTranscript?.(...args);
+    export const enqueueVideos = (...args) => hooks().enqueueVideos?.(...args);
     export const completeFeishuAutomation = (...args) => hooks().completeFeishuAutomation?.(...args);
   `;
   const stubUrl = `data:text/javascript;base64,${Buffer.from(stubSource).toString("base64")}`;
@@ -46,7 +64,7 @@ async function loadAnalysis(hooks) {
 
 function qwenDiagnostic(requestIndex, inputSha256) {
   return {
-    model: "qwen3.5-omni-plus",
+    model: "qwen3.7-plus",
     inputBytes: 4_800_000,
     inputSha256,
     requestId: `provider-request-${requestIndex}`,
@@ -138,19 +156,20 @@ test("one attempt uses one local complete MP4, persists two Qwen calls, and neve
       const requestIndex = qwenInputs.length + 1;
       qwenInputs.push(input);
       if (requestIndex === 1) {
-        input.onDiagnostic({
+        await input.onDiagnostic({
           ...qwenDiagnostic(requestIndex, inputSha256),
           requestId: "",
           httpStatus: null,
           headersMs: null,
           firstTokenMs: null,
           outcome: "network_error",
+          errorCode: "ECONNRESET",
           responseSha256: "",
         });
         throw retryableQwenError();
       }
       if (requestIndex === 2) {
-        input.onDiagnostic(qwenDiagnostic(requestIndex, inputSha256));
+        await input.onDiagnostic(qwenDiagnostic(requestIndex, inputSha256));
         return {
           summary: "第二轮完整",
           language: "en",
@@ -186,6 +205,7 @@ test("one attempt uses one local complete MP4, persists two Qwen calls, and neve
 
   assert.equal(diagnosticSnapshots.length, 2);
   assert.deepEqual(diagnosticSnapshots[0].calls.map((call) => call.requestIndex), [1]);
+  assert.equal(diagnosticSnapshots[0].calls[0].errorCode, "ECONNRESET");
   assert.deepEqual(diagnosticSnapshots[1].calls.map((call) => call.requestIndex), [1, 2]);
   assert.ok(diagnosticSnapshots.every((snapshot) => snapshot.inputSha256 === inputSha256));
   assert.ok(diagnosticSnapshots.every((snapshot) => snapshot.inputMode === "local_base64"));
@@ -199,7 +219,7 @@ test("one attempt uses one local complete MP4, persists two Qwen calls, and neve
   assert.equal(patches.at(-1).status, "completed");
 });
 
-test("a structurally incomplete Qwen response fails without uploading the same video twice", async () => {
+test("a structurally incomplete Qwen response exhausts the single permitted retry", async () => {
   const videoId = "local-qwen-incomplete";
   const attemptNumber = 2;
   const patches = [];
@@ -251,17 +271,21 @@ test("a structurally incomplete Qwen response fails without uploading the same v
     }),
     analyzeVideoWithQwen: async () => {
       qwenCalls += 1;
-      return { summary: "只有摘要，结构不完整" };
+      return { summary: "只有摘要，结构不完整", strengths: [], viralPoints: [] };
     },
   });
 
-  await assert.rejects(
-    analysis.analyzeVideo(videoId, undefined, attemptNumber),
-    /Qwen 未返回完整的视频分析/,
-  );
-  assert.equal(qwenCalls, 1);
+  const priorRetryDelay = process.env.QWEN_RETRY_BASE_MS;
+  process.env.QWEN_RETRY_BASE_MS = "0";
+  try {
+    await assert.rejects(analysis.analyzeVideo(videoId, undefined, attemptNumber), /Qwen 未返回完整的视频分析/);
+  } finally {
+    if (priorRetryDelay === undefined) delete process.env.QWEN_RETRY_BASE_MS;
+    else process.env.QWEN_RETRY_BASE_MS = priorRetryDelay;
+  }
+  assert.equal(qwenCalls, 2);
   assert.equal(patches.at(-1).status, "failed");
-  assert.equal(patches.at(-1).error_message, "Qwen 未返回完整的视频分析，请重试该链接");
+  assert.equal(patches.at(-1).error_message, "Qwen 未返回完整的视频分析，请重试该链接，系统已自动重试一次");
 });
 
 test("a finalized TokScript tool error is not retried as a whole fetch", async () => {
@@ -343,4 +367,159 @@ test("a finalized TokScript tool error is not retried as a whole fetch", async (
     retryPatches.at(-1).error_message,
     "TokScript 前置调用失败（stage=connect; category=network_error）：服务网络异常",
   );
+});
+
+async function pipeline(overrides = {}) {
+  const video = {
+    id: "pipeline-test", productId: "product", sourceType: "tiktok",
+    sourceUrl: "https://www.tiktok.com/@demo/video/123", analysisMode: "product_doc",
+    originalPath: "pipeline-test/original.mp4", transcriptOriginal: "The TokScript original speech.",
+    transcriptZh: "", attemptCount: 1, status: "queued", title: "test",
+  };
+  const deliveries = [], enqueued = [], patches = [];
+  const analysisModule = await loadAnalysis({
+    getVideo: () => ({ ...video }),
+    getProduct: () => ({ id: "product", name: "产品", coreFunctions: [] }),
+    updateVideo: (_id, patch) => {
+      patches.push(patch);
+      const aliases = { transcript_zh: "transcriptZh", original_path: "originalPath", error_message: "errorMessage" };
+      for (const [key, value] of Object.entries(patch)) video[aliases[key] || key] = value;
+    },
+    prepareLocalVideoForQwen: async () => "pipeline-test/qwen-full-video.mp4",
+    resolveMediaPath: path => path,
+    validateCompleteVideoForQwen: async () => ({ duration: 8, videoCodec: "h264", audioCodec: "aac" }),
+    extractVideoAssets: async () => ({ duration: 8, scenes: [{ shotIndex: 1, startSeconds: 0, endSeconds: 8 }] }),
+    analyzeVideoWithQwen: async () => ({ summary: "视频结论", hook: { description: "展示产品" } }),
+    translateTranscriptWithQwen: async () => "TokScript 中文翻译",
+    syncVideoToProductDocument: async () => deliveries.push({ status: video.status, translation: video.transcriptZh }),
+    enqueueVideos: ids => enqueued.push(...ids),
+    ...overrides,
+  });
+  return { video, deliveries, enqueued, patches, run: signal => analysisModule.analyzeVideo(video.id, signal, video.attemptCount) };
+}
+
+test("the first execution stops after two video errors; a late single translation still delivers", async () => {
+  let calls = 0, translations = 0, finishTranslation;
+  const p = await pipeline({
+    analyzeVideoWithQwen: async () => { calls += 1; throw retryableQwenError(); },
+    translateTranscriptWithQwen: ({ transcript }) => {
+      assert.equal(transcript, "The TokScript original speech.");
+      translations += 1;
+      return new Promise(resolve => { finishTranslation = resolve; });
+    },
+  });
+  const prior = process.env.QWEN_RETRY_BASE_MS;
+  process.env.QWEN_RETRY_BASE_MS = "0";
+  try {
+    await assert.rejects(p.run(), /Qwen/);
+    await waitFor(() => translations === 1);
+    assert.equal(p.video.status, "failed");
+    finishTranslation("来自 TokScript 的迟到翻译");
+    await waitFor(() => p.deliveries.some(d => d.status === "failed" && d.translation === "来自 TokScript 的迟到翻译"));
+    await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(calls, 2);
+    assert.equal(translations, 1);
+    assert.deepEqual(p.enqueued, []);
+    assert.equal(p.video.originalPath, "pipeline-test/original.mp4");
+    assert.equal(p.video.status, "failed");
+  } finally {
+    if (prior === undefined) delete process.env.QWEN_RETRY_BASE_MS;
+    else process.env.QWEN_RETRY_BASE_MS = prior;
+  }
+});
+
+test("video success does not wait for translation or use a translation invented in video JSON", async () => {
+  let finishTranslation, translations = 0;
+  const p = await pipeline({
+    analyzeVideoWithQwen: async () => ({
+      summary: "视频结论", hook: { description: "产品演示" }, translationZh: "无口播",
+    }),
+    translateTranscriptWithQwen: () => {
+      translations += 1;
+      return new Promise(resolve => { finishTranslation = resolve; });
+    },
+  });
+  await p.run();
+  assert.equal(p.video.status, "completed");
+  assert.equal(p.video.transcriptZh, "");
+  assert.equal(JSON.parse(p.video.analysis_json).translationZh, "");
+  finishTranslation("真实原口播的翻译");
+  await waitFor(() => p.deliveries.some(d => d.status === "completed" && d.translation === "真实原口播的翻译"));
+  assert.equal(translations, 1);
+});
+
+test("text-translation failure cannot reject successful video analysis", async () => {
+  let translations = 0;
+  const p = await pipeline({ translateTranscriptWithQwen: async () => { translations += 1; throw new Error("text API unavailable"); } });
+  await p.run();
+  assert.equal(p.video.status, "completed");
+  assert.equal(translations, 1);
+  assert.equal(p.video.transcriptZh, "");
+});
+
+for (const reason of ["newer-attempt", "manual-text", "stop"]) {
+  test(`a late translation respects ${reason}`, async () => {
+    let finishTranslation;
+    const controller = new AbortController();
+    const p = await pipeline({ translateTranscriptWithQwen: () => new Promise(resolve => { finishTranslation = resolve; }) });
+    await p.run(controller.signal);
+    if (reason === "newer-attempt") p.video.attemptCount += 1;
+    if (reason === "manual-text") p.video.transcriptZh = "已保存的翻译";
+    if (reason === "stop") controller.abort(new Error("stopped"));
+    finishTranslation("旧任务翻译");
+    await new Promise(resolve => setTimeout(resolve, 15));
+    assert.notEqual(p.video.transcriptZh, "旧任务翻译");
+    if (reason === "manual-text") assert.equal(p.video.transcriptZh, "已保存的翻译");
+  });
+}
+
+test("a permanent video rejection is not retried and does not falsely claim a retry", async () => {
+  let calls = 0;
+  const p = await pipeline({ analyzeVideoWithQwen: async () => {
+    calls += 1;
+    const error = retryableQwenError("Qwen 完整视频请求失败（HTTP 400）");
+    error.retryable = false;
+    throw error;
+  } });
+  await assert.rejects(p.run(), /HTTP 400/);
+  assert.equal(calls, 1);
+  assert.doesNotMatch(p.video.errorMessage, /已自动重试/);
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.deepEqual(p.enqueued, []);
+});
+
+test("transcript-only completion shares the one early translation and never calls video analysis", async () => {
+  let translations = 0;
+  const p = await pipeline({
+    analyzeVideoWithQwen: () => { throw new Error("must not analyze video"); },
+    translateTranscriptWithQwen: async () => { translations += 1; return "纯翻译"; },
+  });
+  p.video.analysisMode = "transcript_only";
+  await p.run();
+  assert.equal(p.video.status, "completed");
+  assert.equal(p.video.transcriptZh, "纯翻译");
+  assert.equal(translations, 1);
+});
+
+test("an existing TokScript Chinese transcript needs no text-model request", async () => {
+  let translations = 0;
+  const p = await pipeline({ translateTranscriptWithQwen: async () => { translations += 1; return "unwanted"; } });
+  p.video.transcriptZh = "TokScript 已返回中文版";
+  await p.run();
+  assert.equal(translations, 0);
+  assert.equal(p.video.transcriptZh, "TokScript 已返回中文版");
+});
+
+test("stopping the first video request cannot start the second request", async () => {
+  const controller = new AbortController();
+  let calls = 0;
+  const p = await pipeline({ analyzeVideoWithQwen: async () => {
+    calls += 1;
+    controller.abort(new Error("user stopped"));
+    throw retryableQwenError();
+  } });
+  await assert.rejects(p.run(controller.signal));
+  assert.equal(calls, 1);
+  assert.equal(p.video.status, "stopped");
+  assert.deepEqual(p.enqueued, []);
 });

@@ -1,7 +1,7 @@
 import "server-only";
 
-import { createReadStream, statSync } from "node:fs";
 import type { Client } from "@larksuiteoapi/node-sdk";
+import { uploadFeishuMedia } from "@/lib/feishu/media-upload";
 
 type DocxBlock = {
   block_id?: string;
@@ -28,42 +28,12 @@ function descendants(rootId: string, blocks: DocxBlock[]) {
 }
 
 async function uploadFile(client: Client, fileBlockId: string, absolutePath: string, fileName: string) {
-  const size = statSync(absolutePath).size;
-  if (size <= 20 * 1024 * 1024) {
-    const uploaded = await client.drive.v1.media.uploadAll({ data: {
-      file_name: fileName,
-      parent_type: "docx_file",
-      parent_node: fileBlockId,
-      size,
-      file: createReadStream(absolutePath),
-    } });
-    if (!uploaded?.file_token) throw new Error("飞书没有返回视频文件 Token");
-    return uploaded.file_token;
-  }
-
-  const prepared = await client.drive.v1.media.uploadPrepare({ data: {
-    file_name: fileName,
-    parent_type: "docx_file",
-    parent_node: fileBlockId,
-    size,
-  } });
-  const { upload_id: uploadId, block_size: blockSize, block_num: blockCount } = prepared.data || {};
-  if (!uploadId || !blockSize || !blockCount) throw new Error("飞书没有返回视频分片策略");
-  for (let seq = 0; seq < blockCount; seq += 1) {
-    const start = seq * blockSize;
-    const partSize = Math.min(blockSize, size - start);
-    await client.drive.v1.media.uploadPart({ data: {
-      upload_id: uploadId,
-      seq,
-      size: partSize,
-      file: createReadStream(absolutePath, { start, end: start + partSize - 1 }),
-    } });
-  }
-  const finished = await client.drive.v1.media.uploadFinish({
-    data: { upload_id: uploadId, block_num: blockCount },
+  return uploadFeishuMedia(client, {
+    parentType: "docx_file",
+    parentNode: fileBlockId,
+    absolutePath,
+    fileName,
   });
-  if (!finished.data?.file_token) throw new Error("飞书没有完成视频分片上传");
-  return finished.data.file_token;
 }
 
 async function deleteChild(client: Client, documentId: string, parentBlockId: string, childBlockId: string) {

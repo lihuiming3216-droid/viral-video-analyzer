@@ -11,7 +11,7 @@ export async function register() {
     import("@/lib/feishu/product-doc-sync"),
     import("@/lib/feishu/automation"),
   ]);
-  resumePendingVideos();
+  void resumePendingVideos().catch(() => undefined);
   startProductDocumentSyncWorker();
   startFeishuAutomationDeliveryWorker();
   void ensureFeishuConnection().catch(() => undefined);

@@ -835,7 +835,8 @@ function productAnalysisPolicy() {
     "页面文字直接支持的事实标 verified_text，并给出逐字证据。只有图片清单明确附带独立 ocrText 时，才可把其中逐字命中的文字标为 verified_image_ocr。",
     "verified_text 必须使用简短单事实受控表达，例如“支持夜视”“双向语音通话”“通过应用查看访客”“安装后使用”“宠物用户”“适合户外使用”；不要创造新的中文谓词或对象。",
     "没有独立 ocrText 的图片内容（包括你读到的图片文字）必须标 ai_inference，不能由模型自己证明为已核实。",
-    "ai_inference 只能逐字选择数据中 allowedAiInferenceTemplates 对应字段列出的固定中文模板；没有适用模板时不要自由改写或补充。有主体图片时引用 visual_observation；没有主体图片时必须引用同 PID 商品详情文字的逐字证据。",
+    "ai_inference 允许基于证据自行归纳总结中文表达，不再局限于逐字套用 referenceInferenceTemplates 里的固定模板（那份列表仅供参考、不是必须遵守的清单）；但归纳内容绝不能超出证据实际表达的信息，不能补写证据里没有的内容。有主体图片时引用 visual_observation；没有主体图片时必须引用同 PID 商品详情文字的逐字证据，且这条证据要能让人看出结论是怎么从原文推出来的。",
+    "分析图片得出“适用人群”“使用场景”时，不要只满足于识别画面里的物体本身；要主动解读画面传达的风格、色调、光线氛围、场景布置、搭配道具、包装或摆拍方式等视觉线索（例如温馨暖光的卧室布景、礼盒包装、极简北欧风摆拍、多人使用的家庭场景），归纳出比“XX用户”更具体的人群画像或使用情境。归纳内容仍必须能让人一眼看出是从画面里哪些具体元素推出来的，不能脱离画面内容凭空发挥或加入画面没有的信息。",
     "AI推断绝对不能包含材质、尺寸、重量、功率、电压、容量、续航、防水、防火、认证、兼容型号、性能数值等硬事实。",
     "不得引用推荐商品、评论、店铺宣传或相似商品。每条只表达一个事实，中文简洁，不写营销夸张词。",
     "evidenceRefs.sourceId 必须使用数据中列出的 fragment/image id，或 product-name-hint；视觉观察的 exactQuote 可为空。",
@@ -873,7 +874,7 @@ function captureDataForModel(input: OpenAIProductCaptureInput) {
     },
     fragments,
     images: imageManifest,
-    allowedAiInferenceTemplates: controlledInferenceTemplates(input),
+    referenceInferenceTemplates: controlledInferenceTemplates(input),
     requiredEcho: [
     `必须原样回传 captureId=${input.captureId}、pid=${input.pid}、sourceDigest=${input.sourceDigest}。`,
     ],
@@ -1276,19 +1277,21 @@ function directFactValidation(
     return { supported: false, unsafe: true };
   }
 
-  const semanticRules = SEMANTIC_EVIDENCE_RULES.filter((rule) => rule.zh.test(valueZh));
-  const hardRules = HARD_EVIDENCE_RULES.filter((rule) => rule.zh.test(valueZh));
-  const directRiskRules = DIRECT_RISK_EVIDENCE_RULES.filter((rule) => rule.zh.test(valueZh));
-  if (!semanticRules.length && !hardRules.length) return { supported: false, unsafe: false };
+  // No longer requires valueZh to match one of a narrow, category-specific
+  // English→Chinese term whitelist (SEMANTIC_EVIDENCE_RULES/HARD_EVIDENCE_RULES/
+  // DIRECT_RISK_EVIDENCE_RULES) — that whitelist was tuned against cameras/
+  // doorbells/monitors and routinely rejected perfectly real, evidenced facts
+  // for other categories (chargers, cosmetics, small appliances). What
+  // actually establishes support is category-agnostic and stays: the quote
+  // must read as an affirmative statement about *this* product (not a
+  // question, a comparison, or a prompt-injection attempt), the claim's verb
+  // must correspond to a real verb in the source, and any number in the claim
+  // must be traceable to the same number in the source.
   const hasNumbers = /\d/.test(valueZh);
   const supported = contexts.some(({ context, reference }) => {
     const candidates = hasNumbers ? atomicEvidenceClauses(context) : [context];
     return candidates.some((candidate) => (
       contextIsAffirmativeProductAssertion(candidate, field, reference, input, valueZh)
-      &&
-      semanticRules.every((rule) => rule.source.test(candidate))
-      && hardRules.every((rule) => rule.source.test(candidate))
-      && directRiskRules.every((rule) => rule.source.test(candidate))
       && directPredicatesBoundInContext(valueZh, candidate, field)
       && numericFactsBoundInContext(valueZh, candidate)
       && numericPredicateBoundInContext(valueZh, candidate)
@@ -1297,54 +1300,6 @@ function directFactValidation(
   return { supported, unsafe: !supported && /\d/.test(valueZh) };
 }
 
-function safeInferenceShape(
-  field: ProductAnalysisField,
-  valueZh: string,
-  input: OpenAIProductCaptureInput,
-) {
-  const compact = clean(valueZh, 120).replace(/\s+/g, "");
-  if (!compact) return false;
-  // The accepted string must equal a server-authored template for the single
-  // resolved product subject. Unlike free model text, these templates are the
-  // policy itself; running a broad keyword deny-list over them would reject
-  // legitimate templates such as “连接设备后充电” while adding no safety.
-  return controlledInferenceTemplates(input)[field].includes(clean(valueZh, 120));
-}
-
-function directFactUsesOnlyMappedLanguage(valueZh: string) {
-  let residue = clean(valueZh, 120).normalize("NFKC");
-  const mapped = [
-    ...SEMANTIC_EVIDENCE_RULES,
-    ...HARD_EVIDENCE_RULES,
-    ...DIRECT_RISK_EVIDENCE_RULES,
-  ];
-  for (const rule of mapped) residue = residue.replace(new RegExp(rule.zh.source, rule.zh.flags.includes("g") ? rule.zh.flags : `${rule.zh.flags}g`), "");
-  residue = residue
-    .replace(/\d+(?:\.\d+)?/g, "")
-    .replace(/(?:小时|分钟|天|周|月|年|档|级|件|个|片|英寸|毫米|厘米|米|克|公斤|伏|瓦|毫安时|mAh|Hz|GHz|MP|IPX?)/gi, "")
-    .replace(/(?:支持|提供|具备|具有|用于|适合|需要|可|通过|使用|进行|实现|辅助|用户|人群|人士|主人|家长|父母|场景|功能|模式|设备|产品|商品|后|前|的|为|在|与|及)/g, "")
-    .replace(/[\p{P}\p{S}\p{Z}\s]/gu, "");
-  return !/[\p{L}\p{N}]/u.test(residue);
-}
-
-/**
- * Direct evidence also uses a closed Chinese claim grammar. English evidence
- * rules prove the slots inside these shapes; they never authorize a free-form
- * predicate or object merely because one mapped noun appears nearby.
- */
-function directFactShapeAllowed(field: ProductAnalysisField, valueZh: string) {
-  const compact = clean(valueZh, 120).replace(/\s+/g, "");
-  if (field === "coreFunctions") {
-    return /^(?:支持|提供|具备|具有|可)?(?:(?:无需|免)(?:付费|订阅)|无(?:月费|订阅费)|夜视|夜间查看|双向(?:语音|通话|音频)(?:通话)?|(?:AI|智能)(?:(?:人物|宠物|哭声))?检测|实时查看|远程查看|宠物看护|防水|防火|阻燃|抗菌|抑菌|防震|抗摔|高清|超清|快充)$/i.test(compact);
-  }
-  if (field === "usageMethod") {
-    return /^(?:通过(?:应用|App|手机)(?:远程)?查看(?:门外)?访客|(?:安装|固定|装入|套入)后使用|使用前充电\d+(?:\.\d+)?小时|充电\d+(?:\.\d+)?小时后使用|(?:点击|按下)(?:按钮)?(?:查看访客|进行双向通话|双向通话|通话|启动|关闭)|(?:清洁|清洗|冲洗)后使用)$/i.test(compact);
-  }
-  if (field === "audience") {
-    return /^(?:适合)?(?:(?:家庭|宠物|儿童|婴幼儿|手机|办公)用户|宠物主人|婴幼儿父母|家庭用户)$/i.test(compact);
-  }
-  return /^(?:适合)?(?:家庭|住宅|居家|室内|户外|室外|旅行|出行|办公室|办公|住宅门口)(?:使用|监控|查看)?(?:场景)?$/i.test(compact);
-}
 
 function isAtomicCardFact(valueZh: string) {
   // The model has an array for multiple facts. Reject conjunctive/compound
@@ -1394,8 +1349,6 @@ function validatedFact(
   const basis = raw?.basis;
   if (!valueZh || !isAtomicCardFact(valueZh)
     || !["verified_text", "verified_image_ocr", "ai_inference"].includes(basis)) return null;
-  if (basis === "ai_inference"
-    && !safeInferenceShape(field, valueZh, input)) return null;
   const evidenceRefs = (Array.isArray(raw.evidenceRefs) ? raw.evidenceRefs : [])
     .map((reference) => ({
       sourceType: reference?.sourceType,
@@ -1414,7 +1367,6 @@ function validatedFact(
   const hasCaptureEvidence = evidenceRefs.some((reference) => reference.sourceType !== "product_name_hint");
   if (!hasCaptureEvidence) return null;
   if (basis !== "ai_inference") {
-    if (!directFactUsesOnlyMappedLanguage(valueZh) || !directFactShapeAllowed(field, valueZh)) return null;
     const direct = directFactValidation(valueZh, evidenceRefs, input, field);
     if (!direct.supported) {
       // A model cannot turn an unrelated text quote into a safe inference.
@@ -1490,13 +1442,15 @@ function validateModelResult(raw: ModelProductAnalysis, input: OpenAIProductCapt
     const fallback = facts.length ? null : controlledTextFallbackFact(input, field);
     if (fallback) facts.push(fallback);
     const unique = [...new Map(facts.map((fact) => [fact.valueZh.normalize("NFKC").toLowerCase(), fact])).values()];
+    // A field with nothing that survives grounding is left empty rather than
+    // failing the whole capture — the strict per-fact whitelist (see
+    // directFactShapeAllowed above) was tuned against a handful of product
+    // categories and routinely has nothing to offer for others, even when the
+    // page had perfectly usable content for the *other* three fields.
     result[field] = { facts: unique.slice(0, field === "coreFunctions" ? 5 : 4) };
-    if (!result[field].facts.length) {
-      throw new OpenAIProductAnalysisError(
-        "insufficient_safe_facts",
-        `OpenAI 没有为${field === "coreFunctions" ? "产品主要功能" : field === "usageMethod" ? "使用方法" : field === "audience" ? "适用人群" : "使用场景"}返回安全可用的信息`,
-      );
-    }
+  }
+  if (PRODUCT_ANALYSIS_FIELDS.every((field) => !result[field].facts.length)) {
+    throw new OpenAIProductAnalysisError("insufficient_safe_facts", "OpenAI 没有返回任何安全可用的商品信息");
   }
   return result;
 }

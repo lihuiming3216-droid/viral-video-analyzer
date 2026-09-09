@@ -1,7 +1,7 @@
 import "server-only";
 
 import { execFile } from "node:child_process";
-import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statfsSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -121,6 +121,36 @@ export async function downloadMedia(
     rmSync(target, { force: true });
     throw normalizedDownloadError(error, kind, timeoutSignal, signal);
   }
+  return relative;
+}
+
+/**
+ * Fallback used only when TokScript's own download tool fails (its backend
+ * yt-dlp predates the 2026.08.19 fix for TikTok's anti-bot challenge —
+ * yt-dlp/yt-dlp#17403 — while its transcript tool is unaffected). Downloads
+ * directly from the source URL with our own pinned, working yt-dlp binary,
+ * writing to the exact same path convention as downloadMedia() so nothing
+ * downstream needs to know which path produced the file.
+ */
+export async function downloadTikTokVideoWithYtDlp(videoId: string, url: string, signal?: AbortSignal) {
+  const relative = path.join(videoId, "original.mp4");
+  const target = resolveMediaPath(relative);
+  mkdirSync(path.dirname(target), { recursive: true });
+  const timeoutSignal = AbortSignal.timeout(180_000);
+  const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+  try {
+    await runFile("yt-dlp", [
+      "--no-playlist",
+      "-f", "mp4/bestvideo+bestaudio/best",
+      "--merge-output-format", "mp4",
+      "-o", target,
+      url,
+    ], { signal: requestSignal, maxBuffer: 4 * 1024 * 1024 });
+  } catch (error) {
+    rmSync(target, { force: true });
+    throw normalizedDownloadError(error, "video", timeoutSignal, signal);
+  }
+  if (!existsSync(target)) throw new Error("yt-dlp 未生成视频文件");
   return relative;
 }
 
@@ -377,6 +407,33 @@ export function deleteVideoAttemptCache(videoId: string, preservedOriginalPath?:
     const child = path.join(target, entry);
     if (child === preserved) continue;
     rmSync(child, { recursive: true, force: true });
+  }
+}
+
+/** Recursively sums file sizes under the media root, for the ops console's disk-usage widget. */
+export function getMediaUsageBytes() {
+  const root = getMediaRoot();
+  let total = 0;
+  const walk = (dir: string) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.isFile()) total += statSync(full).size;
+    }
+  };
+  walk(root);
+  return total;
+}
+
+/** Whole-volume disk usage for the drive holding the media root (not just media size). */
+export function getDiskUsage() {
+  try {
+    const stats = statfsSync(getMediaRoot());
+    const totalBytes = stats.blocks * stats.bsize;
+    const freeBytes = stats.bfree * stats.bsize;
+    return { totalBytes, freeBytes, usedBytes: totalBytes - freeBytes };
+  } catch {
+    return null;
   }
 }
 

@@ -28,6 +28,14 @@ export type VideoAttemptCallOutcome =
   | "network_error"
   | "invalid_response";
 
+// Only these fixed codes may be persisted. Never store free-form error causes.
+export const QWEN_TRANSPORT_ERROR_CODES = [
+  "REQUEST_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT",
+  "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_SOCKET", "ECONNRESET", "ETIMEDOUT",
+  "ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "ABORT_ERR",
+] as const;
+export type QwenTransportErrorCode = typeof QWEN_TRANSPORT_ERROR_CODES[number];
+
 /** Sanitized provider telemetry for one request. Free-form provider content,
  * prompts, credentials and media locations deliberately have no field here. */
 export interface VideoAttemptCallDiagnostic {
@@ -42,6 +50,7 @@ export interface VideoAttemptCallDiagnostic {
   totalMs: number;
   httpStatus?: number;
   responseSha256?: string;
+  errorCode?: QwenTransportErrorCode;
 }
 
 /** Durable, size-bounded diagnostics for one video execution attempt. */
@@ -193,11 +202,12 @@ export interface VideoRecord {
   statsCapturedAt: string | null;
   transcriptOriginal: string;
   transcriptZh: string;
+  transcriptSegments: Array<{ start: number; end: number; text: string }>;
   analysis: AnalysisResult | null;
   createdAt: string;
   updatedAt: string;
   scenes?: SceneRecord[];
-  analysisMode: "full" | "product_doc";
+  analysisMode: "full" | "product_doc" | "transcript_only";
   /** Legacy retry counter retained for existing databases; automatic retries are disabled. */
   productDocRetryCount: number;
   /** Whether the terminal product-document failure was delivered to Feishu. */

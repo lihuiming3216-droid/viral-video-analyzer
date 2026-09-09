@@ -4,8 +4,8 @@ import { decryptSecret } from "@/lib/crypto";
 import { getRawProviderSetting } from "@/lib/database";
 import type { ProviderName } from "@/lib/types";
 
-export function getProviderConfig(provider: ProviderName) {
-  const row = getRawProviderSetting(provider);
+export async function getProviderConfig(provider: ProviderName) {
+  const row = await getRawProviderSetting(provider);
   if (!row) throw new Error(`没有找到 ${provider} 配置`);
   return {
     provider,
@@ -16,8 +16,8 @@ export function getProviderConfig(provider: ProviderName) {
   };
 }
 
-export function requireProvider(provider: ProviderName) {
-  const config = getProviderConfig(provider);
+export async function requireProvider(provider: ProviderName) {
+  const config = await getProviderConfig(provider);
   if (!config.enabled) throw new Error(`${provider} 已停用`);
   if (!config.apiKey) throw new Error(`请先在设置页配置 ${provider} API Key`);
   return config;

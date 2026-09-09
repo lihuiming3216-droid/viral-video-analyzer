@@ -10,15 +10,15 @@ export const runtime = "nodejs";
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const video = getVideo(String(body.videoId || ""), false);
+    const video = await getVideo(String(body.videoId || ""), false);
     if (!video) return NextResponse.json({ error: "视频不存在" }, { status: 404 });
     if (video.status !== "completed") return NextResponse.json({ error: "视频分析完成后才能发送到飞书" }, { status: 409 });
-    const target = getFeishuTarget(String(body.targetId || ""));
+    const target = await getFeishuTarget(String(body.targetId || ""));
     if (!target) return NextResponse.json({ error: "请选择一个已经和机器人产生过会话的人或群" }, { status: 400 });
     const channel = await ensureFeishuConnection();
     if (!channel) return NextResponse.json({ error: "飞书机器人尚未连接" }, { status: 409 });
-    const product = getProduct(video.productId);
-    const delivery = createFeishuDelivery({
+    const product = await getProduct(video.productId);
+    const delivery = await createFeishuDelivery({
       videoId: video.id,
       chatId: target.targetId,
       chatType: target.targetType,
@@ -30,8 +30,8 @@ export async function POST(request: NextRequest) {
       pid: product?.pid || "",
       items: [{ ...video, status: "analyzing", stage: "正在生成并归档飞书文档", progress: 96 }],
     }) });
-    updateFeishuDelivery(delivery.id, { cardMessageId: sent.messageId, status: "documenting" });
-    upsertFeishuTarget({
+    await updateFeishuDelivery(delivery.id, { cardMessageId: sent.messageId, status: "documenting" });
+    await upsertFeishuTarget({
       targetId: target.targetId,
       targetType: target.targetType,
       name: target.name,

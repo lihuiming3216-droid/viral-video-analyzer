@@ -537,7 +537,13 @@ function isOfficialTikTokHttpsUrl(value: string) {
 function isCanonicalTikTokVideoUrl(value: string) {
   if (!isOfficialTikTokHttpsUrl(value)) return false;
   try {
-    return /^\/@[^/]+\/video\/\d+\/?$/.test(new URL(value).pathname);
+    // TikTok's own short-link redirect (/t/xxxx) now sometimes lands on
+    // "/@/video/123..." with an empty username segment instead of
+    // "/@handle/video/123...". Confirmed live: that URL still returns a real
+    // 200 video page (video id is what actually resolves it) — a strict
+    // "username required" regex here just misclassified a valid resolution
+    // as a failure, so the username segment is optional ([^/]*, not [^/]+).
+    return /^\/@[^/]*\/video\/\d+\/?$/.test(new URL(value).pathname);
   } catch {
     return false;
   }
@@ -587,10 +593,22 @@ export async function resolveTokScriptVideoUrl(
         const next = new URL(location, current);
         if (!isOfficialTikTokHttpsUrl(next.toString())) break;
         current = next;
-        if (isCanonicalTikTokVideoUrl(current.toString())) return current.toString();
         continue;
       }
-      if (response.ok && isCanonicalTikTokVideoUrl(current.toString())) return current.toString();
+      if (response.ok && isCanonicalTikTokVideoUrl(current.toString())) {
+        // TikTok's short-link redirect can land on "/@/video/id" with the
+        // username omitted (confirmed live). That shape passes the relaxed
+        // canonical check above, but TokScript's own scraper needs the real
+        // handle — verified live: the same video id 400s as
+        // "extraction_failed" with the username missing, and succeeds once
+        // it's filled in. The page's own embedded JSON always carries it.
+        if (!/^\/@[^/]+\//.test(current.pathname)) {
+          const html = await response.text();
+          const uniqueId = /"uniqueId":"([^"]+)"/.exec(html)?.[1];
+          if (uniqueId) current.pathname = current.pathname.replace(/^\/@[^/]*\//, `/@${uniqueId}/`);
+        }
+        return current.toString();
+      }
       break;
     } finally {
       await response.body?.cancel().catch(() => undefined);
@@ -608,7 +626,7 @@ export function tokScriptTranscriptFailure(value: string) {
 }
 
 export async function testTokScriptConnection() {
-  const config = requireProvider("tokscript");
+  const config = await requireProvider("tokscript");
   const client = new TokScriptClient(config.baseUrl, config.apiKey);
   await client.connect();
   const tools = await client.listTools();
@@ -620,7 +638,7 @@ export async function fetchTikTok(
   signal?: AbortSignal,
   options: { includeCover?: boolean; timeoutMs?: number } = {},
 ): Promise<TokScriptResult> {
-  const config = requireProvider("tokscript");
+  const config = await requireProvider("tokscript");
   const timeoutSignal = AbortSignal.timeout(Math.max(15_000, options.timeoutMs || 180_000));
   const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
   const client = new TokScriptClient(config.baseUrl, config.apiKey, requestSignal);
@@ -644,17 +662,10 @@ export async function fetchTikTok(
     if (!transcriptTool || !downloadTool) {
       throw new Error("TokScript 当前账号没有返回转写或下载工具，请检查套餐权限");
     }
-    // Obtain both outputs from TokScript. TikTok-link jobs never re-transcribe
-    // the downloaded media with another provider.
-    const downloadRaw = await callTokScriptToolWithOneRetry({
-      client,
-      tool: downloadTool,
-      url: resolvedUrl,
-      stage: "download",
-      parse: parseToolPayload,
-      requestSignal,
-      userSignal: signal,
-    });
+    // Transcript must succeed — it's the one thing this call can never do
+    // without. Fetch it first so a download-stage failure (see the local
+    // yt-dlp fallback in lib/video-processing.ts) never costs us a transcript
+    // we'd otherwise already have.
     const parsedTranscript = await callTokScriptToolWithOneRetry({
       client,
       tool: transcriptTool,
@@ -665,17 +676,44 @@ export async function fetchTikTok(
       userSignal: signal,
     });
     const transcriptRaw = parsedTranscript.payload;
-    const coverRaw = options.includeCover !== false && coverTool && !timeoutSignal.aborted
-      ? await callTokScriptToolWithOneRetry({
+    // A failed download here is not fatal to this function — it just leaves
+    // downloadUrl empty, and the caller falls back to local yt-dlp.
+    let downloadRaw: Record<string, unknown> = {};
+    try {
+      downloadRaw = await callTokScriptToolWithOneRetry({
         client,
-        tool: coverTool,
+        tool: downloadTool,
         url: resolvedUrl,
-        stage: "cover",
+        stage: "download",
         parse: parseToolPayload,
         requestSignal,
         userSignal: signal,
-      })
-      : null;
+      });
+    } catch (error) {
+      if (signal?.aborted) throw error;
+    }
+    // A failed cover fetch is not fatal either — same tolerance as the
+    // download above, and for the same reason: it would otherwise discard an
+    // already-successful transcript over a thumbnail image, the least
+    // important of the three tool calls this function makes. Confirmed live:
+    // a real transcript_only task failed whole with "stage=cover" even
+    // though its transcript had already come back fine.
+    let coverRaw: Record<string, unknown> | null = null;
+    if (options.includeCover !== false && coverTool && !timeoutSignal.aborted) {
+      try {
+        coverRaw = await callTokScriptToolWithOneRetry({
+          client,
+          tool: coverTool,
+          url: resolvedUrl,
+          stage: "cover",
+          parse: parseToolPayload,
+          requestSignal,
+          userSignal: signal,
+        });
+      } catch (error) {
+        if (signal?.aborted) throw error;
+      }
+    }
     const segments = normalizeSegments(transcriptRaw);
     const transcript = explicitTranscript(transcriptRaw)
       || labelledPlainTextTranscript(parsedTranscript.plainText)
@@ -723,7 +761,7 @@ export async function fetchTikTok(
   }
 }
 
-export function tokScriptIsConfigured() {
-  const config = getProviderConfig("tokscript");
+export async function tokScriptIsConfigured() {
+  const config = await getProviderConfig("tokscript");
   return config.enabled && Boolean(config.apiKey);
 }

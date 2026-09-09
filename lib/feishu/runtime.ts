@@ -17,8 +17,8 @@ state.__feishuChannel ||= null;
 state.__feishuSignature ||= "";
 state.__feishuConnectPromise ||= null;
 
-function credentials() {
-  const raw = getRawFeishuSettings();
+async function credentials() {
+  const raw = await getRawFeishuSettings();
   return {
     appId: String(raw.app_id || ""),
     appSecret: decryptSecret(raw.encrypted_app_secret ? String(raw.encrypted_app_secret) : ""),
@@ -38,10 +38,10 @@ async function disconnectCurrent() {
 }
 
 export async function ensureFeishuConnection(force = false): Promise<LarkChannel | null> {
-  const config = credentials();
+  const config = await credentials();
   if (!config.enabled || !config.appId || !config.appSecret) {
     if (state.__feishuChannel) await disconnectCurrent();
-    setFeishuConnectionStatus("disconnected", "");
+    await setFeishuConnectionStatus("disconnected", "");
     return null;
   }
   const nextSignature = signature(config.appId, config.appSecret);
@@ -50,7 +50,7 @@ export async function ensureFeishuConnection(force = false): Promise<LarkChannel
 
   const connectPromise = (async () => {
     await disconnectCurrent();
-    setFeishuConnectionStatus("connecting", "");
+    await setFeishuConnectionStatus("connecting", "");
     const channel = createLarkChannel({
       appId: config.appId,
       appSecret: config.appSecret,
@@ -76,19 +76,19 @@ export async function ensureFeishuConnection(force = false): Promise<LarkChannel
       },
     });
     registerFeishuHandlers(channel);
-    channel.on("reconnecting", () => setFeishuConnectionStatus("reconnecting", "连接中断，正在自动恢复"));
-    channel.on("reconnected", () => setFeishuConnectionStatus("connected", ""));
-    channel.on("error", (error) => setFeishuConnectionStatus("failed", error.message));
+    channel.on("reconnecting", () => void setFeishuConnectionStatus("reconnecting", "连接中断，正在自动恢复").catch(() => undefined));
+    channel.on("reconnected", () => void setFeishuConnectionStatus("connected", "").catch(() => undefined));
+    channel.on("error", (error) => void setFeishuConnectionStatus("failed", error.message).catch(() => undefined));
     try {
       await channel.connect();
       state.__feishuChannel = channel;
       state.__feishuSignature = nextSignature;
-      setFeishuConnectionStatus("connected", "");
+      await setFeishuConnectionStatus("connected", "");
       return channel;
     } catch (error) {
       await channel.disconnect().catch(() => undefined);
       const message = error instanceof Error ? error.message : "飞书连接失败";
-      setFeishuConnectionStatus("failed", message);
+      await setFeishuConnectionStatus("failed", message);
       throw new Error(message);
     }
   })();
@@ -110,11 +110,11 @@ export function getConnectedFeishuChannel() {
 
 export async function stopFeishuConnection() {
   await disconnectCurrent();
-  setFeishuConnectionStatus("disconnected", "");
+  await setFeishuConnectionStatus("disconnected", "");
 }
 
-export function getFeishuRuntimeStatus() {
-  const saved = getFeishuSettings();
+export async function getFeishuRuntimeStatus() {
+  const saved = await getFeishuSettings();
   const live = state.__feishuChannel?.getConnectionStatus();
   if (!live) return saved;
   return { ...saved, connectionStatus: live.state };

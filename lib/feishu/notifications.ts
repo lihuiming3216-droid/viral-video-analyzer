@@ -18,12 +18,13 @@ type NotificationGlobal = typeof globalThis & { __feishuDeliveryLocks?: Set<stri
 const state = globalThis as NotificationGlobal;
 state.__feishuDeliveryLocks ||= new Set<string>();
 
-function localReportUrl(videoId: string) {
-  return `${getFeishuSettings().publicBaseUrl.replace(/\/+$/, "")}/?video=${encodeURIComponent(videoId)}`;
+async function localReportUrl(videoId: string) {
+  const settings = await getFeishuSettings();
+  return `${settings.publicBaseUrl.replace(/\/+$/, "")}/?video=${encodeURIComponent(videoId)}`;
 }
 
-function deliveryItem(delivery: FeishuDelivery) {
-  const video = getVideo(delivery.videoId, false);
+async function deliveryItem(delivery: FeishuDelivery) {
+  const video = await getVideo(delivery.videoId, false);
   if (!video) return null;
   return {
     ...video,
@@ -34,11 +35,11 @@ function deliveryItem(delivery: FeishuDelivery) {
 
 export async function updateFeishuBatchCard(batchId: string, channel = getConnectedFeishuChannel()) {
   if (!channel) return;
-  const batch = refreshFeishuBatchStats(batchId);
+  const batch = await refreshFeishuBatchStats(batchId);
   if (!batch?.progressMessageId) return;
-  const deliveries = listFeishuBatchDeliveries(batchId);
-  const items = deliveries.map(deliveryItem).filter(Boolean) as Array<VideoRecord & { documentUrl?: string | null }>;
-  const product = items[0] ? getProduct(items[0].productId) : null;
+  const deliveries = await listFeishuBatchDeliveries(batchId);
+  const items = (await Promise.all(deliveries.map(deliveryItem))).filter(Boolean) as Array<VideoRecord & { documentUrl?: string | null }>;
+  const product = items[0] ? await getProduct(items[0].productId) : null;
   await channel.updateCard(batch.progressMessageId, buildProgressCard({
     productName: product?.name || items[0]?.productName || "待识别产品",
     pid: product?.pid || "",
@@ -50,11 +51,11 @@ export async function updateFeishuBatchCard(batchId: string, channel = getConnec
 async function sendOrUpdateResult(channel: LarkChannel, delivery: FeishuDelivery, video: VideoRecord, documentUrl: string, historical = false) {
   const card = buildResultCard(video, {
     documentUrl,
-    localReportUrl: localReportUrl(video.id),
+    localReportUrl: await localReportUrl(video.id),
     senderOpenId: delivery.senderOpenId,
     historical,
   });
-  const batch = delivery.batchId ? getFeishuBatch(delivery.batchId) : null;
+  const batch = delivery.batchId ? await getFeishuBatch(delivery.batchId) : null;
   const canReplaceProgress = Boolean(delivery.cardMessageId && (!batch || batch.total === 1));
   if (canReplaceProgress) {
     await channel.updateCard(delivery.cardMessageId!, card);
@@ -71,12 +72,12 @@ export async function deliverCompletedVideo(deliveryId: string, channel = getCon
   if (!channel || state.__feishuDeliveryLocks!.has(deliveryId)) return;
   state.__feishuDeliveryLocks!.add(deliveryId);
   try {
-    const delivery = getFeishuDelivery(deliveryId);
+    const delivery = await getFeishuDelivery(deliveryId);
     if (!delivery || ["delivered", "historical"].includes(delivery.status)) return;
-    const video = getVideo(delivery.videoId);
+    const video = await getVideo(delivery.videoId);
     if (!video) throw new Error("本地视频记录不存在");
     if (video.status !== "completed") return;
-    updateFeishuDelivery(delivery.id, { status: "documenting", errorMessage: "" });
+    await updateFeishuDelivery(delivery.id, { status: "documenting", errorMessage: "" });
     if (delivery.batchId) await updateFeishuBatchCard(delivery.batchId, channel).catch(() => undefined);
     const report = await ensureFeishuReportDocument(channel.rawClient, video.id);
     await grantReportAccess(channel.rawClient, report.documentId, {
@@ -84,10 +85,10 @@ export async function deliverCompletedVideo(deliveryId: string, channel = getCon
       chatId: delivery.chatId,
       senderOpenId: delivery.senderOpenId,
     });
-    const latest = getFeishuDelivery(delivery.id)!;
+    const latest = (await getFeishuDelivery(delivery.id))!;
     const historical = delivery.status === "historical_pending";
     const messageId = await sendOrUpdateResult(channel, latest, video, report.documentUrl, historical);
-    updateFeishuDelivery(delivery.id, {
+    await updateFeishuDelivery(delivery.id, {
       cardMessageId: messageId,
       documentId: report.documentId,
       documentUrl: report.documentUrl,
@@ -96,10 +97,10 @@ export async function deliverCompletedVideo(deliveryId: string, channel = getCon
     });
     if (delivery.batchId) await updateFeishuBatchCard(delivery.batchId, channel).catch(() => undefined);
   } catch (error) {
-    const delivery = getFeishuDelivery(deliveryId);
+    const delivery = await getFeishuDelivery(deliveryId);
     const message = error instanceof Error ? error.message : "生成飞书报告失败";
     if (delivery) {
-      updateFeishuDelivery(delivery.id, { status: "failed", errorMessage: message });
+      await updateFeishuDelivery(delivery.id, { status: "failed", errorMessage: message });
       if (delivery.cardMessageId) {
         await channel.updateCard(delivery.cardMessageId, buildErrorCard({
           message, senderOpenId: delivery.senderOpenId, retryVideoId: delivery.videoId,
@@ -122,7 +123,7 @@ export async function deliverCompletedVideo(deliveryId: string, channel = getCon
 async function failDelivery(channel: LarkChannel, delivery: FeishuDelivery, video: VideoRecord) {
   const status = video.status === "stopped" ? "stopped" : "failed";
   const message = video.status === "stopped" ? "分析已停止，可以点击重试。" : video.errorMessage || "视频分析失败";
-  updateFeishuDelivery(delivery.id, { status, errorMessage: message });
+  await updateFeishuDelivery(delivery.id, { status, errorMessage: message });
   const card = buildErrorCard({ message, senderOpenId: delivery.senderOpenId, retryVideoId: video.id });
   if (delivery.cardMessageId) await channel.updateCard(delivery.cardMessageId, card).catch(() => undefined);
   else await channel.send(delivery.chatId, { card }, {
@@ -135,15 +136,15 @@ async function failDelivery(channel: LarkChannel, delivery: FeishuDelivery, vide
 export async function notifyFeishuVideoProgress(videoId: string) {
   const channel = getConnectedFeishuChannel();
   if (!channel) return;
-  const video = getVideo(videoId, false);
+  const video = await getVideo(videoId, false);
   if (!video) return;
-  const deliveries = listOpenFeishuDeliveries(videoId);
+  const deliveries = await listOpenFeishuDeliveries(videoId);
   const batchIds = [...new Set(deliveries.map((item) => item.batchId).filter(Boolean))] as string[];
   await Promise.all(batchIds.map((batchId) => updateFeishuBatchCard(batchId, channel).catch(() => undefined)));
   for (const delivery of deliveries) {
-    const batch = delivery.batchId ? getFeishuBatch(delivery.batchId) : null;
+    const batch = delivery.batchId ? await getFeishuBatch(delivery.batchId) : null;
     if (delivery.cardMessageId && (!batch || batch.total === 1) && !["completed", "failed", "stopped"].includes(video.status)) {
-      const product = getProduct(video.productId);
+      const product = await getProduct(video.productId);
       await channel.updateCard(delivery.cardMessageId, buildProgressCard({
         productName: product?.name || video.productName,
         pid: product?.pid || "",
@@ -165,39 +166,43 @@ export async function applyFeishuCardAction(channel: LarkChannel, input: {
   const value = input.value && typeof input.value === "object" ? input.value as Record<string, unknown> : {};
   const action = String(value.action || "");
   const videoId = String(value.videoId || "");
-  const video = getVideo(videoId);
+  const video = await getVideo(videoId);
   if (!video) return;
 
   if (action === "label" && ["优质", "普通", "较差"].includes(String(value.label))) {
     const label = String(value.label) as Exclude<ManualLabel, null>;
-    updateVideo(videoId, { manual_label: label });
-    learnFromVideo(videoId);
-    const latest = getVideo(videoId)!;
-    const document = getFeishuDocument(videoId);
+    await updateVideo(videoId, { manual_label: label });
+    await learnFromVideo(videoId);
+    const latest = (await getVideo(videoId))!;
+    const document = await getFeishuDocument(videoId);
     const documentUrl = document ? String(document.document_url) : "";
     if (documentUrl) await channel.updateCard(input.messageId, buildResultCard(latest, {
       documentUrl,
-      localReportUrl: localReportUrl(videoId),
+      localReportUrl: await localReportUrl(videoId),
       selectedLabel: label,
     }));
     return;
   }
 
   if (action === "reanalyze") {
-    let delivery = getFeishuDeliveryByCardMessage(input.messageId, videoId);
-    if (!delivery) delivery = createFeishuDelivery({
-      videoId,
-      chatId: input.chatId,
-      chatType: getFeishuTarget(input.chatId)?.targetType || "group",
-      senderOpenId: input.operatorOpenId,
-    });
-    updateFeishuDelivery(delivery.id, { cardMessageId: input.messageId, status: "queued", errorMessage: "" });
-    updateVideo(videoId, { status: "queued", stage: "已重新加入队列", progress: 2, error_message: null });
-    const product = getProduct(video.productId);
+    let delivery = await getFeishuDeliveryByCardMessage(input.messageId, videoId);
+    if (!delivery) {
+      const target = await getFeishuTarget(input.chatId);
+      delivery = await createFeishuDelivery({
+        videoId,
+        chatId: input.chatId,
+        chatType: target?.targetType || "group",
+        senderOpenId: input.operatorOpenId,
+      });
+    }
+    await updateFeishuDelivery(delivery.id, { cardMessageId: input.messageId, status: "queued", errorMessage: "" });
+    await updateVideo(videoId, { status: "queued", stage: "已重新加入队列", progress: 2, error_message: null });
+    const product = await getProduct(video.productId);
+    const refreshed = (await getVideo(videoId, false))!;
     await channel.updateCard(input.messageId, buildProgressCard({
       productName: product?.name || video.productName, pid: product?.pid || "", senderOpenId: input.operatorOpenId,
-      items: [getVideo(videoId, false)!],
+      items: [refreshed],
     }));
-    enqueueVideos([videoId]);
+    await enqueueVideos([videoId]);
   }
 }

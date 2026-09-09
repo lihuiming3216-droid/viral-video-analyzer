@@ -11,13 +11,15 @@
     "start": "next start",
     "test": "node --test tests/*.test.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "migrate:sqlite": "node --env-file=.env.local scripts/migrate-sqlite-to-mysql.mjs"
   },
   "dependencies": {
     "@ffmpeg-installer/ffmpeg": "^1.1.0",
     "@larksuiteoapi/node-sdk": "^1.72.0",
     "ffprobe-static": "^3.1.0",
     "lucide-react": "^0.468.0",
+    "mysql2": "^3.15.3",
     "next": "16.2.11",
     "playwright-core": "^1.62.1",
     "react": "19.2.6",

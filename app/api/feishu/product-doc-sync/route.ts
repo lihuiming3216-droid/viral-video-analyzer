@@ -27,7 +27,7 @@ export async function POST(request: NextRequest) {
     if (!documentId || !name || !pid || !productUrl) {
       return NextResponse.json({ error: "产品文档同步参数不完整" }, { status: 400 });
     }
-    const product = getProductByPid(pid) || createProduct({ name, pid, productUrl });
+    const product = (await getProductByPid(pid)) || (await createProduct({ name, pid, productUrl }));
     const channel = getConnectedFeishuChannel() || await ensureFeishuConnection();
     if (!channel) return NextResponse.json({ error: "飞书应用尚未连接" }, { status: 503 });
     const result = await syncProductDocument(channel.rawClient, { ...product, documentId });

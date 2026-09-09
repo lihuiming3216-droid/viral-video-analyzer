@@ -306,7 +306,7 @@ async function throttle() {
 }
 
 async function rootFolderToken(client: Client) {
-  const cached = getFeishuFolder("drive-root");
+  const cached = await getFeishuFolder("drive-root");
   if (cached?.folder_token) return String(cached.folder_token);
   const response = await client.request<{ code?: number; msg?: string; data?: { token?: string; url?: string } }>({
     url: "/open-apis/drive/explorer/v2/root_folder/meta",
@@ -315,7 +315,7 @@ async function rootFolderToken(client: Client) {
   apiError(response, "无法获取飞书云空间根目录");
   const token = response.data?.token;
   if (!token) throw new Error("飞书没有返回云空间根目录 Token");
-  saveFeishuFolder({ scopeKey: "drive-root", folderToken: token, folderUrl: response.data?.url || "" });
+  await saveFeishuFolder({ scopeKey: "drive-root", folderToken: token, folderUrl: response.data?.url || "" });
   return token;
 }
 
@@ -326,30 +326,30 @@ async function findChildFolder(client: Client, parentToken: string, name: string
 }
 
 async function ensureFolder(client: Client, scopeKey: string, parentToken: string, name: string) {
-  const cached = getFeishuFolder(scopeKey);
+  const cached = await getFeishuFolder(scopeKey);
   if (cached?.folder_token) return String(cached.folder_token);
   const existing = await findChildFolder(client, parentToken, name);
   if (existing?.token) {
-    saveFeishuFolder({ scopeKey, folderToken: existing.token, folderUrl: existing.url, parentToken });
+    await saveFeishuFolder({ scopeKey, folderToken: existing.token, folderUrl: existing.url, parentToken });
     return existing.token;
   }
   const response = await client.drive.v1.file.createFolder({ data: { name, folder_token: parentToken } });
   apiError(response, `创建飞书文件夹“${name}”失败`);
   const token = response.data?.token;
   if (!token) throw new Error(`飞书没有返回文件夹“${name}”的 Token`);
-  saveFeishuFolder({ scopeKey, folderToken: token, folderUrl: response.data?.url, parentToken });
+  await saveFeishuFolder({ scopeKey, folderToken: token, folderUrl: response.data?.url, parentToken });
   return token;
 }
 
 async function ensureArchiveFolder(client: Client, video: VideoRecord) {
-  const settings = getFeishuSettings();
+  const settings = await getFeishuSettings();
   let base = settings.rootFolderToken;
   if (!base) {
     const root = await rootFolderToken(client);
     const scopeKey = `report-root:${root}`;
     base = await ensureFolder(client, scopeKey, root, "爆片分析报告");
-    const reportFolder = getFeishuFolder(scopeKey);
-    setFeishuRootFolder(base, reportFolder?.folder_url ? String(reportFolder.folder_url) : "");
+    const reportFolder = await getFeishuFolder(scopeKey);
+    await setFeishuRootFolder(base, reportFolder?.folder_url ? String(reportFolder.folder_url) : "");
   }
   const product = await ensureFolder(client, `product:${base}:${video.productId}`, base, safeName(video.productName));
   const monthName = (video.publishedAt || video.createdAt || new Date().toISOString()).slice(0, 7);
@@ -695,7 +695,9 @@ async function findProductDocumentByPid(
     if (!pageToken) throw new Error("按 PID 查找产品手卡失败：飞书分页结果缺少下一页 Token");
   } while (pageToken);
   if (matches.length > 1) {
-    throw new Error(`发现重复 PID 文档（${normalizedPid}），请人工处理后重试`);
+    // 负责人已确认：同一 PID 出现多份文档时自动选最新一份，不再停止报错。
+    // matches 按 EditedTime DESC 抓取且分页参数保持一致，matches[0] 就是最近编辑的那份。
+    console.warn(`[product-card] PID ${normalizedPid} 匹配到 ${matches.length} 份文档，已自动选择最近编辑的一份：${matches[0].documentId}`);
   }
   return matches[0] || null;
 }
@@ -731,6 +733,10 @@ export type EnsureProductCardByPidInput = {
   pid: string;
   templateToken?: string;
   ownerOpenId?: string;
+  /** Testing convenience: always create a fresh document, bypassing the
+   * existing-by-PID lookup, so a real PID can be reused across repeated test
+   * clicks without the "已有手卡不碰" rule blocking every field-fill test. */
+  forceNew?: boolean;
 };
 
 /**
@@ -749,12 +755,12 @@ export async function ensureProductCardByPid(
   if (!/^\d+$/.test(pid)) throw new Error("商品 PID 格式不正确，必须只包含数字");
   const title = productDocumentStableTitle(name, pid);
   return withProductDocumentLock(`pid_${sanitizedName(pid)}`, async () => {
-    const settings = getFeishuSettings();
+    const settings = await getFeishuSettings();
     const productFolderToken = requiredToken(
       settings.productFolderToken,
       "飞书产品文档文件夹配置，请先配置“产品说明文档”文件夹",
     );
-    const existing = await findProductDocumentByPid(client, productFolderToken, pid);
+    const existing = input.forceNew ? null : await findProductDocumentByPid(client, productFolderToken, pid);
     const document = existing || await copyFeishuTemplateDocument(client, {
       templateToken: input.templateToken?.trim()
         || process.env.FEISHU_PRODUCT_TEMPLATE_TOKEN?.trim()
@@ -763,9 +769,13 @@ export async function ensureProductCardByPid(
       folderToken: productFolderToken,
     });
 
-    // Existing documents are also normalized so the title is always exactly
-    // `产品名称_PID`. This patch changes only the Docx title, never its body.
-    await renameProductCardDocument(client, document.documentId, name, pid);
+    // An already-existing card is returned untouched — staff may already be
+    // editing it, and a button click must never rename or rewrite it out from
+    // under them. Title normalization and identity-field sync only apply to a
+    // document this call just created.
+    if (!existing) {
+      await renameProductCardDocument(client, document.documentId, name, pid);
+    }
 
     let permissionWarning = "";
     try { await setCompanyManaged(client, document.documentId); }
@@ -835,7 +845,7 @@ export async function ensureProductCardShell(
   const stableSuffix = input.recordKey ? productDocumentShellSuffix(input.recordKey) : "";
   const lockKey = stableSuffix ? `record${stableSuffix}` : `document_${supplied!.documentId}`;
   return withProductDocumentLock(lockKey, async () => {
-    const settings = getFeishuSettings();
+    const settings = await getFeishuSettings();
     const productFolderToken = requiredToken(
       settings.productFolderToken,
       "飞书产品文档文件夹配置，请先配置“产品说明文档”文件夹",
@@ -1508,16 +1518,11 @@ export async function syncProductCardManagedFields(
   if (duplicateLabels.length) {
     throw new Error(`产品手卡模板基础字段重复：${duplicateLabels.join("、")}`);
   }
-  if (missingLabels.length) {
-    return {
-      scanned: blocks.length,
-      updated: 0,
-      matchedLabels,
-      missingLabels,
-      duplicateLabels,
-      currentValues,
-    };
-  }
+  // A template missing one expected row (identity or verified-basic derived)
+  // no longer blocks writing the rows that do exist — matches the analyzer's
+  // own per-field tolerance (validateModelResult/parsedProductInfoFromOpenAICapture):
+  // a value the model couldn't safely produce is left blank, not treated as a
+  // reason to withhold every other value that did come through cleanly.
 
   let updated = 0;
   const managedBlocks = expectedLabels
@@ -1589,7 +1594,7 @@ async function ensureProductDocumentUnlocked(
   if (!product.pid.trim()) throw new Error("创建产品文档前必须有 PID");
 
   let currentProduct = product;
-  const settings = getFeishuSettings();
+  const settings = await getFeishuSettings();
   const productFolderToken = requiredToken(
     settings.productFolderToken,
     "飞书产品文档文件夹配置，请先配置“产品说明文档”文件夹",
@@ -1611,12 +1616,12 @@ async function ensureProductDocumentUnlocked(
       reused = true;
     } catch (error) {
       if (!isMissingProductDocumentError(error)) throw error;
-      const cleared = clearProductDocumentLink(currentProduct.id);
+      const cleared = await clearProductDocumentLink(currentProduct.id);
       if (!cleared) throw new Error("清理已删除的飞书产品文档关联失败：产品不存在");
       currentProduct = cleared;
     }
   } else if (currentProduct.documentId || currentProduct.documentUrl) {
-    const cleared = clearProductDocumentLink(currentProduct.id);
+    const cleared = await clearProductDocumentLink(currentProduct.id);
     if (!cleared) throw new Error("清理不完整的飞书产品文档关联失败：产品不存在");
     currentProduct = cleared;
   }
@@ -1631,7 +1636,7 @@ async function ensureProductDocumentUnlocked(
     reused = Boolean(existing);
     // Persist an adopted/copy result before any later API call. If the copy
     // response itself is lost, the next attempt adopts the stable-title file.
-    updateProduct(currentProduct.id, { documentId: copied.documentId, documentUrl: copied.documentUrl });
+    await updateProduct(currentProduct.id, { documentId: copied.documentId, documentUrl: copied.documentUrl });
   }
   let permissionWarning = "";
   try { await setCompanyManaged(client, copied.documentId); }
@@ -1702,7 +1707,7 @@ async function ensureProductDocumentUnlocked(
     };
   }
   if (reused) {
-    updateProduct(currentProduct.id, { documentId: copied.documentId, documentUrl: copied.documentUrl });
+    await updateProduct(currentProduct.id, { documentId: copied.documentId, documentUrl: copied.documentUrl });
   }
   return { ...copied, reused, permissionWarning, migration };
 }
@@ -1745,14 +1750,14 @@ export async function grantReportAccess(client: Client, documentId: string, inpu
 }
 
 export async function ensureFeishuReportDocument(client: Client, videoId: string) {
-  const video = getVideo(videoId);
+  const video = await getVideo(videoId);
   if (!video || video.status !== "completed") throw new Error("视频尚未完成分析");
   const hash = reportHash(video);
-  const cached = getFeishuDocument(videoId);
+  const cached = await getFeishuDocument(videoId);
   if (cached && String(cached.report_hash) === hash) {
     return { documentId: String(cached.document_id), documentUrl: String(cached.document_url), reused: true };
   }
-  const product = getProduct(video.productId);
+  const product = await getProduct(video.productId);
   if (!product) throw new Error("产品档案不存在");
   let folderToken = "";
   try {
@@ -1771,6 +1776,6 @@ export async function ensureFeishuReportDocument(client: Client, videoId: string
     await addSceneMedia(client, documentId, scene).catch(() => undefined);
   }
   const url = await documentUrl(client, documentId);
-  saveFeishuDocument({ videoId, reportHash: hash, documentId, documentUrl: url, folderToken });
+  await saveFeishuDocument({ videoId, reportHash: hash, documentId, documentUrl: url, folderToken });
   return { documentId, documentUrl: url, reused: false };
 }

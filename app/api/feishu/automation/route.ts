@@ -7,61 +7,10 @@ import {
   updateProductCardStatus,
   type FeishuAutomationFieldMap,
 } from "@/lib/feishu/automation";
+import { automationAuth, payloadFieldMap, payloadFields, safeBackgroundError } from "@/lib/feishu/webhook-shared";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-
-function automationAuth(request: NextRequest, body: Record<string, unknown>) {
-  const expected = process.env.FEISHU_AUTOMATION_WEBHOOK_SECRET?.trim();
-  if (!expected) return null;
-  return request.headers.get("x-feishu-automation-secret") === expected
-    || String(body.secret || "") === expected;
-}
-
-function payloadFields(body: Record<string, unknown>) {
-  const direct = body.fields;
-  if (direct && typeof direct === "object" && !Array.isArray(direct)) return direct as Record<string, unknown>;
-  const record = body.record;
-  if (record && typeof record === "object") {
-    const fields = (record as Record<string, unknown>).fields;
-    if (fields && typeof fields === "object" && !Array.isArray(fields)) return fields as Record<string, unknown>;
-  }
-  const data = body.data;
-  if (data && typeof data === "object") {
-    const nested = (data as Record<string, unknown>).record;
-    if (nested && typeof nested === "object") {
-      const fields = (nested as Record<string, unknown>).fields;
-      if (fields && typeof fields === "object" && !Array.isArray(fields)) return fields as Record<string, unknown>;
-    }
-  }
-  const controlKeys = new Set(["appToken", "app_token", "tableId", "table_id", "recordId", "record_id", "secret", "fieldMap", "field_map"]);
-  const directFields = Object.fromEntries(Object.entries(body).filter(([key]) => !controlKeys.has(key)));
-  return directFields;
-}
-
-function payloadFieldMap(value: unknown): Partial<FeishuAutomationFieldMap> {
-  if (value && typeof value === "object" && !Array.isArray(value)) return value as Partial<FeishuAutomationFieldMap>;
-  if (typeof value !== "string" || !value.trim()) return {};
-  try {
-    const parsed = JSON.parse(value) as unknown;
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-      ? parsed as Partial<FeishuAutomationFieldMap>
-      : {};
-  } catch {
-    return {};
-  }
-}
-
-function safeBackgroundError(error: unknown) {
-  const message = error instanceof Error ? error.message : String(error || "飞书自动化处理失败");
-  return message
-    .replace(/\bauthorization\s*:\s*(?:bearer|basic)?\s*\S+/gi, "[已隐藏]")
-    .replace(/\bbearer\s+\S+/gi, "[已隐藏]")
-    .replace(/(?:api[_ -]?key|app[_ -]?secret|webhook[_ -]?secret)\s*[:=]?\s*\S+/gi, "[已隐藏]")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 360) || "飞书自动化处理失败";
-}
 
 async function hydrateMissingProductCardFields(input: {
   client: { request<T>(options: Record<string, unknown>): Promise<T> };
@@ -151,7 +100,12 @@ export async function POST(request: NextRequest) {
         const message = safeBackgroundError(error);
         try {
           const channel = getConnectedFeishuChannel() || await ensureFeishuConnection();
-          if (channel && !jobFields[fieldMap.videoUrl || "视频链接"] && !jobFields["样片链接"]) {
+          // Always write the failure here — this only runs when the whole
+          // handler threw, meaning nothing else touched this row (a video URL
+          // being present in the payload doesn't mean a video was actually
+          // created; e.g. a missing-产品名称/PID failure throws before that
+          // ever happens, and skipping the write left the row silently blank).
+          if (channel) {
             await updateProductCardStatus({
               client: channel.rawClient,
               appToken,

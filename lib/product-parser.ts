@@ -637,6 +637,13 @@ const TRUSTED_TIKTOK_IMAGE_HOST_SUFFIXES = [
   "tiktokcdn-us.com",
   "tiktokcdn-eu.com",
   "muscdn.com",
+  // TikTok Shop's product-image CDN — confirmed live: model.images[].url_list
+  // on a real PDP router-data payload resolves to
+  // p16-oec-general-useast5.ttcdn-us.com, a distinct domain from the
+  // tiktokcdn-us.com content CDN above (not a subdomain of it), so every
+  // real product photo was silently dropped here before this was added.
+  "ttcdn-us.com",
+  "ttcdn-eu.com",
 ] as const;
 
 /** Router image URLs are still seller-controlled input; keep probes off private/arbitrary hosts. */
@@ -765,11 +772,12 @@ export async function parsedProductInfoFromOpenAICapture(input: {
   const usageMethod = formatFacts(analysis.usageMethod.facts).join("；");
   const audience = formatFacts(analysis.audience.facts).join("；");
   const scenes = formatFacts(analysis.scenes.facts).join("；");
-  if (!coreFunctions.length || !usageMethod || !audience || !scenes) {
-    // The analyzer already enforces this, but the parser repeats the boundary
-    // so a future provider adapter cannot publish an apparently completed card
-    // with one of the four business-required fields missing.
-    throw Object.assign(new Error("OpenAI 没有返回四个必填商品字段"), {
+  // A field with no safely-grounded facts is left blank rather than failing
+  // the whole card — matches the analyzer's own per-field tolerance (see
+  // validateModelResult) so a page that has good evidence for three of the
+  // four fields isn't discarded entirely over the fourth.
+  if (!coreFunctions.length && !usageMethod && !audience && !scenes) {
+    throw Object.assign(new Error("OpenAI 没有返回任何安全可用的商品信息"), {
       code: "insufficient_safe_facts",
     });
   }
@@ -2292,6 +2300,17 @@ export function shouldRetryProductPageCapture(result: ProductPageCollectionResul
 
 type ChromiumModule = typeof import("playwright-core");
 
+// Playwright's launched browser does NOT inherit HTTPS_PROXY/HTTP_PROXY the
+// way Node's own fetch/http calls do — it needs an explicit `proxy` launch
+// option or it dials TikTok directly, which just times out on a machine
+// that can only reach it through a local proxy (confirmed locally: without
+// this, the browser launches fine but every navigation fails fast).
+function browserProxyOption(): { server: string } | undefined {
+  const server = process.env.HTTPS_PROXY || process.env.https_proxy
+    || process.env.HTTP_PROXY || process.env.http_proxy || "";
+  return server ? { server } : undefined;
+}
+
 async function runProductPageBrowserAttempt(
   chromium: ChromiumModule["chromium"],
   executablePath: string,
@@ -2301,6 +2320,7 @@ async function runProductPageBrowserAttempt(
   let persistent: Awaited<ReturnType<ChromiumModule["chromium"]["launchPersistentContext"]>> | null = null;
   let browser: Awaited<ReturnType<ChromiumModule["chromium"]["launch"]>> | null = null;
   try {
+    const proxy = browserProxyOption();
     persistent = profileDir
       ? await chromium.launchPersistentContext(profileDir, {
           executablePath,
@@ -2309,11 +2329,13 @@ async function runProductPageBrowserAttempt(
           userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
           viewport: { width: 1280, height: 900 },
           args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+          proxy,
         })
       : null;
     browser = persistent ? null : await chromium.launch({
       executablePath,
       headless: true,
+      proxy,
       args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
     });
     const page = persistent
@@ -2618,7 +2640,7 @@ async function parsedQwenProductResponse(response: Response) {
 }
 
 async function qwenExtract(prompt: string) {
-  const qwen = getProviderConfig("qwen");
+  const qwen = await getProviderConfig("qwen");
   if (!qwen.enabled || !qwen.apiKey) throw new Error("Qwen 商品资料抽取未配置");
   const response = await fetchWithProxy(`${qwen.baseUrl.replace(/\/$/, "")}/chat/completions`, {
     method: "POST",
@@ -2638,7 +2660,7 @@ async function qwenExtract(prompt: string) {
 }
 
 async function qwenTranslateBundleFeatures(features: string[]) {
-  const qwen = getProviderConfig("qwen");
+  const qwen = await getProviderConfig("qwen");
   if (!qwen.enabled || !qwen.apiKey || !features.length) return [];
   const response = await fetchWithProxy(`${qwen.baseUrl.replace(/\/$/, "")}/chat/completions`, {
     method: "POST",
@@ -2665,7 +2687,7 @@ async function qwenTranslateBundleFeatures(features: string[]) {
 }
 
 async function qwenVisualExtract(prompt: string, imageUrls: string[]) {
-  const qwen = getProviderConfig("qwen");
+  const qwen = await getProviderConfig("qwen");
   if (!qwen.enabled || !qwen.apiKey) throw new Error("Qwen 商品图片抽取未配置");
   if (!imageUrls.length) throw new Error("没有可供 Qwen 分析的商品图片");
   const response = await fetchWithProxy(`${qwen.baseUrl.replace(/\/$/, "")}/chat/completions`, {
@@ -2696,7 +2718,7 @@ async function qwenVisualExtract(prompt: string, imageUrls: string[]) {
 }
 
 async function qwenFindExactProductSources(productUrl: string) {
-  const qwen = getProviderConfig("qwen");
+  const qwen = await getProviderConfig("qwen");
   if (!qwen.enabled || !qwen.apiKey) throw new Error("Qwen 联网检索未配置");
   const productId = productIdFromOfficialTikTokPath(productUrl);
   const search = async (input: string) => {

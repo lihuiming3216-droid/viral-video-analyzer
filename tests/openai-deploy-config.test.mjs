@@ -4,12 +4,12 @@ import test from "node:test";
 
 const workflow = await readFile(new URL("../.github/workflows/deploy.yml", import.meta.url), "utf8");
 const compose = await readFile(new URL("../docker-compose.yml", import.meta.url), "utf8");
+const deploy = await readFile(new URL("../deploy/update-server.sh", import.meta.url), "utf8");
 
-test("the OpenAI key is sourced from an encrypted GitHub secret and never embedded", () => {
-  assert.match(workflow, /OPENAI_API_KEY:\s*\$\{\{\s*secrets\.OPENAI_API_KEY\s*\}\}/);
-  assert.match(workflow, /envs:\s*OPENAI_API_KEY/);
-  assert.match(workflow, /install -m 600 "\$runtime_env_tmp" \.env/);
-  assert.match(workflow, /trap 'rm -f "\$runtime_env_tmp"' EXIT/);
+test("deployments retain the server key and do not rewrite it from GitHub", () => {
+  assert.doesNotMatch(workflow, /secrets\.OPENAI_API_KEY|envs:\s*OPENAI_API_KEY|runtime_env_tmp/);
+  assert.match(deploy, /--env-file "\$env_file"/);
+  assert.doesNotMatch(deploy, /source "\$env_file"|\. "\$env_file"/);
   assert.match(workflow, /appleboy\/ssh-action@[a-f0-9]{40}/);
   assert.match(workflow, /appleboy\/scp-action@[a-f0-9]{40}/);
   assert.match(workflow, /permissions:\s*\n\s+contents: read/);

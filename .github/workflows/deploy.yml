@@ -7,13 +7,14 @@ on:
 
 concurrency:
   group: production-deploy
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
   deploy:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -21,101 +22,49 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Build Docker image on GitHub runner
-        run: docker build -t viral-video-analyzer:latest .
+      - name: Build versioned Linux image
+        run: docker build --build-arg VCS_REF="$GITHUB_SHA" -t "viral-video-analyzer:$GITHUB_SHA" .
 
-      - name: Export Docker image
-        run: docker save viral-video-analyzer:latest | gzip > viral-video-analyzer.tar.gz
+      - name: Test deployment guards
+        run: |
+          docker run --rm --entrypoint node -v "$PWD/tests:/app/tests:ro" -v "$PWD/deploy:/app/deploy:ro" -v "$PWD/docker-compose.yml:/app/docker-compose.yml:ro" -v "$PWD/.github:/app/.github:ro" -v "$PWD/Dockerfile:/app/Dockerfile:ro" -v "$PWD/.dockerignore:/app/.dockerignore:ro" "viral-video-analyzer:$GITHUB_SHA" --test tests/deployment-config.test.mjs tests/openai-deploy-config.test.mjs
 
-      - name: Copy runtime configuration to AWS Lightsail
+      - name: Test hand-card video regression without provider credentials
+        run: |
+          docker run --rm --entrypoint node -v "$PWD/tests:/app/tests:ro" "viral-video-analyzer:$GITHUB_SHA" --test --test-concurrency=2 tests/qwen-full-video-input.test.mjs tests/qwen-transport.test.mjs tests/qwen-diagnostics-safety.test.mjs tests/analysis-qwen-local-retry.test.mjs tests/product-doc-sync-write-protection.test.mjs tests/video-queue-hard-timeout.test.mjs tests/transcript-validation.test.mjs tests/product-doc-analysis.test.mjs tests/feishu-parser-duplicates.test.mjs tests/video-processing-av-integrity.test.mjs
+
+      - name: Smoke test with an isolated empty MySQL
+        run: bash deploy/smoke-test.sh "viral-video-analyzer:$GITHUB_SHA"
+
+      - name: Prepare release bundle
+        run: |
+          release_dir="releases/$GITHUB_SHA"
+          mkdir -p "$release_dir/deploy"
+          docker save "viral-video-analyzer:$GITHUB_SHA" | gzip > "$release_dir/viral-video-analyzer.tar.gz"
+          cp docker-compose.yml "$release_dir/docker-compose.yml"
+          cp deploy/update-server.sh "$release_dir/deploy/update-server.sh"
+          cd "$release_dir"
+          sha256sum viral-video-analyzer.tar.gz docker-compose.yml deploy/update-server.sh > release.sha256
+
+      - name: Upload immutable release bundle
         uses: appleboy/scp-action@ff85246acaad7bdce478db94a363cd2bf7c90345 # v1
         with:
           host: ${{ secrets.ECS_HOST }}
           username: ${{ secrets.ECS_USER }}
           key: ${{ secrets.ECS_SSH_KEY }}
-          source: "docker-compose.yml,deploy/nginx.conf"
+          source: "releases/${{ github.sha }}"
           target: "/opt/viral-video-analyzer"
           overwrite: true
 
-      - name: Copy built Docker image to AWS Lightsail
-        uses: appleboy/scp-action@ff85246acaad7bdce478db94a363cd2bf7c90345 # v1
-        with:
-          host: ${{ secrets.ECS_HOST }}
-          username: ${{ secrets.ECS_USER }}
-          key: ${{ secrets.ECS_SSH_KEY }}
-          source: "viral-video-analyzer.tar.gz"
-          target: "/opt/viral-video-analyzer"
-          overwrite: true
-
-      - name: Deploy over SSH
-        # Pin third-party code that receives deployment secrets to an immutable
-        # commit instead of a movable tag.
+      - name: Preflight and update only the application
         uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         with:
           host: ${{ secrets.ECS_HOST }}
           username: ${{ secrets.ECS_USER }}
           key: ${{ secrets.ECS_SSH_KEY }}
-          envs: OPENAI_API_KEY
+          command_timeout: 15m
           script: |
-            set -e
-            if ! command -v docker >/dev/null 2>&1; then
-              sudo apt-get update
-              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io
-              sudo systemctl enable --now docker
-            fi
-            if ! sudo docker compose version >/dev/null 2>&1; then
-              sudo apt-get update
-              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y docker-compose-v2
-            fi
-            if ! command -v nginx >/dev/null 2>&1; then
-              sudo apt-get update
-              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nginx
-            fi
-            cd /opt/viral-video-analyzer
-            if [ -z "${OPENAI_API_KEY:-}" ]; then
-              echo "OPENAI_API_KEY repository secret is missing" >&2
-              exit 1
-            fi
-            # Persist the runtime key without printing it. This preserves the
-            # existing server-side .env values and keeps manual container
-            # restarts consistent with GitHub deployments.
-            umask 077
-            runtime_env_tmp=$(mktemp)
-            trap 'rm -f "$runtime_env_tmp"' EXIT
-            if [ -f .env ]; then
-              sudo awk '!/^OPENAI_API_KEY=/' .env > "$runtime_env_tmp"
-            fi
-            printf 'OPENAI_API_KEY=%s\n' "$OPENAI_API_KEY" >> "$runtime_env_tmp"
-            sudo install -m 600 "$runtime_env_tmp" .env
-            rm -f "$runtime_env_tmp"
-            trap - EXIT
-            unset OPENAI_API_KEY
-            sudo docker load -i /opt/viral-video-analyzer/viral-video-analyzer.tar.gz
-            rm -f /opt/viral-video-analyzer/viral-video-analyzer.tar.gz
-            # The container may have been created manually during recovery,
-            # so remove it by its fixed name before Compose recreates it.
-            # The named viral_data volume is not removed.
-            sudo docker rm -f viral-video-analyzer 2>/dev/null || true
-            sudo docker compose up -d --no-build --remove-orphans
-
-            sudo install -m 644 deploy/nginx.conf /etc/nginx/sites-available/viral-video-analyzer
-            sudo ln -sfn /etc/nginx/sites-available/viral-video-analyzer /etc/nginx/sites-enabled/viral-video-analyzer
-            sudo rm -f /etc/nginx/sites-enabled/default
-            sudo nginx -t
-            sudo systemctl enable --now nginx
-            sudo systemctl reload nginx
-
-            for attempt in $(seq 1 30); do
-              if curl -fsS --max-time 5 http://127.0.0.1:3000/api/health >/dev/null; then
-                break
-              fi
-              if [ "$attempt" -eq 30 ]; then
-                sudo docker logs --tail 120 viral-video-analyzer
-                exit 1
-              fi
-              sleep 2
-            done
-            sudo docker compose ps
-            sudo docker image prune -f
+            set -eu
+            release_script="/opt/viral-video-analyzer/releases/${{ github.sha }}/deploy/update-server.sh"
+            sudo bash "$release_script" --check '${{ github.sha }}'
+            sudo bash "$release_script" --apply '${{ github.sha }}'

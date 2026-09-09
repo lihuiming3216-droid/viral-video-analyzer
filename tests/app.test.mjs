@@ -141,21 +141,17 @@ test("source tree contains no pasted API keys", async () => {
   assert.doesNotMatch(text, /sk_[a-f0-9]{32,}/i);
 });
 
-test("production routes are protected while health and Feishu webhooks stay independently accessible", async () => {
-  const [proxy, compose, workflow] = await Promise.all([
-    readFile(new URL("proxy.ts", root), "utf8"),
+test("owner-approved no-login deployment retains independent Feishu callback authentication", async () => {
+  await assert.rejects(readFile(new URL("proxy.ts", root)), { code: "ENOENT" });
+  const [auth, compose] = await Promise.all([
+    readFile(new URL("lib/feishu/webhook-shared.ts", root), "utf8"),
     readFile(new URL("docker-compose.yml", root), "utf8"),
-    readFile(new URL(".github/workflows/deploy.yml", root), "utf8"),
   ]);
-  assert.match(proxy, /APP_BASIC_AUTH_USER/);
-  assert.match(proxy, /APP_BASIC_AUTH_PASSWORD/);
-  assert.match(proxy, /NODE_ENV !== "production"/);
-  assert.match(proxy, /\/api\/health/);
-  assert.match(proxy, /\/api\/feishu\/automation/);
-  assert.match(compose, /APP_BASIC_AUTH_USER/);
-  assert.match(compose, /APP_BASIC_AUTH_PASSWORD/);
+  assert.doesNotMatch(compose, /APP_BASIC_AUTH_USER|APP_BASIC_AUTH_PASSWORD/);
+  assert.match(auth, /FEISHU_AUTOMATION_WEBHOOK_SECRET/);
+  assert.match(auth, /FEISHU_SUBTITLE_BRIDGE_SECRET/);
+  assert.match(compose, /FEISHU_SUBTITLE_BRIDGE_SECRET/);
   assert.match(compose, /\/api\/health/);
-  assert.match(workflow, /\/api\/health/);
 });
 
 test("TikTok inputs require HTTPS TikTok hosts and PID links do not invent a product slug", async () => {

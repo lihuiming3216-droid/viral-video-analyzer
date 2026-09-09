@@ -8,10 +8,10 @@ export const dynamic = "force-dynamic";
 
 export async function GET(request: NextRequest) {
   void ensureFeishuConnection().catch(() => undefined);
-  resumePendingVideos();
+  void resumePendingVideos().catch(() => undefined);
   const search = request.nextUrl.searchParams;
   return NextResponse.json(
-    getDashboard({
+    await getDashboard({
       search: search.get("search") || "",
       productId: search.get("productId") || "",
       account: search.get("account") || "",

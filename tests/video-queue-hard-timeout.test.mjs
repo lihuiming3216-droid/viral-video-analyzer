@@ -147,8 +147,13 @@ async function loadAnalysis(hooks) {
     export const learnFromVideo = () => undefined;
     export const getProviderConfig = () => ({ enabled: false, apiKey: "" });
     export const analyzeVideoWithQwen = (...args) => hooks().analyzeVideoWithQwen?.(...args);
+    export class QwenRequestError extends Error {}
+    export const getPromptTemplate = async (_slug, _label, template) => ({ template });
+    export const savePromptDebugCapture = async () => {};
     export const translateTranscriptWithQwen = (...args) => hooks().translateTranscriptWithQwen?.(...args) || Promise.resolve("");
     export const fetchTikTok = (...args) => hooks().fetchTikTok(...args);
+    export const resolveTokScriptVideoUrl = async (url) => url;
+    export const downloadTikTokVideoWithYtDlp = () => { throw new Error("unexpected fallback"); };
     export const tokScriptTranscriptFailure = () => false;
     export const transcriptAndTranslationAgree = () => true;
     export const emitVideoProgress = (...args) => hooks().emitVideoProgress?.(...args);

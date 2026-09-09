@@ -1,11 +1,12 @@
 import "server-only";
 
 import type { LarkChannel } from "@larksuiteoapi/node-sdk";
-import { createProduct, createVideo, listProducts, updateProduct } from "@/lib/database";
+import { createVideo } from "@/lib/database";
 import { enqueueVideos } from "@/lib/queue";
 import { buildErrorCard, buildProgressCard } from "@/lib/feishu/cards";
 import { parseFeishuSubmission } from "@/lib/feishu/parser";
 import { applyFeishuCardAction } from "@/lib/feishu/notifications";
+import { findOrCreateProduct } from "@/lib/feishu/product-lookup";
 import { setVideoProgressHandler } from "@/lib/video-events";
 import {
   createFeishuBatch, createFeishuDelivery, recordFeishuEvent, updateFeishuBatch,
@@ -20,21 +21,6 @@ function eventId(raw: unknown) {
   return String(record.event_id || header?.event_id || "");
 }
 
-function findOrCreateProduct(name: string, pid: string) {
-  const products = listProducts();
-  if (pid) {
-    const byPid = products.find((product) => product.pid && product.pid.toLowerCase() === pid.toLowerCase());
-    if (byPid) return byPid;
-  }
-  const sameName = products.filter((product) => product.name.trim().toLowerCase() === name.trim().toLowerCase());
-  const compatible = sameName.find((product) => !pid || !product.pid || product.pid.toLowerCase() === pid.toLowerCase());
-  if (compatible) {
-    if (pid && !compatible.pid) return updateProduct(compatible.id, { pid })!;
-    return compatible;
-  }
-  return createProduct({ name, pid, category: "飞书待补充", notes: "由飞书机器人收到视频链接后自动创建" });
-}
-
 async function enrichTarget(channel: LarkChannel, input: {
   chatId: string;
   chatType: "p2p" | "group";
@@ -43,7 +29,7 @@ async function enrichTarget(channel: LarkChannel, input: {
   try {
     if (input.chatType === "group") {
       const info = await channel.getChatInfo(input.chatId);
-      upsertFeishuTarget({ targetId: input.chatId, targetType: input.chatType, senderOpenId: input.senderOpenId, name: info.name || "飞书群聊" });
+      await upsertFeishuTarget({ targetId: input.chatId, targetType: input.chatType, senderOpenId: input.senderOpenId, name: info.name || "飞书群聊" });
       return;
     }
     const response = await channel.rawClient.contact.v3.user.get({
@@ -51,7 +37,7 @@ async function enrichTarget(channel: LarkChannel, input: {
       params: { user_id_type: "open_id", department_id_type: "open_department_id" },
     });
     const name = response.data?.user?.name || "飞书成员";
-    upsertFeishuTarget({ targetId: input.chatId, targetType: input.chatType, senderOpenId: input.senderOpenId, name });
+    await upsertFeishuTarget({ targetId: input.chatId, targetType: input.chatType, senderOpenId: input.senderOpenId, name });
   } catch {
     // 名称补全失败不影响接收和返回报告。
   }
@@ -64,9 +50,9 @@ function replyOptions(messageId: string, chatType: "p2p" | "group") {
 export function registerFeishuHandlers(channel: LarkChannel) {
   setVideoProgressHandler((videoId) => import("@/lib/feishu/notifications").then(({ notifyFeishuVideoProgress }) => notifyFeishuVideoProgress(videoId)));
   channel.on("message", async (message) => {
-    if (!recordFeishuEvent(message.messageId, eventId(message.raw))) return;
+    if (!(await recordFeishuEvent(message.messageId, eventId(message.raw)))) return;
     const chatType = message.chatType === "p2p" ? "p2p" : "group";
-    upsertFeishuTarget({
+    await upsertFeishuTarget({
       targetId: message.chatId,
       targetType: chatType,
       name: chatType === "group" ? "飞书群聊" : message.senderName || "飞书成员",
@@ -84,8 +70,8 @@ export function registerFeishuHandlers(channel: LarkChannel) {
       return;
     }
 
-    const product = findOrCreateProduct(parsed.productName, parsed.pid);
-    const batch = createFeishuBatch({
+    const product = await findOrCreateProduct(parsed.productName, parsed.pid);
+    const batch = await createFeishuBatch({
       sourceMessageId: message.messageId,
       chatId: message.chatId,
       chatType,
@@ -96,8 +82,8 @@ export function registerFeishuHandlers(channel: LarkChannel) {
     const deliveries: FeishuDelivery[] = [];
     const enqueueIds = new Set<string>();
 
-    parsed.urls.forEach((url, index) => {
-      const video: VideoRecord = createVideo({
+    for (const [index, url] of parsed.urls.entries()) {
+      const video: VideoRecord = await createVideo({
         productId: product.id,
         sourceType: "tiktok",
         sourceUrl: url,
@@ -106,7 +92,7 @@ export function registerFeishuHandlers(channel: LarkChannel) {
       const deliveryStatus = "queued";
       enqueueIds.add(video.id);
       videos.push(video);
-      deliveries.push(createFeishuDelivery({
+      deliveries.push(await createFeishuDelivery({
         videoId: video.id,
         batchId: batch.id,
         chatId: message.chatId,
@@ -115,7 +101,7 @@ export function registerFeishuHandlers(channel: LarkChannel) {
         replyToMessageId: message.messageId,
         status: deliveryStatus,
       }));
-    });
+    }
 
     const sent = await channel.send(message.chatId, { card: buildProgressCard({
       productName: product.name,
@@ -123,10 +109,10 @@ export function registerFeishuHandlers(channel: LarkChannel) {
       senderOpenId: message.senderId,
       items: videos,
     }) }, replyOptions(message.messageId, chatType));
-    updateFeishuBatch(batch.id, { progressMessageId: sent.messageId, status: "processing" });
-    if (deliveries.length === 1) updateFeishuDelivery(deliveries[0].id, { cardMessageId: sent.messageId });
+    await updateFeishuBatch(batch.id, { progressMessageId: sent.messageId, status: "processing" });
+    if (deliveries.length === 1) await updateFeishuDelivery(deliveries[0].id, { cardMessageId: sent.messageId });
 
-    if (enqueueIds.size) enqueueVideos([...enqueueIds]);
+    if (enqueueIds.size) await enqueueVideos([...enqueueIds]);
   });
 
   channel.on("cardAction", async (event) => {
@@ -138,8 +124,8 @@ export function registerFeishuHandlers(channel: LarkChannel) {
     });
   });
 
-  channel.on("botAdded", (event) => {
-    upsertFeishuTarget({
+  channel.on("botAdded", async (event) => {
+    await upsertFeishuTarget({
       targetId: event.chatId,
       targetType: "group",
       name: "飞书群聊",

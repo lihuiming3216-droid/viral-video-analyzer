@@ -6,7 +6,7 @@ import type { ProviderName } from "@/lib/types";
 export const runtime = "nodejs";
 
 export async function GET() {
-  return NextResponse.json({ providers: listProviderSettings() });
+  return NextResponse.json({ providers: await listProviderSettings() });
 }
 
 export async function PUT(request: NextRequest) {
@@ -21,7 +21,7 @@ export async function PUT(request: NextRequest) {
       : typeof body.apiKey === "string" && body.apiKey.trim()
         ? encryptSecret(body.apiKey.trim())
         : undefined;
-    const setting = saveProviderSetting({
+    const setting = await saveProviderSetting({
       provider,
       encryptedApiKey,
       baseUrl: String(body.baseUrl || "").trim(),

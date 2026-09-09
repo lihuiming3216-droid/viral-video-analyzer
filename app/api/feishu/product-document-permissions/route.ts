@@ -33,7 +33,8 @@ export async function POST(request: NextRequest) {
 
     const channel = getConnectedFeishuChannel() || await ensureFeishuConnection();
     if (!channel) return NextResponse.json({ error: "飞书应用尚未连接" }, { status: 503 });
-    const products = listProducts().filter((product) => product.documentId && product.documentUrl);
+    const allProducts = await listProducts();
+    const products = allProducts.filter((product) => product.documentId && product.documentUrl);
     const results = [];
     for (const product of products) {
       try {

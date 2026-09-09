@@ -7,5 +7,5 @@ export const dynamic = "force-dynamic";
 
 export async function GET() {
   await ensureFeishuConnection().catch(() => undefined);
-  return NextResponse.json({ targets: listFeishuTargets() });
+  return NextResponse.json({ targets: await listFeishuTargets() });
 }

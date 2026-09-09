@@ -16,7 +16,7 @@ function rawText(settings: Record<string, unknown>, key: string, fallback = "") 
 }
 
 async function restorePreviousSettings(previous: Record<string, unknown>) {
-  const restored = saveFeishuSettings({
+  const restored = await saveFeishuSettings({
     appId: rawText(previous, "app_id"),
     encryptedAppSecret: previous.encrypted_app_secret == null ? null : String(previous.encrypted_app_secret),
     enabled: Boolean(previous.enabled),
@@ -59,12 +59,12 @@ function parseFeishuFolderInput(value: unknown) {
 }
 
 export async function GET() {
-  return NextResponse.json({ settings: getFeishuRuntimeStatus() });
+  return NextResponse.json({ settings: await getFeishuRuntimeStatus() });
 }
 
 export async function PUT(request: NextRequest) {
   try {
-    const previous = getRawFeishuSettings();
+    const previous = await getRawFeishuSettings();
     const body = await request.json();
     const appId = String(body.appId || "").trim();
     const enabled = body.enabled === true;
@@ -82,7 +82,7 @@ export async function PUT(request: NextRequest) {
     if (hasProductFolderInput && !productFolder) {
       return NextResponse.json({ error: "请输入正确的飞书文件夹完整链接" }, { status: 400 });
     }
-    const settings = saveFeishuSettings({
+    const settings = await saveFeishuSettings({
       appId,
       encryptedAppSecret,
       enabled,
@@ -109,7 +109,7 @@ export async function PUT(request: NextRequest) {
           }
         }
       } else await stopFeishuConnection();
-      if (rawText(previous, "root_folder_token") !== settings.rootFolderToken) clearFeishuFolderCache();
+      if (rawText(previous, "root_folder_token") !== settings.rootFolderToken) await clearFeishuFolderCache();
     } catch (error) {
       const restoreError = await restorePreviousSettings(previous);
       const message = error instanceof Error ? error.message : "保存飞书设置失败";
@@ -119,7 +119,7 @@ export async function PUT(request: NextRequest) {
       }
       throw new Error(`${message}${suffix}`);
     }
-    return NextResponse.json({ settings: getFeishuRuntimeStatus() });
+    return NextResponse.json({ settings: await getFeishuRuntimeStatus() });
   } catch (error) {
     return NextResponse.json({ error: error instanceof Error ? error.message : "保存飞书设置失败" }, { status: 500 });
   }

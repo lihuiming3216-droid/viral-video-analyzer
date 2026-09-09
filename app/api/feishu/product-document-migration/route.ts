@@ -48,13 +48,14 @@ export async function POST(request: NextRequest) {
 
     const dryRun = body.confirm !== CONFIRMATION;
     const handleRequest = async () => {
-      const settings = getFeishuSettings();
+      const settings = await getFeishuSettings();
       const folderToken = settings.productFolderToken?.trim();
       if (!folderToken) {
         return NextResponse.json({ error: "尚未配置产品说明文档文件夹" }, { status: 503 });
       }
 
-      const availableProducts = listProducts().filter((product) => product.documentId && product.documentUrl);
+      const allProducts = await listProducts();
+      const availableProducts = allProducts.filter((product) => product.documentId && product.documentUrl);
       const products = productId
         ? availableProducts.filter((product) => product.id === productId)
         : availableProducts;

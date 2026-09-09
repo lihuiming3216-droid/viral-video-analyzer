@@ -1,6 +1,7 @@
 import "server-only";
 
 import { getDb, getProduct, getVideo } from "@/lib/database";
+import { execute, queryRow, queryRows } from "@/lib/db/query";
 import type {
   AnalysisResult,
   LearningOverview,
@@ -42,7 +43,7 @@ type MemoryRow = {
   category: string;
   outcome: Outcome;
   evidence_weight: number;
-  features_json: string;
+  features_json: unknown;
   updated_at: string;
   product_name?: string;
   video_title?: string;
@@ -56,14 +57,20 @@ const emptyInsights: LearningProfile["insights"] = {
   riskPatterns: [],
 };
 
+/** mysql2 auto-parses JSON columns into JS values already; a string only shows up for legacy/edge input. */
 function parseJson<T>(value: unknown, fallback: T): T {
-  if (typeof value !== "string" || !value) return fallback;
-  try {
-    return JSON.parse(value) as T;
-  } catch {
-    return fallback;
+  if (value == null) return fallback;
+  if (typeof value === "string") {
+    if (!value) return fallback;
+    try {
+      return JSON.parse(value) as T;
+    } catch {
+      return fallback;
+    }
   }
+  return value as T;
 }
+
 function outcomeFor(label: ManualLabel): Outcome {
   if (label === "优质") return "positive";
   if (label === "普通") return "neutral";
@@ -113,10 +120,10 @@ function featuresFromAnalysis(input: {
   };
 }
 
-export function learnFromVideo(videoId: string, refreshProfiles = true) {
-  const video = getVideo(videoId, false);
+export async function learnFromVideo(videoId: string, refreshProfiles = true) {
+  const video = await getVideo(videoId, false);
   if (!video || video.status !== "completed" || !video.analysis) return false;
-  const product = getProduct(video.productId);
+  const product = await getProduct(video.productId);
   if (!product) return false;
   const outcome = outcomeFor(video.manualLabel);
   const features = featuresFromAnalysis({
@@ -136,34 +143,43 @@ export function learnFromVideo(videoId: string, refreshProfiles = true) {
     features.hookType, features.hookDescription, features.structureFormula,
     features.strengths, features.weaknesses, features.tags, features.summary,
   ]).join(" ");
-  getDb().prepare(`INSERT INTO learning_memories(
-    video_id, product_id, category, outcome, evidence_weight, features_json, searchable_text,
-    source_updated_at, created_at, updated_at
-  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  ON CONFLICT(video_id) DO UPDATE SET
-    product_id=excluded.product_id,
-    category=excluded.category,
-    outcome=excluded.outcome,
-    evidence_weight=excluded.evidence_weight,
-    features_json=excluded.features_json,
-    searchable_text=excluded.searchable_text,
-    source_updated_at=excluded.source_updated_at,
-    updated_at=excluded.updated_at`).run(
-    video.id, product.id, product.category || "未分类", outcome, evidenceWeight(outcome),
-    JSON.stringify(features), searchableText, video.updatedAt, timestamp, timestamp,
+  const db = await getDb();
+  await execute(
+    db,
+    `INSERT INTO learning_memories(
+      video_id, product_id, category, outcome, evidence_weight, features_json, searchable_text,
+      source_updated_at, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON DUPLICATE KEY UPDATE
+      product_id=VALUES(product_id),
+      category=VALUES(category),
+      outcome=VALUES(outcome),
+      evidence_weight=VALUES(evidence_weight),
+      features_json=VALUES(features_json),
+      searchable_text=VALUES(searchable_text),
+      source_updated_at=VALUES(source_updated_at),
+      updated_at=VALUES(updated_at)`,
+    [
+      video.id, product.id, product.category || "未分类", outcome, evidenceWeight(outcome),
+      JSON.stringify(features), searchableText, video.updatedAt, timestamp, timestamp,
+    ],
   );
-  if (refreshProfiles) refreshLearningProfiles();
+  if (refreshProfiles) await refreshLearningProfiles();
   return true;
 }
 
-export function syncLearningMemories() {
-  const rows = getDb().prepare(`SELECT v.id FROM videos v
-    LEFT JOIN learning_memories m ON m.video_id=v.id
-    WHERE v.status='completed' AND v.analysis_json IS NOT NULL
-      AND (m.video_id IS NULL OR m.source_updated_at <> v.updated_at)`).all() as Array<{ id: string }>;
-  rows.forEach((row) => learnFromVideo(String(row.id), false));
-  if (rows.length || !getDb().prepare("SELECT 1 FROM learning_profiles LIMIT 1").get()) refreshLearningProfiles();
-  return rows.length;
+export async function syncLearningMemories() {
+  const db = await getDb();
+  const pending = await queryRows<{ id: string }>(
+    db,
+    `SELECT v.id FROM videos v
+     LEFT JOIN learning_memories m ON m.video_id=v.id
+     WHERE v.status='completed' AND v.analysis_json IS NOT NULL
+       AND (m.video_id IS NULL OR m.source_updated_at <> v.updated_at)`,
+  );
+  for (const item of pending) await learnFromVideo(String(item.id), false);
+  if (pending.length || !(await queryRow(db, "SELECT 1 FROM learning_profiles LIMIT 1"))) await refreshLearningProfiles();
+  return pending.length;
 }
 
 function rankedPatterns(values: Array<{ names: string[]; score: number }>, limit = 5): LearningPattern[] {
@@ -219,10 +235,13 @@ function buildProfile(scopeType: LearningScopeType, scopeKey: string, scopeName:
   return profile;
 }
 
-export function refreshLearningProfiles() {
-  const db = getDb();
-  const rows = db.prepare(`SELECT m.*, p.name AS product_name FROM learning_memories m
-    JOIN products p ON p.id=m.product_id ORDER BY m.updated_at DESC`).all() as MemoryRow[];
+export async function refreshLearningProfiles() {
+  const db = await getDb();
+  const rows = await queryRows<MemoryRow>(
+    db,
+    `SELECT m.*, p.name AS product_name FROM learning_memories m
+     JOIN products p ON p.id=m.product_id ORDER BY m.updated_at DESC`,
+  );
   const scopes = new Map<string, { type: LearningScopeType; key: string; name: string; rows: MemoryRow[] }>();
   const add = (type: LearningScopeType, key: string, name: string, row: MemoryRow) => {
     const id = `${type}:${key}`;
@@ -235,26 +254,35 @@ export function refreshLearningProfiles() {
     add("category", row.category || "未分类", row.category || "未分类", row);
     add("product", row.product_id, row.product_name || "未命名产品", row);
   });
-  db.exec("BEGIN");
+  const connection = await db.getConnection();
   try {
-    db.prepare("DELETE FROM learning_profiles").run();
-    const insert = db.prepare(`INSERT INTO learning_profiles(
-      scope_type, scope_key, sample_count, labeled_count, positive_count, neutral_count, negative_count,
-      avg_traffic, avg_conversion, confidence, insights_json, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
-    scopes.forEach((scope) => {
+    await connection.beginTransaction();
+    await connection.query("DELETE FROM learning_profiles");
+    for (const scope of scopes.values()) {
       const profile = buildProfile(scope.type, scope.key, scope.name, scope.rows);
-      insert.run(
-        profile.scopeType, profile.scopeKey, profile.sampleCount, profile.labeledCount,
-        profile.positiveCount, profile.neutralCount, profile.negativeCount,
-        profile.averageTraffic, profile.averageConversion, profile.confidence,
-        JSON.stringify({ ...profile.insights, scopeName: profile.scopeName }), profile.updatedAt,
+      await connection.query(
+        `INSERT INTO learning_profiles(
+          scope_type, scope_key, sample_count, labeled_count, positive_count, neutral_count, negative_count,
+          avg_traffic, avg_conversion, confidence, insights_json, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          profile.scopeType, profile.scopeKey, profile.sampleCount, profile.labeledCount,
+          profile.positiveCount, profile.neutralCount, profile.negativeCount,
+          profile.averageTraffic, profile.averageConversion, profile.confidence,
+          JSON.stringify({ ...profile.insights, scopeName: profile.scopeName }), profile.updatedAt,
+        ],
       );
-    });
-    db.exec("COMMIT");
+    }
+    await connection.commit();
   } catch (error) {
-    db.exec("ROLLBACK");
+    try {
+      await connection.rollback();
+    } catch {
+      /* transaction already closed */
+    }
     throw error;
+  } finally {
+    connection.release();
   }
   return scopes.size;
 }
@@ -284,15 +312,21 @@ function profileFromRow(row: Record<string, unknown>): LearningProfile {
   };
 }
 
-export function getLearningOverview(): LearningOverview {
-  syncLearningMemories();
-  const db = getDb();
-  const profiles = (db.prepare(`SELECT * FROM learning_profiles
-    ORDER BY CASE scope_type WHEN 'global' THEN 0 WHEN 'product' THEN 1 ELSE 2 END, sample_count DESC`).all() as Array<Record<string, unknown>>)
-    .map(profileFromRow);
-  const memories = db.prepare(`SELECT m.*, p.name AS product_name, v.title AS video_title, v.manual_label
-    FROM learning_memories m JOIN products p ON p.id=m.product_id JOIN videos v ON v.id=m.video_id
-    ORDER BY m.updated_at DESC LIMIT 12`).all() as Array<MemoryRow & { manual_label?: string }>;
+export async function getLearningOverview(): Promise<LearningOverview> {
+  await syncLearningMemories();
+  const db = await getDb();
+  const profileRows = await queryRows(
+    db,
+    `SELECT * FROM learning_profiles
+     ORDER BY CASE scope_type WHEN 'global' THEN 0 WHEN 'product' THEN 1 ELSE 2 END, sample_count DESC`,
+  );
+  const profiles = profileRows.map(profileFromRow);
+  const memories = await queryRows<MemoryRow & { manual_label?: string }>(
+    db,
+    `SELECT m.*, p.name AS product_name, v.title AS video_title, v.manual_label
+     FROM learning_memories m JOIN products p ON p.id=m.product_id JOIN videos v ON v.id=m.video_id
+     ORDER BY m.updated_at DESC LIMIT 12`,
+  );
   const global = profiles.find((profile) => profile.scopeType === "global");
   return {
     learnedVideos: global?.sampleCount || 0,
@@ -321,21 +355,28 @@ export function getLearningOverview(): LearningOverview {
   };
 }
 
-export function getLearningContext(product: Product, excludeVideoId = "") {
-  syncLearningMemories();
-  const rows = getDb().prepare(`SELECT m.*, p.name AS product_name, v.title AS video_title
-    FROM learning_memories m JOIN products p ON p.id=m.product_id JOIN videos v ON v.id=m.video_id
-    WHERE m.video_id <> ? AND (m.product_id=? OR m.category=? OR m.outcome='positive')
-    ORDER BY CASE WHEN m.product_id=? THEN 0 WHEN m.category=? THEN 1 ELSE 2 END,
-      CASE m.outcome WHEN 'positive' THEN 0 WHEN 'neutral' THEN 1 WHEN 'unverified' THEN 2 ELSE 3 END,
-      m.updated_at DESC LIMIT 12`).all(
-    excludeVideoId, product.id, product.category || "未分类", product.id, product.category || "未分类",
-  ) as MemoryRow[];
-  const profiles = (getDb().prepare(`SELECT * FROM learning_profiles WHERE
-    (scope_type='global' AND scope_key='all') OR
-    (scope_type='category' AND scope_key=?) OR
-    (scope_type='product' AND scope_key=?)`).all(product.category || "未分类", product.id) as Array<Record<string, unknown>>)
-    .map(profileFromRow);
+export async function getLearningContext(product: Product, excludeVideoId = "") {
+  await syncLearningMemories();
+  const db = await getDb();
+  const rows = await queryRows<MemoryRow>(
+    db,
+    `SELECT m.*, p.name AS product_name, v.title AS video_title
+     FROM learning_memories m JOIN products p ON p.id=m.product_id JOIN videos v ON v.id=m.video_id
+     WHERE m.video_id <> ? AND (m.product_id=? OR m.category=? OR m.outcome='positive')
+     ORDER BY CASE WHEN m.product_id=? THEN 0 WHEN m.category=? THEN 1 ELSE 2 END,
+       CASE m.outcome WHEN 'positive' THEN 0 WHEN 'neutral' THEN 1 WHEN 'unverified' THEN 2 ELSE 3 END,
+       m.updated_at DESC LIMIT 12`,
+    [excludeVideoId, product.id, product.category || "未分类", product.id, product.category || "未分类"],
+  );
+  const profileRows = await queryRows(
+    db,
+    `SELECT * FROM learning_profiles WHERE
+      (scope_type='global' AND scope_key='all') OR
+      (scope_type='category' AND scope_key=?) OR
+      (scope_type='product' AND scope_key=?)`,
+    [product.category || "未分类", product.id],
+  );
+  const profiles = profileRows.map(profileFromRow);
   return {
     rule: "人工标签和备注是最高优先级证据；未标记案例仅作低置信度参考。不要机械复制历史分数。",
     profiles,
@@ -349,8 +390,9 @@ export function getLearningContext(product: Product, excludeVideoId = "") {
   };
 }
 
-export function refreshProductLearning(productId: string) {
-  const rows = getDb().prepare("SELECT id FROM videos WHERE product_id=? AND status='completed'").all(productId) as Array<{ id: string }>;
-  rows.forEach((row) => learnFromVideo(String(row.id), false));
-  refreshLearningProfiles();
+export async function refreshProductLearning(productId: string) {
+  const db = await getDb();
+  const rows = await queryRows<{ id: string }>(db, "SELECT id FROM videos WHERE product_id=? AND status='completed'", [productId]);
+  for (const row of rows) await learnFromVideo(String(row.id), false);
+  await refreshLearningProfiles();
 }

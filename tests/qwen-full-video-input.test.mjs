@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import test from "node:test";
+import test, { after } from "node:test";
 import ts from "typescript";
 
 const source = await readFile(new URL("../lib/providers/qwen.ts", import.meta.url), "utf8");
@@ -14,14 +14,24 @@ const stubSource = `
     model: globalThis.__qwenProviderModel || "qwen3.7-plus"
   });
   export const parseJsonLoose = JSON.parse;
+  export const getQwenPurposeModel = async () => null;
+  export const getPromptTemplate = async (_slug, _label, template) => ({ template });
+  export const fetchQwen = (...args) => globalThis.fetch(...args);
 `;
 const stubUrl = `data:text/javascript;base64,${Buffer.from(stubSource).toString("base64")}`;
+const typesSource = await readFile(new URL("../lib/types.ts", import.meta.url), "utf8");
+const typesUrl = `data:text/javascript;base64,${Buffer.from(ts.transpileModule(typesSource, {
+  compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
+}).outputText).toString("base64")}`;
 let compiled = ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
 }).outputText;
 compiled = compiled
   .replace('import "server-only";', "")
   .replaceAll('"@/lib/json-utils"', JSON.stringify(stubUrl))
+  .replaceAll('"@/lib/database"', JSON.stringify(stubUrl))
+  .replaceAll('"@/lib/types"', JSON.stringify(typesUrl))
+  .replaceAll('"@/lib/providers/qwen-transport"', JSON.stringify(stubUrl))
   .replaceAll('"@/lib/provider-config"', JSON.stringify(stubUrl));
 const qwen = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString("base64")}`);
 
@@ -29,6 +39,7 @@ const directory = await mkdtemp(path.join(tmpdir(), "qwen-video-"));
 const videoPath = path.join(directory, "complete.mp4");
 const videoBytes = Buffer.from([0, 1, 2, 3, 127, 128, 254, 255, ...Buffer.from("complete-video")]);
 await writeFile(videoPath, videoBytes);
+after(() => rm(directory, { recursive: true, force: true }));
 
 function successfulStream({ requestId = "req-success", result = { summary: "ok" } } = {}) {
   const serialized = JSON.stringify(result);
@@ -92,13 +103,13 @@ test("Qwen always sends the local complete MP4 and ignores a residual remote URL
   assert.equal(content.some((item) => item.type === "image_url"), false);
   assert.equal(content.some((item) => item.type === "input_audio"), false);
   assert.match(content[1].text, /原始画面和原始音轨的完整 MP4/);
-  assert.equal(requestBody.model, "qwen3.5-omni-plus");
+  assert.equal(requestBody.model, "qwen3.7-plus");
   assert.deepEqual(requestBody.modalities, ["text"]);
   assert.equal(requestBody.stream, true);
   assert.equal("response_format" in requestBody, false);
 
   assert.equal(diagnostic.outcome, "success");
-  assert.equal(diagnostic.model, "qwen3.5-omni-plus");
+  assert.equal(diagnostic.model, "qwen3.7-plus");
   assert.equal(diagnostic.inputBytes, videoBytes.length);
   assert.equal(diagnostic.inputSha256, createHash("sha256").update(videoBytes).digest("hex"));
   assert.equal(diagnostic.requestId, "req-success");
@@ -130,7 +141,7 @@ test("a throwing diagnostic callback cannot alter a successful analysis", async 
   assert.equal(callbackCalls, 1);
 });
 
-test("a supported Omni model from provider settings is used for both video and translation", async () => {
+test("video honors the configured model and text translation keeps its own model", async () => {
   const priorEnvironmentModel = process.env.QWEN_VIDEO_MODEL;
   delete process.env.QWEN_VIDEO_MODEL;
   globalThis.__qwenProviderModel = "qwen3.5-omni-flash";
@@ -152,7 +163,7 @@ test("a supported Omni model from provider settings is used for both video and t
     if (priorEnvironmentModel === undefined) delete process.env.QWEN_VIDEO_MODEL;
     else process.env.QWEN_VIDEO_MODEL = priorEnvironmentModel;
   }
-  assert.deepEqual(models, ["qwen3.5-omni-flash", "qwen3.5-omni-flash"]);
+  assert.deepEqual(models, ["qwen3.5-omni-flash", "qwen-plus"]);
 });
 
 test("video requests share a two-slot Qwen limit and jump ahead of queued translations", async () => {
@@ -244,6 +255,7 @@ test("the parent task signal can stop Qwen before the ten-minute ceiling", async
         diagnostic = value;
       },
     });
+    await waitUntil(() => Boolean(fetchSignal), "request did not start");
     controller.abort(new Error("parent task stopped"));
     await assert.rejects(analysis, /parent task stopped/);
   });
@@ -361,4 +373,49 @@ test("an empty successful stream emits an invalid-response diagnostic", async ()
   assert.equal(typeof diagnostic.headersMs, "number");
   assert.equal(diagnostic.firstTokenMs, null);
   assert.equal(diagnostic.responseSha256, "");
+});
+
+test("nested native error codes distinguish header timeout from a socket failure without retaining secrets", async () => {
+  for (const code of ["UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT", "ECONNRESET", "sk-not-allowed"]) {
+    let diagnostic;
+    const native = Object.assign(new Error("secret URL https://signed.example/?token=secret"), { code });
+    await withMockedFetch(async () => { throw new TypeError("fetch failed", { cause: native }); }, async () => {
+      await assert.rejects(qwen.analyzeVideoWithQwen({
+        prompt: "分析", localVideoPath: videoPath,
+        onDiagnostic: async value => { await Promise.resolve(); diagnostic = value; },
+      }), error => error.code === (code.includes("TIMEOUT") ? "timeout" : "network_error"));
+    });
+    assert.equal(diagnostic.errorCode, code.startsWith("sk-") ? undefined : code);
+    assert.doesNotMatch(JSON.stringify(diagnostic), /secret|signed|token|sk-not/);
+  }
+});
+
+test("the explicit deadline is recognized even if a streaming body reports only terminated", async () => {
+  const originalTimeout = AbortSignal.timeout;
+  const deadline = new AbortController();
+  let diagnostic;
+  AbortSignal.timeout = () => deadline.signal;
+  try {
+    await withMockedFetch(async () => new Response(new ReadableStream({
+      start(controller) {
+        deadline.abort(new DOMException("deadline expired", "TimeoutError"));
+        controller.error(new TypeError("terminated"));
+      },
+    })), () => assert.rejects(qwen.analyzeVideoWithQwen({
+      prompt: "分析", localVideoPath: videoPath, onDiagnostic: value => { diagnostic = value; },
+    }), /分析超时/));
+    assert.equal(diagnostic.errorCode, "REQUEST_TIMEOUT");
+    assert.equal(diagnostic.outcome, "timeout");
+  } finally { AbortSignal.timeout = originalTimeout; }
+});
+
+test("a permanent HTTP rejection containing the word timeout is not treated as a network retry", async () => {
+  await withMockedFetch(async () => new Response(JSON.stringify({ error: { message: "invalid timeout parameter" } }), {
+    status: 400,
+  }), () => assert.rejects(qwen.analyzeVideoWithQwen({ prompt: "分析", localVideoPath: videoPath }), error => {
+    assert.equal(error.code, "http_error");
+    assert.equal(error.retryable, false);
+    assert.equal(error.httpStatus, 400);
+    return true;
+  }));
 });

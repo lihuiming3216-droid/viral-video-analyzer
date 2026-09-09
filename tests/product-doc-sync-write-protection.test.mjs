@@ -235,8 +235,11 @@ test("whole-cell guard uses the current empty paragraph rather than a removed sc
   });
 });
 
+// A simulated rejection checks error handling, not a guarantee that Feishu
+// actually rejects stale revisions. Live acceptance found that it may not.
 for (const failure of ["missing paragraph", "cycle", "revision conflict"]) {
-  test(`whole-cell guard fails closed on ${failure}`, async () => {
+  const label = failure === "revision conflict" ? "simulated API revision rejection" : failure;
+  test(`whole-cell guard fails closed on ${label}`, async () => {
     await withResultCellFixture(async ({ blocks, state, writes, cached, sync }) => {
       state.onPreview = () => {
         blocks.find(b => b.block_id === "row-1-translation").children.push(

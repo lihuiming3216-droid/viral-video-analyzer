@@ -234,9 +234,9 @@ async function updateBlankResultCell(
   if (!cellId || !normalizedNext) return false;
   const latest = await latestRowText(client, documentId, rowIdentity.linkBlockId, cellId);
   if (!rowMatchesSource(latest.linkText, rowIdentity.sourceUrl) || latest.resultText.trim() || !latest.resultTextId) return false;
-  // Feishu rejects a patch whose expected revision is no longer current. That
-  // closes the last read/write race if the link or result changes after all
-  // relevant blocks were read at the same fresh document revision.
+  // Keep the revision used for these reads as API context. Live verification
+  // showed Feishu can accept a patch against an older revision: this is NOT
+  // an atomic compare-and-set, and a manual edit after our read can still race.
   return updateIfChanged(client, documentId, latest.resultTextId, "", normalizedNext, {
     documentRevisionId: latest.documentRevisionId,
   });

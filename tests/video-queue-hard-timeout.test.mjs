@@ -70,6 +70,67 @@ function applyPatch(video, patch) {
   });
 }
 
+test("two workers run concurrently; stopping one neither stops the other nor blocks the next row", async () => {
+  const videos = queueState(["stop-one", "keep-two", "next-three"]);
+  const running = new Map();
+  const finished = [];
+  const queue = await loadQueue({
+    getVideo: id => videos.get(id),
+    updateVideo: (id, patch) => applyPatch(videos.get(id), patch),
+    startVideoAttempt: id => ({ attemptId: `attempt-${id}`, attemptNumber: 1 }),
+    finishVideoAttempt: (...args) => finished.push(args),
+    analyzeVideo: (id, signal) => new Promise(resolve => {
+      running.set(id, { signal, finish: () => { videos.get(id).status = "completed"; resolve(); } });
+    }),
+  }, 5_000);
+
+  await queue.enqueueVideos(["stop-one", "keep-two", "next-three"]);
+  await waitFor(() => running.size === 2);
+  assert.deepEqual([...running.keys()], ["stop-one", "keep-two"]);
+  // A scan of an already running row must not create another execution.
+  await queue.enqueueVideos(["keep-two"]);
+  assert.equal(running.size, 2);
+  await queue.stopVideo("stop-one");
+  await waitFor(() => running.has("next-three"));
+  assert.equal(running.get("stop-one").signal.aborted, true);
+  assert.equal(running.get("keep-two").signal.aborted, false);
+  assert.equal(running.get("next-three").signal.aborted, false);
+  running.get("keep-two").finish();
+  running.get("next-three").finish();
+  await waitFor(() => finished.length === 3 && globalThis.__viralQueueActiveIds.size === 0);
+  assert.deepEqual(new Map(finished.map(([, id, status]) => [id, status])), new Map([
+    ["stop-one", "stopped"], ["keep-two", "completed"], ["next-three", "completed"],
+  ]));
+});
+
+test("a failed concurrent worker records only its own error and frees a slot", async () => {
+  const videos = queueState(["fail-one", "keep-two", "next-three"]);
+  const running = new Map(), finished = [];
+  const queue = await loadQueue({
+    getVideo: id => videos.get(id),
+    updateVideo: (id, patch) => applyPatch(videos.get(id), patch),
+    startVideoAttempt: id => ({ attemptId: `attempt-${id}`, attemptNumber: 1 }),
+    finishVideoAttempt: (...args) => finished.push(args),
+    analyzeVideo: (id, signal) => new Promise((resolve, reject) => {
+      running.set(id, { signal, reject, finish: () => { videos.get(id).status = "completed"; resolve(); } });
+    }),
+  }, 5_000);
+  await queue.enqueueVideos([...videos.keys()]);
+  await waitFor(() => running.size === 2);
+  running.get("fail-one").reject(new Error("isolated model failure"));
+  await waitFor(() => running.has("next-three"));
+  assert.equal(videos.get("fail-one").errorMessage, "isolated model failure");
+  assert.equal(videos.get("keep-two").errorMessage, null);
+  assert.equal(running.get("keep-two").signal.aborted, false);
+  running.get("keep-two").finish();
+  running.get("next-three").finish();
+  await waitFor(() => finished.length === 3 && globalThis.__viralQueueActiveIds.size === 0);
+  assert.deepEqual(finished.find(([, id]) => id === "fail-one"), [
+    "attempt-fail-one", "fail-one", "failed", "isolated model failure",
+  ]);
+  assert.equal(finished.filter(([, , status]) => status === "completed").length, 2);
+});
+
 test("hard timeout releases both workers even when analysis ignores abort", async () => {
   const videos = queueState(["stuck-a", "stuck-b", "next"]);
   const started = [];

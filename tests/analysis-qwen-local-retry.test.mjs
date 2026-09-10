@@ -510,6 +510,39 @@ test("an existing TokScript Chinese transcript needs no text-model request", asy
   assert.equal(p.video.transcriptZh, "TokScript 已返回中文版");
 });
 
+test("no voiceover does not skip complete-video analysis or trigger another transcription", async () => {
+  let videoCalls = 0, translationCalls = 0;
+  const p = await pipeline({
+    analyzeVideoWithQwen: async input => {
+      videoCalls += 1;
+      assert.equal(input.localVideoPath, "pipeline-test/qwen-full-video.mp4");
+      return { summary: "纯画面产品演示", hook: { description: "直接展示使用过程" } };
+    },
+    translateTranscriptWithQwen: async () => { translationCalls += 1; return "unexpected"; },
+  });
+  p.video.transcriptOriginal = "背景音乐，无有效产品口播";
+  p.video.transcriptZh = "背景音乐，无有效产品口播";
+  await p.run();
+  assert.equal(videoCalls, 1);
+  assert.equal(translationCalls, 0);
+  assert.equal(p.video.status, "completed");
+  assert.equal(p.video.transcriptZh, "背景音乐，无有效产品口播");
+});
+
+test("an unverified missing audio track makes zero Qwen video calls but does not block the file or translation", async () => {
+  let videoCalls = 0;
+  const p = await pipeline({
+    prepareLocalVideoForQwen: async () => { throw new Error("完整视频缺少音频轨，无法进行 Qwen 全模态分析"); },
+    analyzeVideoWithQwen: async () => { videoCalls += 1; throw new Error("must not run"); },
+  });
+  await assert.rejects(p.run(), /缺少音频轨/);
+  await waitFor(() => p.deliveries.some(d => d.status === "failed" && d.translation === "TokScript 中文翻译"));
+  assert.equal(videoCalls, 0);
+  assert.deepEqual(p.enqueued, []);
+  assert.equal(p.video.originalPath, "pipeline-test/original.mp4");
+  assert.equal(p.video.status, "failed");
+});
+
 test("stopping the first video request cannot start the second request", async () => {
   const controller = new AbortController();
   let calls = 0;

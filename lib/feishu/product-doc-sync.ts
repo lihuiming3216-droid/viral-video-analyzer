@@ -24,6 +24,7 @@ import { ensureFeishuVideoPreview } from "@/lib/feishu/docx-file";
 import { ensureFeishuConnection, getConnectedFeishuChannel } from "@/lib/feishu/runtime";
 import { conciseProductDocAnalysis } from "@/lib/product-doc-analysis";
 import { enqueueVideos } from "@/lib/queue";
+import { NO_PRODUCT_VOICEOVER_TRANSCRIPT } from "@/lib/transcript-validation";
 import type { Product, VideoRecord } from "@/lib/types";
 import { resolveMediaPath } from "@/lib/video-processing";
 
@@ -477,8 +478,11 @@ async function syncProductDocumentUnlocked(
       // the latest row identity/revision and preserve nonempty user content.
       const transcriptZh = String(video.transcriptZh || "").trim();
       if (!row[3].text.trim() && transcriptZh) {
+        // Shorten only the provider's exact sentinel at display time. Keep
+        // stored transcripts, ordinary text and existing user cells unchanged.
         await updateBlankResultCell(
-          client, product.documentId, translationCellId, transcriptZh,
+          client, product.documentId, translationCellId,
+          transcriptZh === NO_PRODUCT_VOICEOVER_TRANSCRIPT ? "无口播" : transcriptZh,
           { linkBlockId, sourceUrl: video.sourceUrl || "" },
         );
       }

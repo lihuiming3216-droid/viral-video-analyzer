@@ -7,6 +7,11 @@ const syncSource = await readFile(
   new URL("../lib/feishu/product-doc-sync.ts", import.meta.url),
   "utf8",
 );
+const transcriptValidationSource = await readFile(new URL("../lib/transcript-validation.ts", import.meta.url), "utf8");
+const transcriptValidationUrl = `data:text/javascript;base64,${Buffer.from(ts.transpileModule(transcriptValidationSource, {
+  compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
+}).outputText).toString("base64")}`;
+const { NO_PRODUCT_VOICEOVER_TRANSCRIPT } = await import(transcriptValidationUrl);
 
 async function loadSyncModule() {
   const stubSource = `
@@ -82,6 +87,7 @@ async function loadSyncModule() {
     .replaceAll('"@/lib/feishu/document"', JSON.stringify(stubUrl))
     .replaceAll('"@/lib/feishu/runtime"', JSON.stringify(stubUrl))
     .replaceAll('"@/lib/product-doc-analysis"', JSON.stringify(stubUrl))
+    .replaceAll('"@/lib/transcript-validation"', JSON.stringify(transcriptValidationUrl))
     .replaceAll('"@/lib/queue"', JSON.stringify(stubUrl));
   compiled = compiled.replaceAll('"@/lib/video-processing"', JSON.stringify(stubUrl));
   compiled = compiled.replaceAll('"@/lib/feishu/docx-file"', JSON.stringify(stubUrl));
@@ -171,6 +177,42 @@ async function withResultCellFixture(run, overrides = {}) {
 }
 
 const manualParagraph = () => ({ block_type: 2, text: { elements: [{ text_run: { content: "人工第二段" } }] } });
+
+for (const status of ["analyzing", "failed", "completed"]) {
+  test(`handcard voiceover label: exact TokScript marker becomes no voiceover during ${status}`, async () => {
+    await withResultCellFixture(async ({ ids, video, writes, enqueued, updates, sync }) => {
+      const storedTranscript = video.transcriptZh;
+      await sync();
+      assert.deepEqual(writes.filter(w => w.id === ids.translation), [{ id: ids.translation, content: "无口播" }]);
+      assert.equal(video.transcriptZh, storedTranscript, "display formatting must not change stored provider data");
+      assert.equal(updates.some(p => "transcript_zh" in p || "transcript_original" in p), false);
+      assert.deepEqual(enqueued, [], "formatting must not rerun analysis");
+      if (status === "completed") assert.ok(writes.some(w => w.id === ids.analysis && w.content === "自动视频分析"));
+    }, { status, transcriptZh: `  ${NO_PRODUCT_VOICEOVER_TRANSCRIPT}\n` });
+  });
+}
+
+for (const timing of ["before scan", "during preview"]) {
+  test(`handcard voiceover label: preserves existing text ${timing}`, async () => {
+    await withResultCellFixture(async ({ ids, append, state, writes, sync }) => {
+      const fill = () => { append("translation", manualParagraph()); state.revision += 1; };
+      if (timing === "before scan") fill();
+      else state.onPreview = fill;
+      await sync();
+      assert.equal(writes.some(w => w.id === ids.translation), false);
+      assert.ok(writes.some(w => w.id === ids.analysis), "the independent empty analysis still fills");
+    }, { transcriptZh: NO_PRODUCT_VOICEOVER_TRANSCRIPT });
+  });
+}
+
+for (const transcriptZh of ["无口播", `这是口播中的原句：${NO_PRODUCT_VOICEOVER_TRANSCRIPT}，不是系统标记。`, ""]) {
+  test(`handcard voiceover label: leaves other translation text unchanged ${JSON.stringify(transcriptZh)}`, async () => {
+    await withResultCellFixture(async ({ ids, writes, sync }) => {
+      await sync();
+      assert.deepEqual(writes.filter(w => w.id === ids.translation), transcriptZh ? [{ id: ids.translation, content: transcriptZh }] : []);
+    }, { transcriptZh });
+  });
+}
 
 for (const status of ["completed", "analyzing", "failed", "stopped"]) {
   for (const timing of ["before scan", "during preview"]) {

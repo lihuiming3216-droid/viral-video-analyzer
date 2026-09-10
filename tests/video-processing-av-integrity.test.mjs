@@ -29,7 +29,7 @@ compiled = compiled
   .replaceAll('"@/lib/network"', JSON.stringify(networkStub));
 const processing = await import(moduleUrl(compiled));
 
-async function makeFixture(directory, name, includeAudio) {
+async function makeFixture(directory, name, includeAudio, audioSource = "sine=frequency=440:sample_rate=16000") {
   const output = path.join(directory, name);
   const args = [
     "-hide_banner", "-loglevel", "error", "-y",
@@ -37,7 +37,7 @@ async function makeFixture(directory, name, includeAudio) {
   ];
   if (includeAudio) {
     args.push(
-      "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=16000",
+      "-f", "lavfi", "-i", audioSource,
       "-map", "0:v:0", "-map", "1:a:0",
     );
   }
@@ -49,6 +49,21 @@ async function makeFixture(directory, name, includeAudio) {
   );
   await runFile(ffmpegInstaller.path, args, { maxBuffer: 8 * 1024 * 1024 });
   return output;
+}
+
+async function decodeAudio(file) {
+  const { stdout } = await runFile(ffmpegInstaller.path, [
+    "-v", "error", "-i", file, "-map", "0:a:0", "-vn",
+    "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", "-f", "s16le", "pipe:1",
+  ], { encoding: "buffer", maxBuffer: 4 * 1024 * 1024 });
+  return stdout;
+}
+
+function audioRms(pcm) {
+  assert.ok(pcm.length > 0, "decoding must return actual audio samples");
+  let squareSum = 0;
+  for (let i = 0; i < pcm.length; i += 2) squareSum += pcm.readInt16LE(i) ** 2;
+  return Math.sqrt(squareSum / (pcm.length / 2));
 }
 
 async function makeOversizedFixture(directory) {
@@ -95,6 +110,20 @@ test("a video-only MP4 is rejected before Qwen preparation", async (t) => {
   await assert.rejects(access(targetPath));
 });
 
+test("a complete MP4 with a genuinely silent AAC track is accepted unchanged", async (t) => {
+  const directory = await mkdtemp(path.join(tmpdir(), "qwen-av-zero-audio-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const sourcePath = await makeFixture(directory, "silent-track.mp4", true, "anullsrc=r=16000:cl=mono");
+  const targetPath = path.join(directory, "proxy.mp4");
+  const before = await readFile(sourcePath);
+  assert.equal(audioRms(await decodeAudio(sourcePath)), 0);
+  const prepared = await processing.prepareCompleteVideoFileForQwen(sourcePath, targetPath, 1);
+  assert.equal(prepared, sourcePath);
+  assert.equal((await processing.validateCompleteVideoForQwen(prepared)).audioCodec, "aac");
+  assert.deepEqual(await readFile(prepared), before);
+  await assert.rejects(access(targetPath));
+});
+
 test("an oversized source becomes a bounded full-duration H.264/AAC proxy", async (t) => {
   const directory = await mkdtemp(path.join(tmpdir(), "qwen-av-proxy-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
@@ -117,4 +146,10 @@ test("an oversized source becomes a bounded full-duration H.264/AAC proxy", asyn
   assert.equal(proxyMetadata.videoCodec, "h264");
   assert.equal(proxyMetadata.audioCodec, "aac");
   assert.ok(Math.abs(proxyMetadata.duration - sourceMetadata.duration) <= 0.5);
+  const sourceAudio = await decodeAudio(sourcePath);
+  const proxyAudio = await decodeAudio(targetPath);
+  assert.ok(audioRms(sourceAudio) > 100, "the fixture actually contains an audible signal");
+  assert.ok(audioRms(proxyAudio) > 100, "transcoding must not turn the source signal into silence");
+  assert.ok(Math.abs(sourceAudio.length - proxyAudio.length) / (16000 * 2) <= 0.5,
+    "the proxy must retain the full audio duration as well as the picture duration");
 });

@@ -54,7 +54,7 @@ export async function POST(request: NextRequest) {
     if (!appToken || !tableId || !recordId) return NextResponse.json({ error: "缺少 appToken、tableId 或 recordId" }, { status: 400 });
     const fieldMap = payloadFieldMap(body.fieldMap || body.field_map);
     // Every accepted click schedules one refresh. The handler itself holds a
-    // per-Base-record lock across shell -> capture -> merge -> document sync,
+    // per-Base-record lock across shell -> PID cache -> document sync,
     // so concurrent clicks serialize without silently dropping a click.
     after(async () => {
       const startedAt = Date.now();
@@ -71,7 +71,7 @@ export async function POST(request: NextRequest) {
           fieldMap,
         });
         // The first external write is deliberately the newly created/reused
-        // hand-card URL inside handleFeishuAutomation. Product-page parsing
+        // hand-card URL inside handleFeishuAutomation. Product-data organization
         // and even status-column failures must come after the document exists.
         const result = await handleFeishuAutomation({
           client: channel.rawClient,

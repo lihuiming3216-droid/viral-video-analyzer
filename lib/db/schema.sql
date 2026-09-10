@@ -4,6 +4,20 @@
 
 SET NAMES utf8mb4;
 
+-- A PID is charged at most once automatically, across rows/cards/processes.
+-- Requested/failed states are deliberately never recycled on restart/timeout.
+-- Raw responses and image bytes live in the persistent private .data directory.
+CREATE TABLE IF NOT EXISTS product_catalog_cache (
+  pid VARCHAR(30) PRIMARY KEY,
+  country CHAR(2) NOT NULL DEFAULT 'us',
+  fetch_state VARCHAR(16) NOT NULL,
+  analysis_state VARCHAR(16) NOT NULL,
+  result_json JSON,
+  error_message VARCHAR(500) NOT NULL DEFAULT '',
+  created_at VARCHAR(32) NOT NULL,
+  updated_at VARCHAR(32) NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
 -- 时间戳全部沿用原来 SQLite 里 now() 产生的 ISO-8601 字符串（如 2026-08-30T09:57:10.484Z），
 -- 不改存 MySQL 原生 DATETIME，省去时区/格式转换，直接保持和现有业务代码一致。VARCHAR 索引排序
 -- 对定长 ISO-8601 UTC 字符串等价于按时间排序。

@@ -33,7 +33,7 @@ test("both workflows pin the reviewed Node 24 checkout release without retaining
 test("verification reuses the image and smoke test while running regression containers offline", () => {
   assert.match(workflow, /docker build --build-arg VCS_REF="\$GITHUB_SHA"/);
   const runs = workflow.split("\n").filter(line => line.includes("docker run"));
-  assert.equal(runs.length, 2);
+  assert.equal(runs.length, 3);
   assert.ok(runs.every(line => line.includes("--network none") && line.includes("--entrypoint node")));
   assert.match(workflow, /tests\/product-doc-sync-write-protection.test.mjs/);
   assert.match(workflow, /tests\/verification-workflow.test.mjs/);

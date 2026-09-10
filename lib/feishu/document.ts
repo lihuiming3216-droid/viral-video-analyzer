@@ -769,11 +769,8 @@ export async function ensureProductCardByPid(
       folderToken: productFolderToken,
     });
 
-    // An already-existing card is returned untouched — staff may already be
-    // editing it, and a button click must never rename or rewrite it out from
-    // under them. Title normalization and identity-field sync only apply to a
-    // document this call just created.
-    if (!existing) {
+    // PID selects the document; the supplied name only normalizes its title.
+    if (!existing || existing.title !== title) {
       await renameProductCardDocument(client, document.documentId, name, pid);
     }
 
@@ -1075,7 +1072,7 @@ export async function copyFeishuTemplateDocument(
   };
 }
 
-export async function listFeishuDocumentBlocks(client: Client, documentId: string) {
+export async function listFeishuDocumentBlocks(client: Client, documentId: string, revision = -1) {
   const blocks: Array<Record<string, unknown>> = [];
   const seenPageTokens = new Set<string>();
   let pageToken = "";
@@ -1089,7 +1086,7 @@ export async function listFeishuDocumentBlocks(client: Client, documentId: strin
       method: "GET",
       params: {
         page_size: "500",
-        document_revision_id: "-1",
+        document_revision_id: String(revision),
         ...(pageToken ? { page_token: pageToken } : {}),
       },
     });
@@ -1125,11 +1122,11 @@ export async function normalizeProductTemplate(client: Client, documentId: strin
   return { scanned: blocks.length, updated };
 }
 
-export async function getFeishuDocumentBlock(client: Client, documentId: string, blockId: string) {
+export async function getFeishuDocumentBlock(client: Client, documentId: string, blockId: string, revision = -1) {
   const response = await client.request<{ code?: number; msg?: string; data?: { block?: Record<string, unknown> } }>({
     url: `/open-apis/docx/v1/documents/${encodeURIComponent(documentId)}/blocks/${encodeURIComponent(blockId)}`,
     method: "GET",
-    params: { document_revision_id: "-1" },
+    params: { document_revision_id: String(revision) },
   });
   apiError(response, "读取飞书文档单元格失败");
   return response.data?.block || {};
@@ -1318,6 +1315,12 @@ export type ProductCardManagedFieldsInput = {
   derivedOnly?: boolean;
   /** Validate the complete managed template structure without patching blocks. */
   preflightOnly?: boolean;
+  /** Missing provider facts must not erase existing manual values. */
+  preserveExistingOnMissing?: boolean;
+  /** Snapshot before the slow provider call; skip values edited since then. */
+  expectedValues?: Partial<Record<ProductCardManagedLabel, string>>;
+  /** Recheck each target at a specific document revision before patching. */
+  protectRevision?: boolean;
 };
 
 const PRODUCT_FIELD_LEADING_DECORATION = String.raw`[ \t\p{Extended_Pictographic}\uFE0F\u200D•·▪▫◦●○★☆]*`;
@@ -1385,6 +1388,8 @@ export function syncProductCardManagedBlockText(
   if (!matched) return content;
   const values = productCardManagedValues(input);
   if (!values.has(matched.label)) return content;
+  if (input.expectedValues && input.expectedValues[matched.label] !== matched.value.trim()) return content;
+  if (input.preserveExistingOnMissing && matched.value.trim() && (!values.get(matched.label) || values.get(matched.label) === "未找到")) return content;
   return `${matched.prefix}${values.get(matched.label) || ""}${matched.tail}`;
 }
 
@@ -1454,8 +1459,23 @@ export async function syncProductCardManagedFields(
   client: Client,
   input: ProductCardManagedFieldsInput,
 ) {
+  return withProductDocumentLock(`managed_${input.documentId}`, () => syncProductCardManagedFieldsUnlocked(client, input));
+}
+
+async function managedDocumentRevision(client: Client, documentId: string) {
+  const response = await client.request<{ code?: number; msg?: string; data?: { document?: { revision_id?: number } } }>({
+    url: `/open-apis/docx/v1/documents/${encodeURIComponent(documentId)}`, method: "GET",
+  });
+  apiError(response, "读取产品文档版本失败");
+  const revision = response.data?.document?.revision_id;
+  if (typeof revision !== "number" || !Number.isInteger(revision) || revision < 0) throw new Error("飞书没有返回有效的文档版本号，已停止写入");
+  return revision;
+}
+
+async function syncProductCardManagedFieldsUnlocked(client: Client, input: ProductCardManagedFieldsInput) {
   const documentId = requiredToken(input.documentId, "飞书产品文档 Token");
-  const blocks = await listFeishuDocumentBlocks(client, documentId);
+  const revision = input.protectRevision ? await managedDocumentRevision(client, documentId) : -1;
+  const blocks = await listFeishuDocumentBlocks(client, documentId, revision);
   const values = productCardManagedValues(input);
   const expectedLabels = input.preflightOnly && input.mode === "verified-basic"
     ? [...PRODUCT_CARD_MANAGED_LABELS]
@@ -1502,6 +1522,7 @@ export async function syncProductCardManagedFields(
       ? [[label, matches[0].matched.value.trim()]]
       : [];
   })) as Partial<Record<ProductCardManagedLabel, string>>;
+  const skippedLabels: ProductCardManagedLabel[] = [];
 
   // Structural validation is deliberately completed before the first patch.
   // A partial update would be worse than a visible, retryable template error.
@@ -1513,6 +1534,7 @@ export async function syncProductCardManagedFields(
       missingLabels,
       duplicateLabels,
       currentValues,
+      skippedLabels,
     };
   }
   if (duplicateLabels.length) {
@@ -1535,6 +1557,14 @@ export async function syncProductCardManagedFields(
     return Number(leftDerived) - Number(rightDerived);
   });
   for (const { block, elements, content, matched } of managedBlocks) {
+    if (input.expectedValues && input.expectedValues[matched.label] !== matched.value.trim()) {
+      skippedLabels.push(matched.label);
+      continue;
+    }
+    if (input.protectRevision && elements.some(element => !element.text_run)) {
+      skippedLabels.push(matched.label);
+      continue;
+    }
     const next = syncProductCardManagedBlockText(content, input);
     const expectedProductUrl = matched.label === "产品链接" ? values.get("产品链接") || "" : "";
     const expectedLink = /^https:\/\//i.test(expectedProductUrl) ? expectedProductUrl : "";
@@ -1545,11 +1575,21 @@ export async function syncProductCardManagedFields(
       ? currentLinks.length === 1 && currentLinks[0] === expectedLink
       : currentLinks.length === 0);
     if (next === content && linkStyleMatches) continue;
+    let documentRevisionId: number | undefined;
+    if (input.protectRevision) {
+      documentRevisionId = await managedDocumentRevision(client, documentId);
+      const latest = await getFeishuDocumentBlock(client, documentId, String(block.block_id), documentRevisionId);
+      if (JSON.stringify(latest.text) !== JSON.stringify(block.text)) {
+        skippedLabels.push(matched.label);
+        continue;
+      }
+    }
     await updateFeishuTextBlockElements(
       client,
       documentId,
       String(block.block_id),
       styledProductFieldElements(next, expectedProductUrl),
+      { documentRevisionId },
     );
     updated += 1;
   }
@@ -1560,6 +1600,7 @@ export async function syncProductCardManagedFields(
     missingLabels,
     duplicateLabels,
     currentValues,
+    skippedLabels,
   };
 }
 

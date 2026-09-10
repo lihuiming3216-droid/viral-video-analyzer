@@ -2,12 +2,13 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-test("the Base product-card button no longer parses product links or rewrites template fields", async () => {
+test("the Base product-card button uses the shared PID catalog, never product-page parsing", async () => {
   const source = await readFile(new URL("../lib/feishu/automation.ts", import.meta.url), "utf8");
   assert.doesNotMatch(source, /parsePublicProductPage/);
-  assert.doesNotMatch(source, /syncProductCardManagedFields/);
+  assert.match(source, /getProductCatalog\(effectivePid\)/);
+  assert.match(source, /preserveExistingOnMissing: true/);
   assert.match(source, /ensureProductCardByPid\(input\.client/);
-  assert.match(source, /手卡已就绪，请手动填写/);
+  assert.match(source, /手卡商品资料已整理/);
 });
 
 test("product-card identity accepts the Base PID without requiring a product URL", async () => {

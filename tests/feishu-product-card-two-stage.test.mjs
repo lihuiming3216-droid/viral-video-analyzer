@@ -39,6 +39,36 @@ async function loadDocumentModule() {
 
 const documentModule = await loadDocumentModule();
 
+test("missing catalog facts preserve manual values, while supported facts replace the old value", () => {
+  const input = { mode: "verified-basic", usageMethod: "未找到", preserveExistingOnMissing: true };
+  assert.equal(documentModule.syncProductCardManagedBlockText("使用方法：人工步骤", input), "使用方法：人工步骤");
+  assert.equal(documentModule.syncProductCardManagedBlockText("使用方法：", input), "使用方法：未找到");
+  assert.equal(documentModule.syncProductCardManagedBlockText("使用方法：人工步骤", { ...input, usageMethod: "打开盖子" }), "使用方法：打开盖子");
+  assert.equal(documentModule.syncProductCardManagedBlockText("使用方法：刚改的步骤", { ...input, usageMethod: "打开盖子", expectedValues: { 使用方法: "人工步骤" } }), "使用方法：刚改的步骤");
+});
+
+test("catalog writes re-read target at a revision and skip a concurrent manual change", async () => {
+  const block = textBlock("usage", "使用方法：旧步骤");
+  const patches = [];
+  let changed = true;
+  const client = {
+    request: async ({ url, params }) => {
+      if (url.endsWith("/blocks")) { assert.equal(params.document_revision_id, "10"); return { code: 0, data: { items: [block] } }; }
+      if (url.endsWith("/blocks/usage")) return { code: 0, data: { block: changed ? textBlock("usage", "使用方法：刚编辑") : block } };
+      return { code: 0, data: { document: { revision_id: 10 } } };
+    },
+    docx: { v1: { documentBlock: { patch: async payload => { patches.push(payload); return { code: 0 }; } } } },
+  };
+  const input = { documentId: "card", mode: "verified-basic", usageMethod: "新步骤", expectedValues: { 使用方法: "旧步骤" }, protectRevision: true };
+  const skipped = await documentModule.syncProductCardManagedFields(client, input);
+  assert.deepEqual(skipped.skippedLabels, ["使用方法"]);
+  assert.equal(patches.length, 0);
+  changed = false;
+  const written = await documentModule.syncProductCardManagedFields(client, input);
+  assert.equal(written.updated, 1);
+  assert.equal(patches[0].params.document_revision_id, 10);
+});
+
 test("manual product cards are renamed exactly to productName_PID without touching template blocks", async () => {
   const patches = [];
   const client = {
@@ -475,7 +505,7 @@ test("PID lookup shares one card across rows and always normalizes productName_P
   assert.equal(state.copyCount, 1, "the second Base row must reuse the exact PID document");
 });
 
-test("duplicate documents with the same complete PID stop instead of guessing", async () => {
+test("duplicate documents with the same complete PID choose the newest edited match", async () => {
   globalThis.__productCardDocumentTestHooks = {
     getFeishuSettings: () => ({ productFolderToken: "folder-token" }),
   };
@@ -491,10 +521,9 @@ test("duplicate documents with the same complete PID stop instead of guessing", 
       ],
     },
   });
-  await assert.rejects(
-    documentModule.ensureProductCardByPid(client, { name: "产品A", pid, ownerOpenId: "ou_owner" }),
-    /发现重复 PID 文档/,
-  );
+  const result = await documentModule.ensureProductCardByPid(client, { name: "产品A", pid, ownerOpenId: "ou_owner" });
+  assert.equal(result.documentId, "first");
+  assert.equal(result.reused, true);
 });
 
 test("an owner repair failure cannot hide an already-created shell", async () => {
@@ -563,7 +592,7 @@ test("a non-template document reports every missing managed label", async () => 
   ].sort());
 });
 
-test("a partially missing template performs zero patches", async () => {
+test("a partially missing template fills the available field and reports the missing one", async () => {
   const patches = [];
   const client = {
     request: async () => ({ code: 0, data: { items: [textBlock("name", "商品名称：旧名称")] } }),
@@ -578,11 +607,11 @@ test("a partially missing template performs zero patches", async () => {
     name: "新名称",
     pid: "1731678528327946361",
   });
-  assert.equal(result.updated, 0);
+  assert.equal(result.updated, 1);
   assert.deepEqual(result.matchedLabels, ["商品名称"]);
   assert.deepEqual(result.missingLabels, ["商品ID"]);
   assert.deepEqual(result.duplicateLabels, []);
-  assert.equal(patches.length, 0, "a valid earlier block must not be patched before preflight finishes");
+  assert.equal(patches.length, 1);
 });
 
 test("a duplicate expected label performs zero patches and raises a safe template error", async () => {

@@ -23,6 +23,7 @@ import { fetchTikTok } from "@/lib/providers/tokscript";
 import { buildBilingualSrt, buildTimestampedText, generateBilingualSubtitleFile, type TranscriptSegment } from "@/lib/subtitle";
 import { resolveMediaPath } from "@/lib/video-processing";
 import { assertDeliveryFields, assertDeliverySource, emptyFieldPatch, fieldHasContent, permanentDeliveryFailure } from "@/lib/feishu/delivery-guard";
+import { catalogError, catalogFields } from "@/lib/products/catalog-types";
 
 export interface FeishuAutomationFieldMap {
   productUrl: string;
@@ -127,9 +128,19 @@ function urlText(value: unknown): string {
   return "";
 }
 
-function field(fields: Record<string, unknown>, name: string, aliases: string[] = []) {
+function pidText(value: unknown): string {
+  if (typeof value === "number" && !Number.isSafeInteger(value)) throw new Error("PID 数字精度已丢失，请将飞书 PID 字段设为文本并重新粘贴完整 PID");
+  if (Array.isArray(value)) return value.map(pidText).filter(Boolean).join(", ");
+  if (value && typeof value === "object") {
+    const item = value as Record<string, unknown>;
+    return pidText(item.text ?? item.value ?? item.name ?? item.id);
+  }
+  return text(value);
+}
+
+function field(fields: Record<string, unknown>, name: string, aliases: string[] = [], read = text) {
   for (const key of [name, ...aliases]) {
-    if (key in fields) return text(fields[key]);
+    if (key in fields) return read(fields[key]);
   }
   return "";
 }
@@ -164,7 +175,7 @@ export function resolveAutomationFields(
   const map = { ...defaultFeishuAutomationFieldMap, ...inputMap };
   const productUrl = urlField(fields, map.productUrl, ["商品链接", "产品链接", ...(extraAliases.productUrl || [])]);
   // 新人组任务安排表用的字段名是"产品id"（小写 id，不带空格）——审计报告技术债第4条确认的缺口，直接补齐。
-  const suppliedPid = field(fields, map.pid, ["PID", "pid", "商品ID/PID", "产品id", "产品ID", ...(extraAliases.pid || [])]);
+  const suppliedPid = field(fields, map.pid, ["PID", "pid", "商品ID/PID", "产品id", "产品ID", ...(extraAliases.pid || [])], pidText);
   const documentField = inputMap.productDocument
     ?? ("产品手卡" in fields ? "产品手卡" : "产品文档" in fields ? "产品文档" : map.productDocument);
   return {
@@ -790,14 +801,8 @@ async function handleFeishuAutomationUnlocked(input: FeishuAutomationInput) {
   const effectiveName = resolved.productName.trim();
   if (!effectiveName) throw new Error("缺少产品名称，无法按“产品名称_PID”命名手卡");
   if (!effectivePid) throw new Error("缺少商品 PID，无法按“产品名称_PID”命名手卡");
-  if (!/^\d+$/.test(effectivePid)) throw new Error("商品 PID 格式不正确，必须只包含数字");
-  // Most rows only carry a PID, not a full 商品链接/产品链接 — but a TikTok Shop
-  // product URL is just this exact template with the PID slotted in (a
-  // slug-less /pdp/{pid} path is a recognized, valid TikTok Shop product
-  // source — see lib/product-parser.ts's officialTikTokProductPath). Build
-  // one from the PID whenever the request didn't supply its own link, so
-  // "产品链接" and the product-page analysis below aren't gated on a field
-  // most rows never fill in.
+  if (!/^\d{6,30}$/.test(effectivePid)) throw new Error("商品 PID 格式不正确，必须为 6–30 位数字");
+  // This optional display link is never crawled or used to establish identity.
   const effectiveProductUrl = resolved.productUrl || `https://shop.tiktok.com/us/pdp/${effectivePid}?source=anchor`;
   // Testing convenience: a product name containing "测试" always gets a fresh
   // card, bypassing the existing-by-PID reuse — lets a real PID be reused
@@ -814,84 +819,62 @@ async function handleFeishuAutomationUnlocked(input: FeishuAutomationInput) {
     forceNew: isTestRequest,
   });
   documentUrl = shell.documentUrl;
+  // Deliver the card before any paid/slow operation. A failed analysis must
+  // never prevent staff from opening or editing the successfully created card.
+  queuePatch({ [resolved.map.productDocument]: shell.documentUrl });
+  queuePatch({ [resolved.map.productCardStatus]: "手卡已就绪，正在整理商品资料" });
+  await flushPatch();
 
   productCardWarning = [shell.permissionWarning, shell.ownershipWarning]
     .filter(Boolean)
     .map((warning) => safeAutomationFailure(warning))
     .join("；");
 
-  // A reused card that staff already filled in is returned as-is — a button
-  // click must never rewrite fields someone is actively editing. But a reused
-  // card that was only ever created as an empty shell (all three identity
-  // fields still blank, e.g. an old pre-session template nobody finished) is
-  // safe, and worth, filling in exactly like a brand-new one. AI-derived
-  // fields like 产品主要功能 are never touched here either way — that belongs to
-  // a separate parsing step.
-  let shouldSyncIdentity = !shell.reused;
-  if (shell.reused) {
-    try {
-      const preflight = await syncProductCardManagedFields(input.client, {
-        documentId: shell.documentId,
-        mode: "identity",
-        name: effectiveName,
-        productUrl: effectiveProductUrl,
-        pid: effectivePid,
-        preflightOnly: true,
-      });
-      shouldSyncIdentity = (["商品名称", "产品链接", "商品ID"] as const)
-        .every((label) => !(preflight.currentValues[label] || "").trim());
-    } catch {
-      shouldSyncIdentity = false; // 读取失败时保守处理，宁可不填也不误判成空白去覆盖。
+  try {
+    const preflight = await syncProductCardManagedFields(input.client, {
+      documentId: shell.documentId, mode: "verified-basic", preflightOnly: true, protectRevision: true,
+    });
+    if (preflight.duplicateLabels.length) throw new Error(`模板字段重复：${preflight.duplicateLabels.join("、")}`);
+    if (preflight.currentValues["商品ID"] && preflight.currentValues["商品ID"] !== effectivePid) {
+      throw new Error("手卡正文中的商品 ID 与当前 PID 不一致，请先核对手卡");
     }
-  }
-  if (shouldSyncIdentity) {
-    try {
-      const identitySync = await syncProductCardManagedFields(input.client, {
-        documentId: shell.documentId,
-        mode: "identity",
-        name: effectiveName,
-        productUrl: effectiveProductUrl,
-        pid: effectivePid,
-      });
-      if (identitySync.missingLabels.length) {
-        productCardWarning = [productCardWarning, `产品手卡模板缺少字段：${identitySync.missingLabels.join("、")}`]
-          .filter(Boolean)
-          .join("；");
-      }
-    } catch (error) {
-      productCardWarning = [productCardWarning, safeAutomationFailure(error)].filter(Boolean).join("；");
+    // The live template intentionally carries the name in its document title,
+    // not a second 商品名称 row. Keep that user-authored layout unchanged.
+    const missingTemplateLabels = preflight.missingLabels.filter(label => label !== "商品名称");
+    if (missingTemplateLabels.length) productCardWarning = [productCardWarning,
+      `模板缺少字段：${missingTemplateLabels.join("、")}`].filter(Boolean).join("；");
+    if (!Object.values(catalogFields).some(label => !preflight.missingLabels.includes(label))) {
+      throw new Error("模板没有可填写的商品资料字段，未请求收费接口");
     }
+    await syncProductCardManagedFields(input.client, {
+      documentId: shell.documentId, mode: "identity", name: effectiveName,
+      productUrl: effectiveProductUrl, pid: effectivePid,
+      expectedValues: preflight.currentValues, protectRevision: true,
+    });
+    const { getProductCatalog } = await import("@/lib/products/catalog");
+    const catalog = await getProductCatalog(effectivePid);
+    const fieldText = (key: keyof typeof catalogFields) => catalog.fields[key].text;
+    const synced = await syncProductCardManagedFields(input.client, {
+      documentId: shell.documentId, mode: "verified-basic", derivedOnly: true,
+      sku: fieldText("sku"), coreFunctions: [fieldText("coreFunctions")],
+      productParameters: fieldText("productParameters"), usageMethod: fieldText("usageMethod"),
+      audience: fieldText("audience"), scenes: fieldText("scenes"),
+      expectedValues: preflight.currentValues, preserveExistingOnMissing: true, protectRevision: true,
+    });
+    const missing = Object.entries(catalog.fields).filter(([, fact]) => fact.basis === "missing")
+      .map(([key]) => catalogFields[key as keyof typeof catalogFields]);
+    productCardWarning = [productCardWarning, ...catalog.warnings,
+      missing.length ? `资料未提供：${missing.join("、")}；已有内容保留` : "",
+      synced.skippedLabels.length ? `填写期间被修改，已保留：${synced.skippedLabels.join("、")}` : "",
+      synced.missingLabels.length ? `无法定位字段：${synced.missingLabels.join("、")}` : "",
+    ].filter(Boolean).join("；");
+    productCardStatus = "手卡商品资料已整理";
+  } catch (error) {
+    // Do not expose provider bodies, signed URLs or credentials in logs/status.
+    productRefreshError = error instanceof Error && /^(模板|手卡正文|产品手卡模板|飞书没有返回)/.test(error.message)
+      ? error.message.slice(0, 300) : catalogError(error);
+    productCardStatus = `手卡已就绪，商品资料未完成：${productRefreshError}`;
   }
-  // Same "safe to fill" gate as identity sync (brand-new or still-blank card
-  // only) — a product-page parse must never overwrite AI-derived content a
-  // human has since edited. effectiveProductUrl is always populated (falls
-  // back to a PID-built link above), so this runs for essentially every
-  // eligible card now, not just the rare row with its own 商品链接.
-  if (shouldSyncIdentity) {
-    try {
-      const { parsePublicProductPage } = await import("@/lib/product-parser");
-      const parsedProduct = await parsePublicProductPage(effectiveProductUrl, {
-        productName: effectiveName,
-        pid: effectivePid,
-      });
-      await syncProductCardManagedFields(input.client, {
-        documentId: shell.documentId,
-        mode: "verified-basic",
-        sku: parsedProduct.sku,
-        coreFunctions: parsedProduct.coreFunctions,
-        productParameters: parsedProduct.productParameters,
-        usageMethod: parsedProduct.usageMethod,
-        audience: parsedProduct.audience,
-        scenes: parsedProduct.scenes,
-      });
-    } catch (error) {
-      // Best-effort only — a bad/expired product link must never block the
-      // hand-card shell (already created) or the rest of this automation run.
-      console.warn(`[feishu-automation] 商品页解析失败 pid=${effectivePid}: ${safeAutomationFailure(error)}`);
-    }
-  }
-  queuePatch({ [resolved.map.productDocument]: shell.documentUrl });
-  await flushPatch();
 
   product = await withProductIdentityLock(effectivePid, async () => {
     const current = await getProductByPid(effectivePid);
@@ -925,10 +908,7 @@ async function handleFeishuAutomationUnlocked(input: FeishuAutomationInput) {
     managedProductPid: "",
   });
 
-  productCardStatus = productCardWarning
-    ? "手卡已就绪，请手动填写；文档权限待修复"
-    : "手卡已就绪，请手动填写";
-  productRefreshError = "";
+  if (productCardWarning) productCardStatus = `${productCardStatus}；提示：${productCardWarning}`.slice(0, 500);
   // Give the critical document-link field one final independent attempt before
   // publishing the terminal status. Never tell the user "已完成" while the row
   // still has no hand-card link, even if parsing and document sync succeeded.

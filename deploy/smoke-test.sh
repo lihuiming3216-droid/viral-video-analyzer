@@ -31,7 +31,7 @@ done
 # database before starting the app. This test cannot use production env vars.
 docker run --rm --network "$network" --entrypoint node \
   -e FEISHU_DELIVERY_MYSQL_TEST=isolated-test-only -v "$PWD/tests:/app/tests:ro" \
-  "$image" --test tests/feishu-delivery-mysql.test.mjs
+  "$image" --test tests/feishu-delivery-mysql.test.mjs tests/product-catalog-mysql.test.mjs
 docker run -d --name "$app_container" --network "$network" \
   --tmpfs /app/.data:rw -e MYSQL_HOST=mysql -e MYSQL_USER=root \
   -e MYSQL_PASSWORD=isolated-ci-only -e MYSQL_DATABASE=viral_video_analyzer "$image" >/dev/null

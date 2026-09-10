@@ -82,8 +82,16 @@
 - 本次发布相关的23个测试文件共253项测试全部通过，0失败、0跳过；覆盖原有视频、飞书写回、商品缓存、部署保护，以及新增设置和登录。测试使用隔离样本/模拟接口，没有访问生产服务。这不等于仓库全部历史测试或线上验收均已完成。
 - 最终源码已通过 `npm run check`、本次变更相关的ESLint、`git diff --check` 与生产构建。构建出现过的过宽文件扫描警告已修复，最终构建无该警告。设置页另用真实React组件、虚拟配置进行了本地渲染检查，未提交任何表单。
 - 已加入结构异常、精确PID、实际图像字节、独立用途、加密/掩码、错误地址换钥、重试上限、手动幂等/故障恢复、登录和真实Next请求拦截等无付费测试。
-- 隔离MySQL测试新增配置表迁移与跨连接锁检查，仍只允许固定的CI测试数据库。当前Mac未提供Docker，该部分尚未本地执行，必须在验证分支完成。
+- 隔离MySQL测试新增配置表迁移与跨连接锁检查，仍只允许固定的CI测试数据库。当前Mac未提供Docker，该部分已在下述云端验证分支执行通过，并非在生产数据库运行。
 - 旧完整报告与配音音轨转写保留自己的旧用途/固定音频模型，不冒充三种新设置均控制所有历史实验入口。
 - 未向Qwen、OpenAI或商品供应商追加请求；界面或模拟测试通过不能代替任意自定义模型的真实能力验收。
 
 接口格式参考：[阿里云结构化输出](https://help.aliyun.com/zh/model-studio/qwen-structured-output)、[OpenAI结构化输出](https://developers.openai.com/api/docs/guides/structured-outputs)。请求拦截与服务端鉴权分别处理，参考[Next.js Proxy](https://nextjs.org/docs/app/api-reference/file-conventions/proxy)。
+
+## 2026-09-11 云端验收与上线前检查
+
+- 已验证的代码提交：`f6e1190cf02a3924521fe8cc9d50626894fa5c36`，分支 `codex/verify-handcard-20260909`。[验证运行记录](https://github.com/lihuiming3216-droid/viral-video-analyzer/actions/runs/34523473058)成功完成；Linux镜像构建、253项离线回归、2项真实MySQL测试及应用/数据库启动检查通过，测试均无失败和跳过。验证环境未配置生产或付费服务凭据。
+- 生产应用和数据库健康，应用仍为 `aef72b68f5a4debed36039e0543f30b420e965d6`；main未变，未部署新代码。原自动化和字幕接口密钥均存在，仅检查了是否配置，没有输出密钥值。
+- Nginx仅监听HTTP，尚无正式HTTPS证书或后台账号。短时、无业务内容的TLS检查在服务器内部返回200，但外部连接失败；这只能确认外部连通性尚未通过，不能直接断言是Lightsail防火墙所致。临时监听和自签诊断证书已撤除，Nginx未改动。AWS控制台当前停在登录页，需负责人登录后核查443规则。
+- 磁盘约6.8GB可用、使用率89%；存在大量历史程序镜像。尚未清理任何程序镜像、数据库、视频或手卡缓存。新版本导入前需核算空间；如需清理旧程序镜像，先取得许可，并保留当前版本、上一正式版本及所有现存容器依赖的镜像。
+- 不强制购买域名：证书机构已支持IP地址证书，但必须安排自动续期并验收。参考[Let's Encrypt IP证书说明](https://letsencrypt.org/2026/03/11/shorter-certs-certbot)。端口规则核查参考[AWS Lightsail防火墙说明](https://docs.aws.amazon.com/lightsail/latest/userguide/amazon-lightsail-editing-firewall-rules.html)。后台地址选择仍待负责人回复。

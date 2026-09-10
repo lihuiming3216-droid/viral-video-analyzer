@@ -281,6 +281,7 @@ export interface FeishuAutomationJobKey {
 export interface FeishuAutomationJob extends FeishuAutomationJobKey {
   fieldMap: Record<string, string>;
   attempts: number;
+  blockedReason: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -310,6 +311,7 @@ function feishuAutomationJobFromRow(source: Row): FeishuAutomationJob {
     recordId: String(source.record_id),
     fieldMap: json<Record<string, string>>(source.field_map_json, {}),
     attempts: Number(source.attempts ?? 0),
+    blockedReason: String(source.blocked_reason || ""),
     createdAt: String(source.created_at),
     updatedAt: String(source.updated_at),
   };
@@ -344,6 +346,8 @@ export async function saveFeishuAutomationJob(input: {
       ON DUPLICATE KEY UPDATE field_map_json=VALUES(field_map_json), attempts=0, updated_at=VALUES(updated_at)`,
       [videoId, appToken, tableId, recordId, JSON.stringify(safeFeishuAutomationFieldMap(input.fieldMap)), timestamp, timestamp],
     );
+    await run(db, `DELETE FROM feishu_automation_delivery_blocks
+      WHERE video_id=? AND app_token=? AND table_id=? AND record_id=?`, [videoId, appToken, tableId, recordId]);
   });
 }
 
@@ -355,7 +359,9 @@ export async function getFeishuAutomationJobs(videoId: string) {
   const db = await getDb();
   const found = await rows(
     db,
-    `SELECT * FROM feishu_automation_jobs WHERE video_id=? ORDER BY created_at, app_token, table_id, record_id`,
+    `SELECT j.*, b.reason AS blocked_reason FROM feishu_automation_jobs j
+      LEFT JOIN feishu_automation_delivery_blocks b USING (video_id, app_token, table_id, record_id)
+      WHERE j.video_id=? ORDER BY j.created_at, j.app_token, j.table_id, j.record_id`,
     [videoId],
   );
   return found.map(feishuAutomationJobFromRow);
@@ -365,8 +371,9 @@ export async function listFeishuAutomationJobVideoIds() {
   const db = await getDb();
   const found = await rows(
     db,
-    `SELECT video_id, MIN(created_at) AS first_created_at FROM feishu_automation_jobs
-     GROUP BY video_id ORDER BY first_created_at, video_id`,
+    `SELECT j.video_id, MIN(j.created_at) AS first_created_at FROM feishu_automation_jobs j
+      LEFT JOIN feishu_automation_delivery_blocks b USING (video_id, app_token, table_id, record_id)
+      WHERE b.video_id IS NULL GROUP BY j.video_id ORDER BY first_created_at, j.video_id`,
   );
   return found.map((item) => String(item.video_id));
 }
@@ -379,6 +386,19 @@ export async function incrementFeishuAutomationJobAttempts(key: FeishuAutomation
      WHERE video_id=? AND app_token=? AND table_id=? AND record_id=?`,
     [now(), key.videoId, key.appToken, key.tableId, key.recordId],
   );
+}
+
+export async function blockFeishuAutomationJob(key: FeishuAutomationJobKey, reason: string, message: string) {
+  const db = await getDb();
+  const timestamp = now();
+  // INSERT ... SELECT cannot create a block for a superseded/deleted row job.
+  await run(db, `INSERT INTO feishu_automation_delivery_blocks
+    (video_id, app_token, table_id, record_id, reason, message, created_at, updated_at)
+    SELECT video_id, app_token, table_id, record_id, ?, ?, ?, ? FROM feishu_automation_jobs
+      WHERE video_id=? AND app_token=? AND table_id=? AND record_id=?
+    ON DUPLICATE KEY UPDATE reason=VALUES(reason), message=VALUES(message), updated_at=VALUES(updated_at)`,
+  [reason, Array.from(message).slice(0, 512).join(""), timestamp, timestamp,
+    key.videoId, key.appToken, key.tableId, key.recordId]);
 }
 
 export async function deleteFeishuAutomationJob(key: FeishuAutomationJobKey | string) {

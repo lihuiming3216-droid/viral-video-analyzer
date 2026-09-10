@@ -5,12 +5,13 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
-  createProduct, createVideo,
+  blockFeishuAutomationJob, createProduct, createVideo,
   deleteFeishuAutomationJob, getFeishuAutomationJobs,
   getFeishuFieldMapping, getFeishuProductCardMapping, getProduct, getProductByPid, getVideo,
   incrementFeishuAutomationJobAttempts,
   listFeishuAutomationJobVideoIds, saveFeishuAutomationJob, updateProduct,
   upsertFeishuProductCardMapping,
+  type FeishuAutomationJob,
 } from "@/lib/database";
 import { ensureFeishuConnection, getConnectedFeishuChannel } from "@/lib/feishu/runtime";
 import { ensureProductCardByPid, syncProductCardManagedFields } from "@/lib/feishu/document";
@@ -21,6 +22,7 @@ import { transcribeMediaWithQwen, translateSegmentsWithQwen } from "@/lib/provid
 import { fetchTikTok } from "@/lib/providers/tokscript";
 import { buildBilingualSrt, buildTimestampedText, generateBilingualSubtitleFile, type TranscriptSegment } from "@/lib/subtitle";
 import { resolveMediaPath } from "@/lib/video-processing";
+import { assertDeliveryFields, assertDeliverySource, emptyFieldPatch, fieldHasContent, permanentDeliveryFailure } from "@/lib/feishu/delivery-guard";
 
 export interface FeishuAutomationFieldMap {
   productUrl: string;
@@ -164,7 +166,7 @@ export function resolveAutomationFields(
   // 新人组任务安排表用的字段名是"产品id"（小写 id，不带空格）——审计报告技术债第4条确认的缺口，直接补齐。
   const suppliedPid = field(fields, map.pid, ["PID", "pid", "商品ID/PID", "产品id", "产品ID", ...(extraAliases.pid || [])]);
   const documentField = inputMap.productDocument
-    || ("产品手卡" in fields ? "产品手卡" : "产品文档" in fields ? "产品文档" : map.productDocument);
+    ?? ("产品手卡" in fields ? "产品手卡" : "产品文档" in fields ? "产品文档" : map.productDocument);
   return {
     map: { ...map, productDocument: documentField },
     // Product-link analysis is disabled. The explicit Base PID is the only
@@ -290,6 +292,37 @@ export async function getBaseRecordFields(
   });
   apiError(response, "读取飞书多维表格记录失败");
   return response.data?.record?.fields || {};
+}
+
+async function currentDeliveryRow(client: Client, job: FeishuAutomationJob, sourceUrl: string | null, map: FeishuAutomationFieldMap) {
+  const pending = (await getFeishuAutomationJobs(job.videoId)).find(candidate => (
+    candidate.appToken === job.appToken && candidate.tableId === job.tableId && candidate.recordId === job.recordId
+  ));
+  if (!pending || pending.blockedReason) return null;
+  const latest = await getBaseRecordFields(client, job);
+  if (sourceUrl && map.videoUrl) assertDeliverySource(sourceUrl, latest[map.videoUrl]);
+  return latest;
+}
+
+async function patchEmptyDeliveryFields(client: Client, job: FeishuAutomationJob, sourceUrl: string | null,
+  map: FeishuAutomationFieldMap, proposed: Record<string, unknown>) {
+  // Re-read after uploads/provider waits as well as on each network retry.
+  // This preserves manual text and attachments, subject to Feishu's existing
+  // non-atomic GET/PUT window; no claim of transactional external writes.
+  const latest = await currentDeliveryRow(client, job, sourceUrl, map);
+  if (!latest) return false;
+  const fields = emptyFieldPatch(latest, proposed);
+  if (Object.keys(fields).length) await patchBaseRecord(client, { ...job, fields });
+  return true;
+}
+
+async function pausePermanentDelivery(job: FeishuAutomationJob, error: unknown) {
+  const failure = permanentDeliveryFailure(error)
+    || permanentDeliveryFailure(feishuApiErrorDetail(error));
+  if (!failure) return false;
+  await blockFeishuAutomationJob(job, failure.reason, failure.message);
+  console.warn(`[feishu-automation] 已暂停写回 video=${job.videoId} record=${job.recordId}: ${failure.message}`);
+  return true;
 }
 
 function firstAttachment(value: unknown): { fileToken: string; name: string } | null {
@@ -465,14 +498,16 @@ export async function deliverEarlyTranscript(videoId: string) {
     const channel = getConnectedFeishuChannel() || await ensureFeishuConnection();
     if (!channel) return;
     for (const job of jobs) {
+      if (job.blockedReason) continue;
       const map = { ...defaultFeishuAutomationFieldMap, ...job.fieldMap };
       const fields: Record<string, unknown> = {};
       setMappedField(fields, map.transcript, video.transcriptOriginal);
       if (video.transcriptZh?.trim()) setMappedField(fields, map.translation, video.transcriptZh);
       if (!Object.keys(fields).length) continue;
       try {
-        await patchBaseRecord(channel.rawClient, { ...job, fields });
+        await withProductCardRecordLock(job, () => patchEmptyDeliveryFields(channel.rawClient, job, video.sourceUrl, map, fields));
       } catch (error) {
+        if (await pausePermanentDelivery(job, error)) continue;
         console.warn(`[feishu-automation] 提前写回口播失败 video=${videoId} record=${job.recordId}: ${safeAutomationFailure(feishuApiErrorDetail(error))}`);
       }
     }
@@ -492,6 +527,7 @@ export async function completeFeishuAutomation(videoId: string) {
     if (!channel) return false;
     let allDelivered = true;
     for (const job of jobs) {
+      if (job.blockedReason) { allDelivered = false; continue; }
       try {
         const delivered = await withProductCardRecordLock(job, async () => {
           // Re-read after acquiring the row lock. A newer click transactionally
@@ -503,13 +539,39 @@ export async function completeFeishuAutomation(videoId: string) {
             && candidate.recordId === job.recordId
           ));
           if (!current) return true;
+          if (current.blockedReason) return false;
           const productCardMapping = await getFeishuProductCardMapping({
             appToken: current.appToken,
             tableId: current.tableId,
             recordId: current.recordId,
           });
           const map = { ...defaultFeishuAutomationFieldMap, ...current.fieldMap };
+          const latest = await currentDeliveryRow(channel.rawClient, current, video.sourceUrl, map);
+          if (!latest) return true;
+          // Validate real columns before an upload or subtitle-model request.
+          // Input-only/card-button fields are deliberately outside this list.
+          const outputNames = [map.status, map.translation, map.transcript, map.videoFile,
+            map.productDocument, map.linkedSubtitle, map.timestampedTranscript, map.timestampedTranslation,
+            ...(video.analysisMode === "product_doc" || video.status !== "completed" ? [map.analysis] : [])];
+          assertDeliveryFields(await listBitableTableFieldNames(current), outputNames);
           const fields: Record<string, unknown> = {};
+          let filePending = false;
+          // File delivery is independent of analysis/subtitles. Never replace
+          // an attachment already present, and never re-analyze a cached file.
+          if (video.originalPath && map.videoFile && !fieldHasContent(latest[map.videoFile])) {
+            try {
+              const attachment = await uploadBaseAttachment(channel.rawClient, {
+                appToken: current.appToken, absolutePath: resolveMediaPath(video.originalPath), fileName: `${video.id}.mp4`,
+              });
+              if (!await patchEmptyDeliveryFields(channel.rawClient, current, video.sourceUrl, map, { [map.videoFile]: attachment })) return true;
+            } catch (error) {
+              if (await pausePermanentDelivery(current, error)) return false;
+              filePending = true;
+              console.warn(`[feishu-automation] 视频文件写回失败 video=${videoId}: ${safeAutomationFailure(feishuApiErrorDetail(error))}`);
+            }
+          }
+          if (video.transcriptZh) setMappedField(fields, map.translation, video.transcriptZh);
+          if (video.transcriptOriginal) setMappedField(fields, map.transcript, video.transcriptOriginal);
           setMappedField(fields, map.status, video.status === "completed" ? "已完成" : video.status === "failed" ? "失败" : "已停止");
           if (video.status === "completed") {
             // conciseProductDocAnalysis()'s compact "核心/爆点/借鉴" format was
@@ -525,28 +587,15 @@ export async function completeFeishuAutomation(videoId: string) {
             setMappedField(fields, map.transcript, video.transcriptOriginal || "");
             const mappedDocumentUrl = productCardMapping?.documentUrl || product?.documentUrl;
             if (mappedDocumentUrl) setMappedField(fields, map.productDocument, mappedDocumentUrl);
-            // Attachments are best-effort: an upload/translation failure here
-            // must never block the text fields above from being written back.
-            // Also skip the upload entirely when the target table has no
-            // matching column — no point paying for it if it can't be written.
-            if (video.originalPath && map.videoFile) {
-              try {
-                fields[map.videoFile] = await uploadBaseAttachment(channel.rawClient, {
-                  appToken: current.appToken,
-                  absolutePath: resolveMediaPath(video.originalPath),
-                  fileName: `${video.title || video.id}.mp4`,
-                });
-              } catch (error) {
-                console.warn(`[feishu-automation] 视频文件上传失败 video=${videoId}: ${safeAutomationFailure(feishuApiErrorDetail(error))}`);
-              }
-            }
-            const wantsSubtitleFields = map.linkedSubtitle || map.timestampedTranscript || map.timestampedTranslation;
+            const wantsSubtitleFields = [map.linkedSubtitle, map.timestampedTranscript, map.timestampedTranslation]
+              .some(name => name && !fieldHasContent(latest[name]));
             // Every failed delivery pass calls this again — without a cap, a
             // video whose segment translation never lines up (see the
             // "双语字幕生成失败" warning below) would re-run a real Qwen call
             // forever every ~30s. Give up on the subtitle fields specifically
             // after a few tries; the cheap text/status fields below still
-            // retry on every pass, uncapped, since they cost nothing to redo.
+            // retry while delivery remains active. Permanent row/field errors
+            // are paused separately before any further provider calls.
             if (current.attempts === SUBTITLE_RETRY_GIVE_UP_AFTER && wantsSubtitleFields) {
               console.warn(`[feishu-automation] 双语字幕已重试 ${current.attempts} 次仍失败，放弃生成 video=${videoId}（其余字段仍会继续重试写回）`);
             }
@@ -558,11 +607,11 @@ export async function completeFeishuAutomation(videoId: string) {
                 if (subtitleFile) {
                   // 用户最终确认：只写"链接字幕"（视频链接提取 TokScript 时间戳这条
                   // 原生流程对应的字段），不再写"音频字幕"。
-                  if (map.linkedSubtitle) {
+                  if (map.linkedSubtitle && !fieldHasContent(latest[map.linkedSubtitle])) {
                     const attachment = await uploadBaseAttachment(channel.rawClient, {
                       appToken: current.appToken,
                       absolutePath: subtitleFile.filePath,
-                      fileName: `${video.title || video.id}.srt`,
+                      fileName: `${video.id}.srt`,
                     });
                     fields[map.linkedSubtitle] = attachment;
                   }
@@ -580,10 +629,15 @@ export async function completeFeishuAutomation(videoId: string) {
           }
           for (let attempt = 1; attempt <= 3; attempt += 1) {
             try {
-              await patchBaseRecord(channel.rawClient, { ...current, fields });
+              if (!await patchEmptyDeliveryFields(channel.rawClient, current, video.sourceUrl, map, fields)) return true;
+              if (filePending) {
+                await incrementFeishuAutomationJobAttempts(current);
+                return false;
+              }
               await deleteFeishuAutomationJob(current);
               return true;
             } catch (error) {
+              if (await pausePermanentDelivery(current, error)) return false;
               if (isBaseRolePermissionError(error) || attempt === 3) {
                 // Feishu's own {code,msg} validation body is not a secret — it
                 // describes what our request got wrong, not a credential — and
@@ -603,7 +657,8 @@ export async function completeFeishuAutomation(videoId: string) {
           allDelivered = false;
           continue;
         }
-      } catch {
+      } catch (error) {
+        await pausePermanentDelivery(job, error);
         // A single Base row must never prevent the remaining deliveries. The
         // untouched job is the durable retry marker for a later completion run.
         allDelivered = false;

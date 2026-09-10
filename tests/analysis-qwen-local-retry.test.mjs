@@ -611,3 +611,28 @@ test("exhausted download fallbacks do not discard a successful TokScript transla
   assert.equal(p.video.originalPath, "");
   assert.equal(p.video.status, "failed");
 });
+
+test("overlong provider metadata fits MySQL without truncating the original payload or blocking download", async () => {
+  const fullTitle = "📦".repeat(800), fullAccount = "名".repeat(300);
+  let downloads = 0;
+  const p = await pipeline({
+    fetchTikTok: async () => ({ title: fullTitle, accountName: fullAccount, downloadUrl: "", transcript: "Original provider speech.",
+      transcriptZh: "已有中文", segments: [], stats: {}, raw: { transcript: { title: fullTitle, username: fullAccount } } }),
+    downloadTikTokVideoWithFallback: async () => {
+      downloads++;
+      const metadata = p.patches.find(patch => patch.provider_payload_json);
+      assert.equal(Array.from(metadata.title).length, 512);
+      assert.equal(metadata.title, "📦".repeat(512));
+      assert.equal(Array.from(metadata.account_name).length, 191);
+      assert.equal(JSON.parse(metadata.provider_payload_json).transcript.title, fullTitle);
+      return { relativePath: "pipeline-test/download-test/1/original.mp4", source: "网页", failures: [] };
+    },
+  });
+  p.video.analysisMode = "transcript_only";
+  p.video.originalPath = "";
+  p.video.transcriptOriginal = "";
+  await p.run();
+  assert.equal(downloads, 1);
+  assert.equal(p.video.status, "completed");
+  assert.equal(p.video.transcriptZh, "已有中文");
+});

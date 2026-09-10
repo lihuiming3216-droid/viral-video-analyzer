@@ -216,7 +216,8 @@ CREATE TABLE IF NOT EXISTS feishu_automation_jobs (
   field_map_json JSON NOT NULL DEFAULT ('{}'),
   -- Counts failed delivery passes for this row. Only gates the expensive
   -- Qwen subtitle-generation retry (see completeFeishuAutomation) — the
-  -- cheap text-field write itself keeps retrying indefinitely.
+  -- transient text-field failures stay retryable; confirmed permanent delivery
+  -- errors are paused separately in feishu_automation_delivery_blocks.
   attempts INT NOT NULL DEFAULT 0,
   created_at VARCHAR(32) NOT NULL,
   updated_at VARCHAR(32) NOT NULL,
@@ -224,6 +225,22 @@ CREATE TABLE IF NOT EXISTS feishu_automation_jobs (
   CONSTRAINT fk_feishu_automation_jobs_video FOREIGN KEY (video_id) REFERENCES videos(id) ON DELETE CASCADE,
   INDEX idx_feishu_automation_jobs_video (video_id, updated_at),
   INDEX idx_feishu_automation_jobs_row (app_token, table_id, record_id, updated_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+-- Durable pauses are separate from attempts: changing a mapping/new submission
+-- can resume delivery, while missing rows/columns must not retry indefinitely.
+CREATE TABLE IF NOT EXISTS feishu_automation_delivery_blocks (
+  video_id VARCHAR(36) NOT NULL,
+  app_token VARCHAR(191) NOT NULL,
+  table_id VARCHAR(191) NOT NULL,
+  record_id VARCHAR(191) NOT NULL,
+  reason VARCHAR(64) NOT NULL,
+  message VARCHAR(512) NOT NULL,
+  created_at VARCHAR(32) NOT NULL,
+  updated_at VARCHAR(32) NOT NULL,
+  PRIMARY KEY (video_id, app_token, table_id, record_id),
+  CONSTRAINT fk_feishu_delivery_block_job FOREIGN KEY (video_id, app_token, table_id, record_id)
+    REFERENCES feishu_automation_jobs(video_id, app_token, table_id, record_id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 CREATE TABLE IF NOT EXISTS product_document_video_rows (

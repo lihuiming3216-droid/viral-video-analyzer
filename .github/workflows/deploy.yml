@@ -31,7 +31,7 @@ jobs:
 
       - name: Test hand-card video regression without provider credentials
         run: |
-          docker run --rm --entrypoint node -v "$PWD/tests:/app/tests:ro" "viral-video-analyzer:$GITHUB_SHA" --test --test-concurrency=2 tests/qwen-full-video-input.test.mjs tests/qwen-transport.test.mjs tests/qwen-diagnostics-safety.test.mjs tests/analysis-qwen-local-retry.test.mjs tests/product-doc-sync-write-protection.test.mjs tests/video-queue-hard-timeout.test.mjs tests/transcript-validation.test.mjs tests/product-doc-analysis.test.mjs tests/feishu-parser-duplicates.test.mjs tests/video-processing-av-integrity.test.mjs tests/tiktok-video-download.test.mjs
+          docker run --rm --entrypoint node -v "$PWD/tests:/app/tests:ro" "viral-video-analyzer:$GITHUB_SHA" --test --test-concurrency=2 tests/qwen-full-video-input.test.mjs tests/qwen-transport.test.mjs tests/qwen-diagnostics-safety.test.mjs tests/analysis-qwen-local-retry.test.mjs tests/product-doc-sync-write-protection.test.mjs tests/video-queue-hard-timeout.test.mjs tests/transcript-validation.test.mjs tests/product-doc-analysis.test.mjs tests/feishu-parser-duplicates.test.mjs tests/video-processing-av-integrity.test.mjs tests/tiktok-video-download.test.mjs tests/feishu-delivery-guard.test.mjs
 
       - name: Smoke test with an isolated empty MySQL
         run: bash deploy/smoke-test.sh "viral-video-analyzer:$GITHUB_SHA"

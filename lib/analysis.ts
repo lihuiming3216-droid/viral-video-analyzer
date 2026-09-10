@@ -464,8 +464,10 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
         ...(transcriptZh ? { transcript_zh: transcriptZh } : {}),
         transcript_segments_json: JSON.stringify(transcriptSegments),
         language: tok.language || null,
-        title: tok.title || initial.title,
-        account_name: tok.accountName,
+        // Display metadata must fit MySQL VARCHAR limits without splitting
+        // Unicode characters. The complete provider payload is retained below.
+        title: Array.from(tok.title || initial.title || "待分析视频").slice(0, 512).join(""),
+        account_name: Array.from(tok.accountName || "").slice(0, 191).join(""),
         platform_video_id: tok.platformVideoId || null,
         published_at: tok.publishedAt,
         view_count: tok.stats.views,

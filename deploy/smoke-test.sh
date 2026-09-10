@@ -14,7 +14,7 @@ cleanup() {
 trap cleanup EXIT
 # Test containers can reach each other, never production or paid providers.
 docker network create --internal "$network" >/dev/null
-docker run -d --name "$mysql_container" --network "$network" --network-alias mysql \
+docker run -d --name "$mysql_container" --network "$network" --network-alias mysql --network-alias delivery-test-mysql \
   -e MYSQL_ROOT_PASSWORD=isolated-ci-only -e MYSQL_ROOT_HOST=% -e MYSQL_DATABASE=viral_video_analyzer \
   --health-cmd='MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql -h127.0.0.1 -uroot -e "SELECT 1" >/dev/null 2>&1' \
   --health-interval=2s --health-timeout=3s --health-retries=40 mysql:8.0.46 >/dev/null
@@ -27,6 +27,11 @@ for attempt in {1..60}; do
   sleep 2
 done
 [[ $mysql_ready == true ]] || { echo "CI MySQL did not become healthy" >&2; exit 1; }
+# Exercise the additive schema and actual delivery SQL in its own disposable
+# database before starting the app. This test cannot use production env vars.
+docker run --rm --network "$network" --entrypoint node \
+  -e FEISHU_DELIVERY_MYSQL_TEST=isolated-test-only -v "$PWD/tests:/app/tests:ro" \
+  "$image" --test tests/feishu-delivery-mysql.test.mjs
 docker run -d --name "$app_container" --network "$network" \
   --tmpfs /app/.data:rw -e MYSQL_HOST=mysql -e MYSQL_USER=root \
   -e MYSQL_PASSWORD=isolated-ci-only -e MYSQL_DATABASE=viral_video_analyzer "$image" >/dev/null

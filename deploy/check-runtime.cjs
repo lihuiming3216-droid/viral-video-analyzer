@@ -16,7 +16,7 @@ async function main() {
     connectTimeout: 5000,
   });
   try {
-    for (const sql of ["START TRANSACTION READ ONLY", "SELECT 1 FROM products LIMIT 1", "SELECT 1 FROM videos LIMIT 1", "ROLLBACK"]) {
+    for (const sql of ["START TRANSACTION READ ONLY", "SELECT 1 FROM products LIMIT 1", "SELECT 1 FROM videos LIMIT 1", "SELECT 1 FROM feishu_automation_delivery_blocks LIMIT 1", "ROLLBACK"]) {
       await connection.query({ sql, timeout: 5000 });
     }
   } finally {

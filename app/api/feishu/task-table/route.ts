@@ -57,7 +57,6 @@ export async function POST(request: NextRequest) {
           // download to completion (see lib/analysis.ts's analyzeVideo).
           analysisMode: "transcript_only",
         });
-        await enqueueVideos([video.id]);
         await saveFeishuAutomationJob({
           videoId: video.id,
           appToken,
@@ -65,6 +64,7 @@ export async function POST(request: NextRequest) {
           recordId,
           fieldMap: resolved.map,
         });
+        await enqueueVideos([video.id]);
         console.info("[feishu-task-table] queued", { recordId, videoId: video.id, pid: product.pid });
       } catch (error) {
         console.error("[feishu-task-table] failed", { recordId, error: safeBackgroundError(error) });

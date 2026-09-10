@@ -22,13 +22,24 @@ test("real MySQL catalog claims are atomic, migration is additive and failure su
   const openPool = () => mysql.createPool({ ...config, database: "catalog_test", multipleStatements: true, connectionLimit: 10 });
   pool = openPool();
   const schema = await readFile(new URL("../lib/db/schema.sql", import.meta.url), "utf8");
-  const prior = schema.replace(/CREATE TABLE IF NOT EXISTS product_catalog_cache \([\s\S]+?;\n/, "");
+  const prior = schema.replace(/CREATE TABLE IF NOT EXISTS (?:product_catalog_cache|product_catalog_reorganizations|ai_purpose_settings) \([\s\S]+?;\n/g, "");
   assert.notEqual(prior, schema);
   await pool.query(prior);
   await pool.query("INSERT INTO products(id,name,created_at,updated_at) VALUES ('preserved','人工资料','t','t')");
   const [before] = await pool.query("SELECT * FROM products");
   await pool.query(schema); await pool.query(schema);
   assert.deepEqual((await pool.query("SELECT * FROM products"))[0], before);
+  const purposeConfig = { purpose: "product", provider: "qwen", model: "qwen3.7-plus", credentialSource: "shared", baseUrl: "", retries: 0, videoAudioConfirmed: false };
+  await pool.execute("INSERT INTO ai_purpose_settings(purpose,config_json,encrypted_api_key,updated_at) VALUES (?,?,?,?)", ["product", JSON.stringify(purposeConfig), null, "t"]);
+  assert.deepEqual((await pool.execute("SELECT config_json FROM ai_purpose_settings WHERE purpose=?", ["product"]))[0][0].config_json, purposeConfig);
+  const lockA = await pool.getConnection(), lockB = await pool.getConnection();
+  try {
+    assert.equal((await lockA.execute("SELECT GET_LOCK(?,0) AS acquired", ["catalog-reorganize:fixture"]))[0][0].acquired, 1);
+    assert.equal((await lockB.execute("SELECT GET_LOCK(?,0) AS acquired", ["catalog-reorganize:fixture"]))[0][0].acquired, 0);
+    await lockA.execute("SELECT RELEASE_LOCK(?)", ["catalog-reorganize:fixture"]);
+  } finally { lockA.release(); lockB.release(); }
+  await pool.execute("INSERT INTO product_catalog_reorganizations(id,pid,state,created_at,updated_at) VALUES (?,?,'requested',?,?)", ["00000000-0000-4000-8000-000000000001", "1732350695360139845", "t", "t"]);
+  assert.equal((await pool.execute("SELECT state FROM product_catalog_reorganizations WHERE pid=?", ["1732350695360139845"]))[0][0].state, "requested");
   const dataUrl = text => `data:text/javascript;base64,${Buffer.from(text).toString("base64")}`;
   const code = ts.transpileModule(await readFile(new URL("../lib/products/catalog-store.ts", import.meta.url), "utf8"), {
     compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },

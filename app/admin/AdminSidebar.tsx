@@ -40,7 +40,7 @@ const NAV_ITEMS = [
   },
   {
     href: "/admin/providers",
-    label: "Provider 设置",
+    label: "模型与接口",
     icon: (
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
         <path d="M9 3v4.5" />

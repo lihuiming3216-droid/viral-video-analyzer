@@ -13,8 +13,9 @@ export const dynamic = "force-dynamic";
  * /feishu/link-subtitle).
  */
 export async function POST(request: NextRequest) {
-  if (subtitleBridgeAuth(request) === false) {
-    return NextResponse.json({ ok: false, error: "invalid secret" }, { status: 401 });
+  const auth = subtitleBridgeAuth(request);
+  if (auth !== true) {
+    return NextResponse.json({ ok: false, error: auth === null ? "subtitle bridge secret is not configured" : "invalid secret" }, { status: auth === null ? 503 : 401 });
   }
   try {
     const body = await request.json() as Record<string, unknown>;

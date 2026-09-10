@@ -15,6 +15,10 @@ const stubSource = `
   });
   export const parseJsonLoose = JSON.parse;
   export const getQwenPurposeModel = async () => null;
+  export const requireAiRuntime = async purpose => globalThis.__aiRuntime || ({
+    purpose, provider: "qwen", apiKey: "test-key", baseUrl: "https://qwen.test/v1",
+    model: purpose === "translation" ? "qwen-plus" : "qwen3.5-omni-plus", retries: 0
+  });
   export const getPromptTemplate = async (_slug, _label, template) => ({ template });
   export const fetchQwen = (...args) => globalThis.fetch(...args);
 `;
@@ -30,6 +34,7 @@ compiled = compiled
   .replace('import "server-only";', "")
   .replaceAll('"@/lib/json-utils"', JSON.stringify(stubUrl))
   .replaceAll('"@/lib/database"', JSON.stringify(stubUrl))
+  .replaceAll('"@/lib/ai/settings"', JSON.stringify(stubUrl))
   .replaceAll('"@/lib/types"', JSON.stringify(typesUrl))
   .replaceAll('"@/lib/providers/qwen-transport"', JSON.stringify(stubUrl))
   .replaceAll('"@/lib/provider-config"', JSON.stringify(stubUrl));
@@ -164,6 +169,52 @@ test("video honors the configured model and text translation keeps its own model
     else process.env.QWEN_VIDEO_MODEL = priorEnvironmentModel;
   }
   assert.deepEqual(models, ["qwen3.5-omni-flash", "qwen-plus"]);
+});
+
+test("hand-card request uses its explicit custom configuration and the complete original file", async t => {
+  globalThis.__aiRuntime = { provider: "compatible", apiKey: "independent-fixture", baseUrl: "https://independent.example/v1", model: "custom-full-av", retries: 0 };
+  t.after(() => { delete globalThis.__aiRuntime; });
+  await withMockedFetch(async (url, init) => {
+    assert.equal(url, "https://independent.example/v1/chat/completions");
+    assert.equal(init.headers.Authorization, "Bearer independent-fixture");
+    const body = JSON.parse(init.body);
+    assert.equal(body.model, "custom-full-av");
+    assert.equal("enable_thinking" in body, false);
+    assert.deepEqual(Buffer.from(body.messages[0].content[0].video_url.url.split(",")[1], "base64"), videoBytes);
+    return successfulStream();
+  }, () => qwen.analyzeVideoWithQwen({ purpose: "product_doc", prompt: "test", localVideoPath: videoPath }));
+});
+
+test("translation retries use one configuration snapshot, never another model or provider", async t => {
+  globalThis.__aiRuntime = { provider: "openai", apiKey: "independent-fixture", baseUrl: "https://independent.example/v1", model: "translation-only", retries: 1 };
+  t.after(() => { delete globalThis.__aiRuntime; });
+  let calls = 0;
+  const result = await withMockedFetch(async (url, init) => {
+    calls++;
+    assert.equal(url, "https://independent.example/v1/chat/completions");
+    const body = JSON.parse(init.body);
+    assert.equal(body.model, "translation-only");
+    assert.equal("enable_thinking" in body, false);
+    assert.equal("modalities" in body, false);
+    if (calls === 1) {
+      globalThis.__aiRuntime = { ...globalThis.__aiRuntime, model: "changed-during-request" };
+      return new Response("private error text", { status: 503 });
+    }
+    return successfulStream({ result: { translationZh: "中文" } });
+  }, () => qwen.translateTranscriptWithQwen({ transcript: "English" }));
+  assert.equal(result, "中文");
+  assert.equal(calls, 2);
+});
+
+test("translation authentication failures are not retried or leaked", async t => {
+  globalThis.__aiRuntime = { provider: "qwen", apiKey: "fixture", baseUrl: "https://independent.example/v1", model: "qwen-plus", retries: 1 };
+  t.after(() => { delete globalThis.__aiRuntime; });
+  let calls = 0;
+  await withMockedFetch(async () => { calls++; return new Response("private provider secret", { status: 401 }); },
+    () => assert.rejects(qwen.translateTranscriptWithQwen({ transcript: "English" }), error => {
+      assert.match(error.message, /HTTP 401/); assert.doesNotMatch(error.message, /private|secret/); return true;
+    }));
+  assert.equal(calls, 1);
 });
 
 test("video requests share a two-slot Qwen limit and jump ahead of queued translations", async () => {

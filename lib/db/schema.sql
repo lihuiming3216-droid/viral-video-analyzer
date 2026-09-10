@@ -18,6 +18,16 @@ CREATE TABLE IF NOT EXISTS product_catalog_cache (
   updated_at VARCHAR(32) NOT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
+CREATE TABLE IF NOT EXISTS product_catalog_reorganizations (
+  id CHAR(36) PRIMARY KEY,
+  pid VARCHAR(30) NOT NULL,
+  state VARCHAR(16) NOT NULL,
+  error_message VARCHAR(500) NOT NULL DEFAULT '',
+  created_at VARCHAR(32) NOT NULL,
+  updated_at VARCHAR(32) NOT NULL,
+  INDEX idx_catalog_reorganization_pid (pid, state)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
 -- 时间戳全部沿用原来 SQLite 里 now() 产生的 ISO-8601 字符串（如 2026-08-30T09:57:10.484Z），
 -- 不改存 MySQL 原生 DATETIME，省去时区/格式转换，直接保持和现有业务代码一致。VARCHAR 索引排序
 -- 对定长 ISO-8601 UTC 字符串等价于按时间排序。
@@ -160,6 +170,14 @@ CREATE TABLE IF NOT EXISTS video_attempts (
   CONSTRAINT fk_video_attempts_video FOREIGN KEY (video_id) REFERENCES videos(id) ON DELETE CASCADE,
   UNIQUE KEY uq_video_attempts_video_number (video_id, attempt_number),
   INDEX idx_video_attempts_video_started (video_id, started_at DESC)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+-- Independent settings; additive only, no migration rewrites existing paid caches.
+CREATE TABLE IF NOT EXISTS ai_purpose_settings (
+  purpose VARCHAR(32) PRIMARY KEY,
+  config_json JSON NOT NULL,
+  encrypted_api_key TEXT NULL,
+  updated_at VARCHAR(40) NOT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 CREATE TABLE IF NOT EXISTS provider_settings (

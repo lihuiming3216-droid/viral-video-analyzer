@@ -1,12 +1,16 @@
 import { countProducts, listProducts } from "@/lib/database";
 import { AdminTopbar } from "../AdminTopbar";
 import { Pagination } from "../Pagination";
+import { randomUUID } from "node:crypto";
+import { requireAdmin } from "@/lib/require-admin";
+import { ReorganizeForm } from "./ReorganizeForm";
 
 export const dynamic = "force-dynamic";
 
 const PAGE_SIZE = 40;
 
 export default async function AdminProductsPage({ searchParams }: { searchParams: Promise<{ q?: string; page?: string }> }) {
+  await requireAdmin();
   const { q, page: pageParam } = await searchParams;
   const search = q?.trim() || "";
   const page = Math.max(1, Number(pageParam) || 1);
@@ -39,6 +43,7 @@ export default async function AdminProductsPage({ searchParams }: { searchParams
           </div>
         </div>
 
+        <ReorganizeForm requestId={randomUUID()} />
         <form action="/admin/products" method="get" style={{ marginBottom: 14 }}>
           <input
             type="text"

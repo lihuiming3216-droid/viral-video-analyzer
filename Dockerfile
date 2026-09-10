@@ -37,6 +37,8 @@ COPY --from=build /app/lib ./lib
 COPY --from=build /app/types ./types
 COPY --from=build /app/next.config.ts ./next.config.ts
 COPY --from=build /app/instrumentation.ts ./instrumentation.ts
+COPY --from=build /app/proxy.ts ./proxy.ts
+COPY --from=build /app/scripts/configure-admin-auth.mjs ./scripts/configure-admin-auth.mjs
 COPY --from=build /app/deploy/check-runtime.cjs ./deploy/check-runtime.cjs
 
 RUN mkdir -p /app/.data

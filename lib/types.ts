@@ -1,4 +1,4 @@
-export type ProviderName = "tokscript" | "qwen";
+export type ProviderName = "tokscript" | "qwen" | "openai";
 
 export type VideoStatus =
   | "waiting"
@@ -56,7 +56,7 @@ export interface VideoAttemptCallDiagnostic {
 /** Durable, size-bounded diagnostics for one video execution attempt. */
 export interface VideoAttemptDiagnostics {
   schemaVersion: 1;
-  provider: "qwen";
+  provider: "qwen" | "compatible";
   model: string;
   inputMode: "local_base64";
   fileBytes: number;

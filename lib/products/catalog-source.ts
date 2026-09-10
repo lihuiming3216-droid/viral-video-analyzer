@@ -9,8 +9,9 @@ const ROOT = path.join(process.cwd(), ".data/provider-evidence/chuhaijiang/us");
 const hash = (body: Buffer) => createHash("sha256").update(body).digest("hex");
 export const catalogDirectory = (pid: string) => path.join(ROOT, validatePid(pid));
 
-export async function claimAnalysisFile(pid: string) {
-  const directory = catalogDirectory(pid);
+export async function claimAnalysisFile(pid: string, runId?: string) {
+  if (runId && !/^[a-f0-9-]{36}$/.test(runId)) throw new CatalogError("资料重新整理任务标识无效");
+  const directory = runId ? path.join(catalogDirectory(pid), "reorganizations", runId) : catalogDirectory(pid);
   await mkdir(directory, { recursive: true, mode: 0o700 });
   let file;
   try { file = await open(path.join(directory, "analysis-started.json"), "wx", 0o600); }
@@ -136,7 +137,7 @@ function removeUrls(value: unknown): unknown {
   return value;
 }
 
-export async function prepareCatalogEvidence(pid: string, item: Record<string, unknown>): Promise<CatalogEvidence> {
+export async function prepareCatalogEvidence(pid: string, item: Record<string, unknown>, options: { cacheOnly?: boolean } = {}): Promise<CatalogEvidence> {
   const directory = catalogDirectory(pid);
   const fields = Object.fromEntries(Object.entries(item).filter(([key]) =>
     /^(product_name|product_title|product_specifications|product_sku_props)$/.test(key) || /description|detail|feature|function|instruction|usage/i.test(key)));
@@ -168,6 +169,7 @@ export async function prepareCatalogEvidence(pid: string, item: Record<string, u
         } catch { /* Only the saved signed image URL may be tried; never repeat the paid detail call. */ }
       }
       if (!body) {
+        if (options.cacheOnly) throw new CatalogError("重新整理只使用已存图片，不发起下载请求");
         const response = await fetchWithProxy(url, {
           redirect: "error", signal: AbortSignal.any([deadline, AbortSignal.timeout(25_000)]),
         });
@@ -178,7 +180,7 @@ export async function prepareCatalogEvidence(pid: string, item: Record<string, u
       totalBytes += body.length;
       if (totalBytes > 25 * 1024 * 1024) throw new CatalogError("商品图片总大小超过 25 MB");
       const file = `${String(candidate.index + 1).padStart(2, "0")}.${mime.split("/")[1]}`;
-      await savePrivate(path.join(directory, "images", file), body);
+      if (!options.cacheOnly) await savePrivate(path.join(directory, "images", file), body);
       manifest.push({ label: candidate.label, file, bytes: body.length, sha256: hash(body) });
       evidence.images.push({ id, label: candidate.label, dataUrl: `data:${mime};base64,${body.toString("base64")}` });
     } catch {
@@ -186,7 +188,7 @@ export async function prepareCatalogEvidence(pid: string, item: Record<string, u
       evidence.warnings.push(`${id}（${candidate.label.slice(0, 60)}）无法获取图片信息`);
     }
   }
-  await savePrivate(path.join(directory, "image-manifest.json"), JSON.stringify(manifest));
+  if (!options.cacheOnly) await savePrivate(path.join(directory, "image-manifest.json"), JSON.stringify(manifest));
   if (!evidence.images.length) evidence.warnings.push("无法获取图片信息；仅根据接口文字整理");
   return evidence;
 }

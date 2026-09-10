@@ -208,6 +208,7 @@ async function loadAnalysis(hooks) {
     export const learnFromVideo = () => undefined;
     export const getProviderConfig = () => ({ enabled: false, apiKey: "" });
     export const analyzeVideoWithQwen = (...args) => hooks().analyzeVideoWithQwen?.(...args);
+    export const getVideoAnalysisConfig = () => ({ retries: 1, model: "fixture-model" });
     export class QwenRequestError extends Error {}
     export const getPromptTemplate = async (_slug, _label, template) => ({ template });
     export const savePromptDebugCapture = async () => {};

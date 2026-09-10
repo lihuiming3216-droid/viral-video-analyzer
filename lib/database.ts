@@ -77,7 +77,8 @@ async function ensureSeeded(db: Queryable) {
   const timestamp = now();
   const providers: Array<[ProviderName, string, string]> = [
     ["tokscript", "https://api.tokscript.com/mcp", ""],
-    ["qwen", "https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen3.7-plus"],
+    ["qwen", "https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen3.5-omni-plus"],
+    ["openai", "https://api.openai.com/v1", ""],
   ];
   for (const [provider, baseUrl, model] of providers) {
     await run(
@@ -86,7 +87,6 @@ async function ensureSeeded(db: Queryable) {
       [provider, baseUrl, model, timestamp],
     );
   }
-  await run(db, "DELETE FROM provider_settings WHERE provider='openai'");
   await run(
     db,
     `INSERT IGNORE INTO feishu_settings(id, public_base_url, connection_status, updated_at)
@@ -1297,7 +1297,7 @@ function serializeVideoAttemptDiagnostics(value: VideoAttemptDiagnostics) {
   }
   assertDiagnosticKeys(value, videoAttemptDiagnosticKeys, "执行诊断");
   if (value.schemaVersion !== 1) throw new Error("执行诊断版本无效");
-  if (value.provider !== "qwen") throw new Error("执行诊断provider必须是qwen");
+  if (value.provider !== "qwen" && value.provider !== "compatible") throw new Error("执行诊断provider无效");
   diagnosticIdentifier(value.model, "model", 100);
   if (value.inputMode !== "local_base64") throw new Error("inputMode无效");
   diagnosticNumber(value.fileBytes, "fileBytes", { integer: true, positive: true });
@@ -1560,27 +1560,6 @@ export async function getQwenPurposeModel(purpose: QwenPurpose) {
   const found = await row(db, "SELECT model FROM qwen_purpose_models WHERE purpose=?", [purpose]);
   const value = found?.model ? String(found.model).trim() : "";
   return value || null;
-}
-
-export async function listQwenPurposeModels() {
-  const db = await getDb();
-  const found = await rows(db, "SELECT * FROM qwen_purpose_models");
-  const byPurpose = Object.fromEntries(found.map((item) => [String(item.purpose), String(item.model ?? "")]));
-  return {
-    full: byPurpose.full || "",
-    product_doc: byPurpose.product_doc || "",
-    translation: byPurpose.translation || "",
-  } satisfies Record<QwenPurpose, string>;
-}
-
-export async function saveQwenPurposeModel(purpose: QwenPurpose, model: string) {
-  const db = await getDb();
-  await run(
-    db,
-    `INSERT INTO qwen_purpose_models (purpose, model, updated_at) VALUES (?, ?, ?)
-     ON DUPLICATE KEY UPDATE model=VALUES(model), updated_at=VALUES(updated_at)`,
-    [purpose, model.trim(), now()],
-  );
 }
 
 // ---- 飞书字段映射：按 scopeKey（通常是 appToken:tableId）持久化覆盖 ----

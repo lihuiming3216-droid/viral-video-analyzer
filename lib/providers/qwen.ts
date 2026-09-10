@@ -6,6 +6,8 @@ import path from "node:path";
 import { getPromptTemplate, getQwenPurposeModel, type QwenPurpose } from "@/lib/database";
 import { parseJsonLoose } from "@/lib/json-utils";
 import { requireProvider } from "@/lib/provider-config";
+import { requireAiRuntime } from "@/lib/ai/settings";
+import type { AiRuntime } from "@/lib/ai/types";
 import { fetchQwen } from "@/lib/providers/qwen-transport";
 import { QWEN_TRANSPORT_ERROR_CODES, type QwenTransportErrorCode } from "@/lib/types";
 
@@ -108,52 +110,13 @@ function qwenVideoFps() {
   return Number.isFinite(configured) ? Math.max(0.1, Math.min(10, configured)) : 2;
 }
 
-// 负责人要求的目标模型是 qwen3.7-plus（审计报告10.1第1条：配置存的是这个，
-// 但白名单只认 omni 系列，导致静默回退）。这里放行 qwen3.7-plus 只是让配置的值不再被
-// 悄悄替换；它是否真的能听到原始音轨，仍然必须用审计12.2节要求的真实 A/V 验收视频组
-// 做验证，不能因为白名单接受了这个名字就当作已验证。
-function supportedQwenVideoModel(value: string) {
-  return /^qwen(?:3\.7-plus|3\.5-omni-(?:plus|flash)|3-omni-flash)(?:-\d{4}-\d{2}-\d{2})?$/.test(value);
-}
-
-// 运维后台下拉建议用的候选名单。full/product_doc 只能从这几个里选——不是因为界面限制，
-// 是因为 supportedQwenVideoModel 的白名单只认这几个（DashScope 上新出的模型即使填了也会被
-// 静默忽略），列出来是为了让下拉框和真实校验规则保持一致，而不是先造一个界面幻觉。
-export const QWEN_VIDEO_MODEL_OPTIONS = ["qwen3.7-plus", "qwen3.5-omni-plus", "qwen3.5-omni-flash", "qwen3-omni-flash"];
-
-// 翻译是纯文本任务，没有代码级白名单限制，这里只是给下拉框一些常见候选，用户仍可以手填任意
-// DashScope 模型名。
-export const QWEN_TRANSLATION_MODEL_SUGGESTIONS = ["qwen-mt-turbo", "qwen-mt-plus", "qwen-plus", "qwen-turbo", ...QWEN_VIDEO_MODEL_OPTIONS];
-
 export type QwenModelSource = "env" | "override" | "default" | "hardcoded";
 
-/**
- * 完整视频分析、产品手卡精简分析、口播翻译原来共用同一个 provider_settings.qwen.model。
- * 运维后台"Provider 设置"页现在可以给这三个用途分别配置模型；这里按优先级取值：
- * 环境变量 > 该用途的运维后台覆盖 > provider_settings 里的默认模型 > 硬编码兜底。
- * 视频分析用途必须通过音视频白名单校验（不匹配的候选会被跳过，不是报错，也不是直接采用）；
- * 口播翻译是纯文本任务，不受这个限制。
- *
- * 导出这个函数是为了让运维后台能显示"这个用途现在实际生效的是哪个模型、为什么"——不复刻
- * 一份新逻辑，直接调用真实解析逻辑，保证界面显示和实际请求用的模型永远一致。
- */
+/** Legacy full-report/dubbing callers remain intact; never skip a configured name. */
 export async function resolveQwenModel(purpose: QwenPurpose, configuredModel = ""): Promise<{ value: string; source: QwenModelSource }> {
-  const dbOverride = ((await getQwenPurposeModel(purpose).catch(() => null)) || "").trim();
+  const dbOverride = ((await getQwenPurposeModel(purpose)) || "").trim();
   if (purpose === "translation") {
     if (dbOverride) return { value: dbOverride, source: "override" };
-    // configuredModel is provider_settings.qwen.model — the default for the
-    // *video* purposes (full/product_doc), an omni model that expects actual
-    // audio/video content. DashScope rejects it for a pure-text translation
-    // request with "Invalid request parameters" (confirmed via a real
-    // 双语字幕生成失败 production failure), so translation must never silently
-    // inherit it. qwen-mt-turbo (DashScope's dedicated MT endpoint) was tried
-    // next and returns perfectly valid JSON in a plain (non-streaming) call —
-    // but our real request always uses stream:true, and that endpoint's SSE
-    // chunk shape isn't fully compatible with parseOmniStream() below
-    // (confirmed live: non-streaming content parses fine, the real streaming
-    // call fails with "Expected ':' after property name"). qwen-plus is a
-    // general chat model in the same family full/product_doc already stream
-    // successfully against, so it doesn't carry that risk.
     return { value: "qwen-plus", source: "hardcoded" };
   }
   const envValue = (process.env.QWEN_VIDEO_MODEL || "").trim();
@@ -162,7 +125,7 @@ export async function resolveQwenModel(purpose: QwenPurpose, configuredModel = "
     [dbOverride, "override"],
     [configuredModel.trim(), "default"],
   ];
-  const found = candidates.find(([value]) => value && supportedQwenVideoModel(value));
+  const found = candidates.find(([value]) => value);
   return found ? { value: found[0], source: found[1] } : { value: "qwen3.5-omni-plus", source: "hardcoded" };
 }
 
@@ -170,8 +133,11 @@ async function qwenVideoModel(purpose: "full" | "product_doc", configuredModel =
   return (await resolveQwenModel(purpose, configuredModel)).value;
 }
 
-async function qwenTranslationModel(configuredModel = "") {
-  return (await resolveQwenModel("translation", configuredModel)).value;
+export async function getVideoAnalysisConfig(purpose: "full" | "product_doc"): Promise<AiRuntime> {
+  if (purpose === "product_doc") return requireAiRuntime("video");
+  const shared = await requireProvider("qwen");
+  return { purpose: "video", provider: "qwen", credentialSource: "shared", apiKey: shared.apiKey,
+    baseUrl: shared.baseUrl, model: await qwenVideoModel("full", shared.model), retries: 1, videoAudioConfirmed: true };
 }
 
 function videoMimeType(videoPath: string) {
@@ -329,9 +295,11 @@ export async function analyzeVideoWithQwen(input: {
   maxTokens?: number;
   signal?: AbortSignal;
   onDiagnostic?: (diagnostic: QwenRequestDiagnostic) => void | Promise<void>;
+  /** One in-memory configuration snapshot for all requests within a task. Never persisted. */
+  config?: AiRuntime;
 }) {
-  const config = await requireProvider("qwen");
-  const model = await qwenVideoModel(input.purpose || "full", config.model);
+  const config = input.config || await getVideoAnalysisConfig(input.purpose || "full");
+  const model = config.model;
   const video = completeVideoInput(input);
   const content: Array<Record<string, unknown>> = [
     video.item,
@@ -360,7 +328,7 @@ export async function analyzeVideoWithQwen(input: {
         model,
         messages: [{ role: "user", content }],
         modalities: ["text"],
-        enable_thinking: false,
+        ...(config.provider === "qwen" ? { enable_thinking: false } : {}),
         stream: true,
         stream_options: { include_usage: true },
         max_tokens: input.maxTokens || 4_500,
@@ -544,53 +512,53 @@ export async function transcribeMediaWithQwen(input: {
  * intentionally independent from the full-video analysis request so a slow or
  * failed multimodal call cannot erase an otherwise valid translation.
  */
+async function requestTranslation<T>(prompt: string, maxTokens: number, validate: (raw: Record<string, unknown>) => T, signal?: AbortSignal): Promise<T> {
+  const config = await requireAiRuntime("translation");
+  for (let attempt = 0; attempt <= config.retries; attempt++) {
+    let releaseSlot: (() => void) | undefined;
+    let response: Response | undefined;
+    try {
+      releaseSlot = await acquireQwenRequestSlot("translation", signal);
+      const timeout = AbortSignal.timeout(QWEN_TRANSLATION_TIMEOUT_MS);
+      response = await fetchQwen(`${config.baseUrl}/chat/completions`, {
+        method: "POST", headers: { Authorization: `Bearer ${config.apiKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: config.model, messages: [{ role: "user", content: [{ type: "text", text: prompt }] }],
+          ...(config.provider === "qwen" ? { enable_thinking: false } : {}),
+          stream: true, max_tokens: maxTokens,
+        }),
+        signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+      });
+      const parsed = await parseOmniStream(response, () => undefined);
+      return validate(parsed.result);
+    } catch {
+      if (signal?.aborted) throw signal.reason;
+      const retryable = !response || response.ok || response.status === 408 || response.status === 429 || response.status >= 500;
+      if (attempt >= config.retries || !retryable) {
+        throw new Error(`中文翻译失败${response && !response.ok ? `（HTTP ${response.status}）` : "（网络超时或返回格式无效）"}，已请求${attempt + 1}次；不影响视频文件和视频分析`);
+      }
+    } finally { releaseSlot?.(); }
+  }
+  throw new Error("中文翻译已达到请求次数上限");
+}
+
 export async function translateTranscriptWithQwen(input: {
   transcript: string;
   signal?: AbortSignal;
 }) {
   const transcript = input.transcript.trim();
   if (!transcript) return "";
-  const config = await requireProvider("qwen");
-  // Translation is deliberately shorter than full-video analysis. It runs in
-  // the background and must never occupy a video worker for ten minutes.
-  let releaseSlot: (() => void) | undefined;
-  try {
-    releaseSlot = await acquireQwenRequestSlot("translation", input.signal);
-    const templateRow = await getPromptTemplate(
+  const templateRow = await getPromptTemplate(
       TRANSCRIPT_TRANSLATION_PROMPT_SLUG,
       "口播翻译",
       DEFAULT_TRANSCRIPT_TRANSLATION_TEMPLATE,
     );
-    const promptText = templateRow.template.replaceAll("{{TRANSCRIPT_JSON}}", JSON.stringify(transcript));
-    const timeoutSignal = AbortSignal.timeout(QWEN_TRANSLATION_TIMEOUT_MS);
-    const signal = input.signal ? AbortSignal.any([input.signal, timeoutSignal]) : timeoutSignal;
-    const response = await fetchQwen(`${config.baseUrl}/chat/completions`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${config.apiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: await qwenTranslationModel(config.model),
-        messages: [{
-          role: "user",
-          content: [{
-            type: "text",
-            text: promptText,
-          }],
-        }],
-        modalities: ["text"],
-        enable_thinking: false,
-        stream: true,
-        max_tokens: 4_500,
-      }),
-      signal,
-    });
-    const parsed = await parseOmniStream(response, () => undefined);
-    const result = parsed.result as Record<string, unknown>;
+  const promptText = templateRow.template.replaceAll("{{TRANSCRIPT_JSON}}", JSON.stringify(transcript));
+  return requestTranslation(promptText, 4_500, result => {
     const translation = String(result.translationZh || result.translation_zh || result.translation || "").trim();
     if (!translation) throw new Error("Qwen 未返回口播中文翻译");
     return translation;
-  } finally {
-    releaseSlot?.();
-  }
+  }, input.signal);
 }
 
 /**
@@ -606,11 +574,7 @@ export async function translateSegmentsWithQwen(input: {
 }): Promise<string[]> {
   const segments = input.segments.filter((segment) => segment.text.trim());
   if (!segments.length) return [];
-  const config = await requireProvider("qwen");
-  let releaseSlot: (() => void) | undefined;
-  try {
-    releaseSlot = await acquireQwenRequestSlot("translation", input.signal);
-    const templateRow = await getPromptTemplate(
+  const templateRow = await getPromptTemplate(
       SEGMENT_TRANSLATION_PROMPT_SLUG,
       "分段口播翻译（字幕用）",
       DEFAULT_SEGMENT_TRANSLATION_TEMPLATE,
@@ -619,29 +583,11 @@ export async function translateSegmentsWithQwen(input: {
       "{{SEGMENTS_JSON}}",
       JSON.stringify(segments.map((segment) => segment.text)),
     );
-    const timeoutSignal = AbortSignal.timeout(QWEN_TRANSLATION_TIMEOUT_MS);
-    const signal = input.signal ? AbortSignal.any([input.signal, timeoutSignal]) : timeoutSignal;
-    const response = await fetchQwen(`${config.baseUrl}/chat/completions`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${config.apiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: await qwenTranslationModel(config.model),
-        messages: [{ role: "user", content: [{ type: "text", text: promptText }] }],
-        modalities: ["text"],
-        enable_thinking: false,
-        stream: true,
-        max_tokens: 8_000,
-      }),
-      signal,
-    });
-    const parsed = await parseOmniStream(response, () => undefined);
-    const result = parsed.result as Record<string, unknown>;
+  return requestTranslation(promptText, 8_000, result => {
     const translations = Array.isArray(result.translations) ? result.translations.map((value) => String(value ?? "").trim()) : [];
     if (translations.length !== segments.length) {
       throw new Error(`Qwen 返回的分段翻译数量（${translations.length}）跟原文分段数量（${segments.length}）不一致`);
     }
     return translations;
-  } finally {
-    releaseSlot?.();
-  }
+  }, input.signal);
 }

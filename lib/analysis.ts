@@ -12,9 +12,9 @@ import {
 } from "@/lib/database";
 import { clampScore, formatTime } from "@/lib/json-utils";
 import { getLearningContext, learnFromVideo } from "@/lib/learning";
-import { getProviderConfig } from "@/lib/provider-config";
 import {
   analyzeVideoWithQwen,
+  getVideoAnalysisConfig,
   QwenRequestError,
   translateTranscriptWithQwen,
   type QwenRequestDiagnostic,
@@ -223,11 +223,6 @@ export async function renderAnalysisPrompt(input: {
   return { prompt, slug, inputs };
 }
 
-async function isConfigured(provider: "qwen") {
-  const config = await getProviderConfig(provider);
-  return config.enabled && Boolean(config.apiKey);
-}
-
 function transientNetworkFailure(error: unknown) {
   if (error instanceof Error && error.name === "TokScriptToolCallError") return false;
   if (error instanceof Error && error.name === "TokScriptRetryableError") return true;
@@ -410,7 +405,6 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
     // translate the same transcript twice. Model failure does not abort this
     // task; an explicit stop, hard timeout or newer execution does.
     translationTask = (async () => {
-      if (!(await isConfigured("qwen"))) return;
       await assertVideoAttempt(videoId, signal, expectedAttemptNumber);
       const translated = await translateTranscriptWithQwen({ transcript: transcriptForTranslation, signal });
       await assertVideoAttempt(videoId, signal, expectedAttemptNumber);
@@ -611,6 +605,7 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
     const qwenMaxTokens = analysisMode === "product_doc"
       ? 2_000
       : Math.min(16_000, 2_500 + assets.scenes.length * 700);
+    const analysisConfig = await getVideoAnalysisConfig(analysisMode);
     const runQwenRequest = (requestIndex: 1 | 2) => {
       qwenRequests = requestIndex;
       const clientRequestId = randomUUID();
@@ -619,6 +614,7 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
         prompt,
         localVideoPath: qwenLocalVideoPath,
         purpose: analysisMode,
+        config: analysisConfig,
         maxTokens: qwenMaxTokens,
         signal,
         onDiagnostic: async (diagnostic) => {
@@ -630,7 +626,7 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
           if (expectedAttemptNumber === undefined) return;
           const snapshot: VideoAttemptDiagnostics = {
             schemaVersion: 1,
-            provider: "qwen",
+            provider: analysisConfig.provider === "compatible" ? "compatible" : "qwen",
             model: diagnostic.model,
             inputMode: "local_base64",
             fileBytes: diagnostic.inputBytes,
@@ -650,9 +646,9 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
     };
     await setStage(videoId, "analyzing", "正在观看完整视频并分析画面、声音、钩子和转化结构", 66);
 
-    if (!(await isConfigured("qwen"))) throw new Error("请先配置并启用 Qwen，所有 AI 分析只使用 Qwen");
     let rawAnalysis: Partial<AnalysisResult> = {};
-    for (const requestIndex of [1, 2] as const) {
+    const requestIndexes: Array<1 | 2> = analysisConfig.retries === 1 ? [1, 2] : [1];
+    for (const requestIndex of requestIndexes) {
       try {
         const candidate = await runQwenRequest(requestIndex);
         await assertVideoAttempt(videoId, signal, expectedAttemptNumber);
@@ -660,10 +656,10 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
           throw new QwenRequestError("invalid_response", true, "Qwen 未返回完整的视频分析，请重试该链接");
         }
         rawAnalysis = candidate;
-        trace.push("Qwen：完整 MP4 画面与原始音轨分析");
+        trace.push(`${analysisConfig.provider === "compatible" ? "兼容模型" : "Qwen"}：完整 MP4 画面与原始音轨分析`);
         break;
       } catch (error) {
-        if (signal?.aborted || requestIndex === 2 || !retryableQwenFailure(error)) throw error;
+        if (signal?.aborted || requestIndex === requestIndexes.length || !retryableQwenFailure(error)) throw error;
         trace.push("Qwen：首次请求失败，短暂退避后重试一次");
         await waitForQwenRetry(signal);
         await assertVideoAttempt(videoId, signal, expectedAttemptNumber);

@@ -35,7 +35,7 @@ jobs:
 
       - name: Test PID catalog and hand-card writes offline
         run: |
-          docker run --rm --network none --entrypoint node -v "$PWD/tests:/app/tests:ro" "viral-video-analyzer:$GITHUB_SHA" --test tests/product-catalog.test.mjs tests/product-catalog-button.test.mjs tests/product-card-manual-only.test.mjs tests/feishu-product-card-two-stage.test.mjs
+          docker run --rm --network none --entrypoint node -v "$PWD/tests:/app/tests:ro" "viral-video-analyzer:$GITHUB_SHA" --test tests/provider-settings-ui.test.mjs tests/ai-settings.test.mjs tests/admin-auth.test.mjs tests/product-catalog-reorganize.test.mjs tests/product-catalog.test.mjs tests/product-catalog-button.test.mjs tests/product-card-manual-only.test.mjs tests/feishu-product-card-two-stage.test.mjs
 
       - name: Smoke test with an isolated empty MySQL
         run: bash deploy/smoke-test.sh "viral-video-analyzer:$GITHUB_SHA"

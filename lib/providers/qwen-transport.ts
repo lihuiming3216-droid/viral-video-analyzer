@@ -10,5 +10,5 @@ const dispatcher = new Agent({ headersTimeout: 0, bodyTimeout: 0 });
 
 export async function fetchQwen(url: string, init: RequestInit & { signal: AbortSignal }): Promise<Response> {
   init.signal.throwIfAborted();
-  return await undiciFetch(url, { ...init, dispatcher }) as unknown as Response;
+  return await undiciFetch(url, { ...init, redirect: "error", dispatcher }) as unknown as Response;
 }

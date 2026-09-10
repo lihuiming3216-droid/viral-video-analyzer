@@ -13,6 +13,7 @@ const types = await import(typesUrl);
 const fixturePid = "1732350695360139845";
 const result = pid => ({ pid, fields: Object.fromEntries(Object.keys(types.catalogFields).map(key => [key, { text: key, basis: "direct", evidence: ["product-text"] }])), warnings: [], model: "test", createdAt: "t" });
 const networkUrl = dataUrl("export const fetchWithProxy = (...args) => globalThis.__catalogFetch(...args);");
+const settingsUrl = dataUrl('export const requireAiRuntime = async () => globalThis.__catalogRuntime || ({ provider: "openai", apiKey: "fixture", model: "fixture-model", baseUrl: "https://api.openai.com/v1", retries: 0 });');
 const envSnapshots = new WeakMap();
 function env(t, key, value) {
   if (!envSnapshots.has(t)) {
@@ -36,9 +37,10 @@ async function modules(t) {
   code = compile(await source("catalog-analyzer"))
     .replaceAll('"@/lib/products/catalog-types"', JSON.stringify(typesUrl))
     .replaceAll('"@/lib/products/catalog-source"', JSON.stringify(sourceUrl))
+    .replaceAll('"@/lib/ai/settings"', JSON.stringify(settingsUrl))
     .replaceAll('"@/lib/network"', JSON.stringify(networkUrl));
   globalThis.__catalogFetch = () => { throw Error("UNEXPECTED_NETWORK_ACCESS"); };
-  t.after(() => { delete globalThis.__catalogFetch; });
+  t.after(() => { delete globalThis.__catalogFetch; delete globalThis.__catalogRuntime; });
   return { file, analyzer: await import(dataUrl(code)) };
 }
 
@@ -132,6 +134,86 @@ test("each field is independently grounded, inference is labelled, invalid claim
   assert.throws(() => analyzer.validateCatalogResult(result("999999"), input, "test"), /PID/);
 });
 
+test("Qwen's single-product array and labelled references are normalized without weakening PID checks", async t => {
+  const { analyzer } = await modules(t);
+  const input = { pid: fixturePid, images: [{ id: "image-1" }], warnings: [] };
+  const raw = result(fixturePid);
+  raw.fields.coreFunctions.evidence = ["image-1: supplier caption", "product-sku: unknown"];
+  const out = analyzer.validateCatalogResult([raw], input, "qwen3.7-plus");
+  assert.equal(Object.values(out.fields).filter(f => f.basis !== "missing").length, 6);
+  assert.deepEqual(out.fields.coreFunctions.evidence, ["image-1"]);
+  assert.equal(out.fields.coreFunctions.text, raw.fields.coreFunctions.text);
+  assert.ok(out.warnings.some(w => w.includes("未知来源")));
+  for (const value of [[], [raw, raw], [[raw]], { ...raw, pid: Number(fixturePid) }, { ...raw, pid: "123456" }]) {
+    assert.throws(() => analyzer.validateCatalogResult(value, input, "fixture"));
+  }
+  raw.fields.coreFunctions.evidence = ["image-99: nonexistent"];
+  raw.fields.usageMethod.basis = "inference";
+  const unsafe = analyzer.validateCatalogResult(raw, input, "fixture");
+  assert.equal(unsafe.fields.coreFunctions.basis, "missing");
+  assert.equal(unsafe.fields.usageMethod.basis, "missing");
+});
+
+test("Qwen product request uses selected endpoint/model, exact schema enum and all actual images", async t => {
+  const { analyzer, file } = await modules(t);
+  globalThis.__catalogRuntime = { provider: "qwen", apiKey: "fixture-qwen", model: "qwen3.7-plus", baseUrl: "https://qwen.example/v1", retries: 0 };
+  const input = { pid: fixturePid, text: "supplier description", images: [{ id: "image-1", label: "SKU", dataUrl: "data:image/webp;base64,AAAA" }], warnings: [] };
+  let calls = 0;
+  globalThis.__catalogFetch = async (url, init) => {
+    calls++;
+    assert.equal(url, "https://qwen.example/v1/chat/completions");
+    assert.equal(init.headers.Authorization, "Bearer fixture-qwen");
+    const request = JSON.parse(init.body);
+    assert.equal(request.model, "qwen3.7-plus");
+    assert.equal(request.enable_thinking, false);
+    assert.equal(request.response_format.json_schema.strict, true);
+    assert.deepEqual(request.response_format.json_schema.schema.properties.pid.enum, [fixturePid]);
+    assert.deepEqual(request.response_format.json_schema.schema.properties.fields.properties.coreFunctions.properties.evidence.items.enum, ["product-text", "image-1"]);
+    assert.equal(request.messages[1].content.find(c => c.type === "image_url").image_url.url, input.images[0].dataUrl);
+    assert.match(request.messages[0].content, /整机、外壳、内部容器、配件或包装/);
+    assert.match(request.messages[0].content, /对应字段正文紧邻/);
+    return Response.json({ choices: [{ finish_reason: "stop", message: { content: JSON.stringify([result(fixturePid)]) } }] });
+  };
+  assert.equal((await analyzer.analyzeCatalog(input)).model, "qwen3.7-plus");
+  assert.ok(await file.readPrivateJson(path.join(file.catalogDirectory(fixturePid), "model-response-1.json")));
+  await assert.rejects(analyzer.analyzeCatalog(input), /已提交过/);
+  assert.equal(calls, 1);
+});
+
+test("failed product parsing preserves raw output before validation and never auto-recalls", async t => {
+  const { analyzer, file } = await modules(t);
+  globalThis.__catalogRuntime = { provider: "qwen", apiKey: "fixture", model: "configured-model", baseUrl: "https://qwen.example/v1", retries: 0 };
+  let calls = 0;
+  globalThis.__catalogFetch = async () => { calls++; return Response.json({ choices: [{ finish_reason: "stop", message: { content: "not JSON" } }] }); };
+  const input = { pid: fixturePid, text: "", images: [], warnings: [] };
+  await assert.rejects(analyzer.analyzeCatalog(input), /正文不是合法JSON/);
+  assert.ok(await file.readPrivateJson(path.join(file.catalogDirectory(fixturePid), "model-response-1.json")));
+  await assert.rejects(analyzer.analyzeCatalog(input), /已提交过/);
+  assert.equal(calls, 1);
+});
+
+test("configured product retry stays on the same provider and stops after two HTTP failures", async t => {
+  const { analyzer } = await modules(t);
+  globalThis.__catalogRuntime = { provider: "qwen", apiKey: "fixture", model: "configured-model", baseUrl: "https://qwen.example/v1", retries: 1 };
+  let calls = 0;
+  globalThis.__catalogFetch = async url => { assert.equal(url, "https://qwen.example/v1/chat/completions"); calls++; return new Response("secret provider error", { status: 503 }); };
+  await assert.rejects(analyzer.analyzeCatalog({ pid: fixturePid, text: "", images: [], warnings: [] }), error => {
+    assert.match(error.message, /已请求2次/); assert.doesNotMatch(error.message, /secret/); return true;
+  });
+  assert.equal(calls, 2);
+});
+
+test("manual evidence preparation never downloads absent images or changes the original manifest", async t => {
+  const { file } = await modules(t);
+  const directory = file.catalogDirectory(fixturePid);
+  await file.savePrivate(path.join(directory, "image-manifest.json"), JSON.stringify([{ label: "kept", failed: true }]));
+  const before = await readFile(path.join(directory, "image-manifest.json"), "utf8");
+  const evidence = await file.prepareCatalogEvidence(fixturePid, { product_name: "Bottle", product_images: [{ url: "https://oss-t.chuhaijiang.com/not-cached" }] }, { cacheOnly: true });
+  assert.equal(evidence.images.length, 0);
+  assert.match(evidence.text, /Bottle/);
+  assert.equal(await readFile(path.join(directory, "image-manifest.json"), "utf8"), before);
+});
+
 test("OpenAI gets actual image bytes plus supplier text, strict structured output, and no automatic retry", async t => {
   env(t, "OPENAI_API_KEY", "isolated-test-key");
   const { analyzer } = await modules(t);
@@ -177,6 +259,7 @@ async function service(t, initial = null) {
   t.after(() => { delete globalThis[key]; });
   const stub = dataUrl(Object.keys(hooks).map(name => `export const ${name} = (...a) => globalThis[${JSON.stringify(key)}][${JSON.stringify(name)}](...a);`).join("\n"));
   const code = compile(await source("catalog"))
+    .replaceAll('"@/lib/ai/settings"', JSON.stringify(settingsUrl))
     .replaceAll('"@/lib/products/catalog-types"', JSON.stringify(typesUrl))
     .replace(/"@\/lib\/products\/catalog-(?:store|source|analyzer)"/g, JSON.stringify(stub));
   const load = suffix => import(dataUrl(`${code}\n// ${suffix}`));

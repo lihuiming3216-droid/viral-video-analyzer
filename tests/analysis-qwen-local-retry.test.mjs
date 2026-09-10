@@ -30,6 +30,7 @@ async function loadAnalysis(hooks) {
     export const learnFromVideo = (...args) => hooks().learnFromVideo?.(...args);
     export const getProviderConfig = () => ({ enabled: true, apiKey: "test-key" });
     export const analyzeVideoWithQwen = (...args) => hooks().analyzeVideoWithQwen(...args);
+    export const getVideoAnalysisConfig = () => ({ retries: hooks().retries ?? 1, model: "fixture-model" });
     export class QwenRequestError extends Error {
       name = "QwenRequestError";
       constructor(code, retryable, message) { super(message); this.code = code; this.retryable = retryable; }

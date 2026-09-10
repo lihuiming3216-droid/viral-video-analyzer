@@ -1,5 +1,6 @@
 import "server-only";
 import path from "node:path";
+import { requireAiRuntime } from "@/lib/ai/settings";
 import { catalogError, CatalogError, validatePid, cachedCatalogResult, type CatalogResult } from "@/lib/products/catalog-types";
 import { readCatalog, claimCatalog, markCatalogFetched, claimCatalogAnalysis, finishCatalogAnalysis, failCatalog } from "@/lib/products/catalog-store";
 import { cachedProduct, fetchProductOnce, prepareCatalogEvidence, catalogDirectory, readPrivateJson, savePrivate } from "@/lib/products/catalog-source";
@@ -29,9 +30,11 @@ async function runCatalog(pid: string): Promise<CatalogResult> {
   }
   if (row?.fetch_state === "failed" || row?.analysis_state === "failed") throw new CatalogError(row.error_message);
   let item = await cachedProduct(pid);
+  const resultFile = path.join(catalogDirectory(pid), "organized.json");
+  const durable = cachedCatalogResult(await readPrivateJson(resultFile), pid);
   if (!row) {
     // Missing credentials should not burn the once-only request slot.
-    if (!process.env.OPENAI_API_KEY?.trim()) throw new CatalogError("未配置商品图文整理密钥，请管理员配置后再点击");
+    if (!durable) await requireAiRuntime("product");
     if (!item && !process.env.CHUHAIJIANG_API_KEY?.trim()) throw new CatalogError("未配置出海匠接口密钥，请管理员配置后再点击");
     const owner = await claimCatalog(pid);
     if (owner && !item) {
@@ -42,7 +45,6 @@ async function runCatalog(pid: string): Promise<CatalogResult> {
   }
   if (!item) throw new CatalogError("该 PID 的取数已开始或结果待核查，不会自动重复收费；请稍后再点击查看");
   await markCatalogFetched(pid);
-  const resultFile = path.join(catalogDirectory(pid), "organized.json");
   if (row?.analysis_state === "requested") {
     const recovered = cachedCatalogResult(await readPrivateJson(resultFile), pid);
     if (recovered) {
@@ -50,6 +52,7 @@ async function runCatalog(pid: string): Promise<CatalogResult> {
       return recovered;
     }
   }
+  const config = durable ? undefined : await requireAiRuntime("product");
   if (!await claimCatalogAnalysis(pid)) {
     throw new CatalogError("该 PID 的资料整理已开始或结果待核查；不会自动重复请求，请稍后再点击查看");
   }
@@ -62,7 +65,7 @@ async function runCatalog(pid: string): Promise<CatalogResult> {
       return recovered;
     }
     const evidence = await prepareCatalogEvidence(pid, item);
-    const result = await analyzeCatalog(evidence);
+    const result = await analyzeCatalog(evidence, config);
     await savePrivate(resultFile, JSON.stringify(result));
     organizedSaved = true;
     await finishCatalogAnalysis(pid, result);

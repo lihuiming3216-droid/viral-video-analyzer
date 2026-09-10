@@ -127,3 +127,15 @@
 .admin-table tr:last-child td {
   border-bottom: 0;
 }
+
+.provider-settings { flex: 1; padding: 24px 28px 40px; display: grid; gap: 18px; max-width: 960px; overflow: auto; }
+.provider-form, .provider-note { padding: 22px; }
+.provider-settings h2 { font-size: 15px; margin: 0 0 10px; }
+.provider-settings p { font-size: 12px; line-height: 1.7; color: var(--text-muted); }
+.provider-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin: 16px 0; }
+.provider-grid label { display: flex; flex-direction: column; gap: 7px; font-size: 12px; }
+.provider-grid input:not([type=checkbox]), .provider-grid select { width: 100%; min-width: 0; height: 38px; border: 1px solid var(--border); border-radius: 8px; padding: 0 10px; background: var(--surface-2); color: var(--text); }
+.provider-form .provider-check { display: flex; flex-direction: row; align-items: center; gap: 8px; font-size: 12px; line-height: 1.6; }
+.provider-form button { border: 0; border-radius: 8px; padding: 9px 16px; color: white; background: var(--accent); cursor: pointer; }
+.provider-form button:disabled { opacity: .55; cursor: wait; }
+@media (max-width: 700px) { .provider-grid { grid-template-columns: 1fr; } .provider-settings { padding: 16px; } }

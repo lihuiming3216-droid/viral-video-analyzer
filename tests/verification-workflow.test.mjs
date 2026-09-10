@@ -54,3 +54,9 @@ test("production workflow remains restricted to main rather than following verif
   assert.match(deploy, /if: github.ref == 'refs\/heads\/main'/);
   assert.doesNotMatch(deploy, /workflow_run|verify-handcard/);
 });
+
+test("both release paths require the download-fallback regression tests", () => {
+  for (const text of [workflow, read(".github/workflows/deploy.yml")]) {
+    assert.match(text, /tests\/tiktok-video-download\.test\.mjs/);
+  }
+});

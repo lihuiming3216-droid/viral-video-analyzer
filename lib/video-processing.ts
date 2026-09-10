@@ -125,12 +125,8 @@ export async function downloadMedia(
 }
 
 /**
- * Fallback used only when TokScript's own download tool fails (its backend
- * yt-dlp predates the 2026.08.19 fix for TikTok's anti-bot challenge —
- * yt-dlp/yt-dlp#17403 — while its transcript tool is unaffected). Downloads
- * directly from the source URL with our own pinned, working yt-dlp binary,
- * writing to the exact same path convention as downloadMedia() so nothing
- * downstream needs to know which path produced the file.
+ * Local downloader candidate. The caller owns fallback selection and gives
+ * each candidate a private destination; a file is not accepted on exit alone.
  */
 export async function downloadTikTokVideoWithYtDlp(videoId: string, url: string, signal?: AbortSignal) {
   const relative = path.join(videoId, "original.mp4");
@@ -140,6 +136,8 @@ export async function downloadTikTokVideoWithYtDlp(videoId: string, url: string,
   const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
   try {
     await runFile("yt-dlp", [
+      "--ignore-config", "--no-progress",
+      "--retries", "0", "--fragment-retries", "0", "--extractor-retries", "0",
       "--no-playlist",
       "-f", "mp4/bestvideo+bestaudio/best",
       "--merge-output-format", "mp4",
@@ -184,6 +182,26 @@ export async function validateCompleteVideoForQwen(
   const metadata = await probeVideo(absolutePath, signal);
   if (!metadata.videoCodec) throw new Error("完整视频缺少视频轨，无法进行 Qwen 全模态分析");
   if (!metadata.audioCodec) throw new Error("完整视频缺少音频轨，无法进行 Qwen 全模态分析");
+  return metadata;
+}
+
+/** Check a newly acquired fallback file without changing or transcribing it. */
+export async function validateDownloadedVideoFile(
+  absolutePath: string,
+  signal?: AbortSignal,
+  options: { requireAudio?: boolean; decode?: boolean } = {},
+) {
+  const metadata = options.requireAudio === false
+    ? await probeVideo(absolutePath, signal)
+    : await validateCompleteVideoForQwen(absolutePath, signal);
+  if (!metadata.videoCodec) throw new Error("完整视频缺少视频轨");
+  if (!Number.isFinite(metadata.duration) || metadata.duration <= 0.1 || metadata.duration > 600.5) {
+    throw new Error("下载视频时长无效或超过 10 分钟");
+  }
+  if (options.decode !== false) await runFile(ffmpegPath, [
+    "-hide_banner", "-nostdin", "-v", "error", "-xerror",
+    "-i", absolutePath, "-map", "0:v:0", "-map", options.requireAudio === false ? "0:a:0?" : "0:a:0", "-f", "null", "-",
+  ], { maxBuffer: 1024 * 1024, signal });
   return metadata;
 }
 

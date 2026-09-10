@@ -153,3 +153,16 @@ test("an oversized source becomes a bounded full-duration H.264/AAC proxy", asyn
   assert.ok(Math.abs(sourceAudio.length - proxyAudio.length) / (16000 * 2) <= 0.5,
     "the proxy must retain the full audio duration as well as the picture duration");
 });
+
+test("download validation decodes both original tracks without modifying an audible or silent MP4", async t => {
+  const directory = await mkdtemp(path.join(tmpdir(), "download-av-validation-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  for (const [name, audio] of [["audible", "sine=frequency=440:sample_rate=16000"], ["silent", "anullsrc=r=16000:cl=mono"]]) {
+    const file = await makeFixture(directory, `${name}.mp4`, true, audio);
+    const before = await readFile(file);
+    assert.equal((await processing.validateDownloadedVideoFile(file)).audioCodec, "aac");
+    assert.deepEqual(await readFile(file), before);
+  }
+  const videoOnly = await makeFixture(directory, "video-only.mp4", false);
+  await assert.rejects(processing.validateDownloadedVideoFile(videoOnly), /缺少音频轨/);
+});

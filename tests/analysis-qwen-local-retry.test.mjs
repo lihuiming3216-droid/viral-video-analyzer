@@ -36,8 +36,7 @@ async function loadAnalysis(hooks) {
     }
     export const translateTranscriptWithQwen = (...args) => hooks().translateTranscriptWithQwen?.(...args) || Promise.resolve("");
     export const fetchTikTok = (...args) => hooks().fetchTikTok?.(...args);
-    export const resolveTokScriptVideoUrl = async (url) => url;
-    export const downloadTikTokVideoWithYtDlp = () => { throw new Error("unexpected yt-dlp fallback"); };
+    export const downloadTikTokVideoWithFallback = (...args) => hooks().downloadTikTokVideoWithFallback(...args);
     export const tokScriptTranscriptFailure = () => false;
     export const transcriptAndTranslationAgree = () => true;
     export const emitVideoProgress = (...args) => hooks().emitVideoProgress?.(...args);
@@ -555,4 +554,60 @@ test("stopping the first video request cannot start the second request", async (
   assert.equal(calls, 1);
   assert.equal(p.video.status, "stopped");
   assert.deepEqual(p.enqueued, []);
+});
+
+test("a newly downloaded fallback file reaches Qwen while the TokScript translation stays independent", async () => {
+  let downloadCalls = 0, providerCalls = 0, videoCalls = 0;
+  const p = await pipeline({
+    fetchTikTok: async () => {
+      providerCalls += 1;
+      return { downloadUrl: "https://cdn.example/expired.mp4", transcript: "Original TokScript speech.",
+        transcriptZh: "TokScript 已返回的中文", segments: [], stats: {}, raw: {} };
+    },
+    downloadTikTokVideoWithFallback: async input => {
+      downloadCalls += 1;
+      assert.equal(input.videoId, "pipeline-test");
+      assert.equal(typeof input.primaryDownload, "function");
+      await input.beforeSource("网页");
+      return { relativePath: "pipeline-test/download-unique/2/original.mp4", source: "网页", failures: ["yt-dlp：无法读取 TikTok 页面"] };
+    },
+    prepareLocalVideoForQwen: async (_id, original) => {
+      assert.equal(original, "pipeline-test/download-unique/2/original.mp4");
+      return "pipeline-test/qwen-full-video.mp4";
+    },
+    translateTranscriptWithQwen: async () => { throw new Error("must not translate existing Chinese text"); },
+    analyzeVideoWithQwen: async input => {
+      videoCalls += 1;
+      assert.equal(input.localVideoPath, "pipeline-test/qwen-full-video.mp4");
+      assert.equal("remoteVideoUrl" in input, false);
+      return { summary: "视频结论", hook: { description: "产品演示" } };
+    },
+  });
+  p.video.originalPath = "";
+  p.video.transcriptOriginal = "";
+  await p.run();
+  assert.equal(providerCalls, 1);
+  assert.equal(downloadCalls, 1);
+  assert.equal(videoCalls, 1);
+  assert.equal(p.video.status, "completed");
+  assert.equal(p.video.transcriptZh, "TokScript 已返回的中文");
+  assert.equal(p.video.originalPath, "pipeline-test/download-unique/2/original.mp4");
+  assert.ok(JSON.parse(p.video.analysis_json).modelTrace.includes("视频文件：网页下载"));
+});
+
+test("exhausted download fallbacks do not discard a successful TokScript translation or run Qwen video analysis", async () => {
+  let videoCalls = 0;
+  const p = await pipeline({
+    fetchTikTok: async () => ({ downloadUrl: "", transcript: "Original speech.", transcriptZh: "仍须保留的中文", segments: [], stats: {}, raw: {} }),
+    downloadTikTokVideoWithFallback: async () => { throw new Error("视频下载失败（网页：请求失败）"); },
+    analyzeVideoWithQwen: async () => { videoCalls += 1; },
+  });
+  p.video.originalPath = "";
+  p.video.transcriptOriginal = "";
+  await assert.rejects(p.run(), /视频下载失败/);
+  await waitFor(() => p.deliveries.some(value => value.translation === "仍须保留的中文"));
+  assert.equal(videoCalls, 0);
+  assert.equal(p.video.transcriptZh, "仍须保留的中文");
+  assert.equal(p.video.originalPath, "");
+  assert.equal(p.video.status, "failed");
 });

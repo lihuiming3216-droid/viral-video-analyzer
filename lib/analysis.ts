@@ -19,7 +19,8 @@ import {
   translateTranscriptWithQwen,
   type QwenRequestDiagnostic,
 } from "@/lib/providers/qwen";
-import { fetchTikTok, resolveTokScriptVideoUrl, tokScriptTranscriptFailure } from "@/lib/providers/tokscript";
+import { fetchTikTok, tokScriptTranscriptFailure } from "@/lib/providers/tokscript";
+import { downloadTikTokVideoWithFallback } from "@/lib/tiktok-video-download";
 import type {
   AnalysisResult,
   AnalysisScene,
@@ -32,7 +33,6 @@ import { emitVideoProgress } from "@/lib/video-events";
 import {
   createSceneClip,
   downloadMedia,
-  downloadTikTokVideoWithYtDlp,
   extractVideoAssets,
   prepareLocalVideoForQwen,
   resolveMediaPath,
@@ -450,10 +450,7 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
         signal,
       );
       await assertVideoAttempt(videoId, signal, expectedAttemptNumber);
-      // TokScript's own download tool can fail independently of transcript
-      // (see lib/video-processing.ts's downloadTikTokVideoWithYtDlp doc
-      // comment) — an empty downloadUrl here just means the local yt-dlp
-      // fallback below will fetch the file directly instead.
+      // File acquisition may fall back independently of the saved transcript.
       const remoteVideoUrl = tok.downloadUrl || "";
       transcript = tok.transcript;
       transcriptZh = tok.transcriptZh || transcriptZh;
@@ -487,22 +484,26 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
         : "TokScript：视频、文案与公开数据");
       if (!relativeVideoPath) {
         await setStage(videoId, "downloading", "正在下载 TikTok 原视频", 22);
-        relativeVideoPath = tok.downloadUrl
-          ? await withOneNetworkRetry(
-            () => downloadMedia(videoId, tok.downloadUrl, "video", signal, {
+        const downloaded = await downloadTikTokVideoWithFallback({
+          videoId, sourceUrl: initial.sourceUrl || "", signal,
+          requireAudio: analysisMode !== "transcript_only",
+          primaryDownload: tok.downloadUrl ? destinationId => withOneNetworkRetry(
+            () => downloadMedia(destinationId, tok.downloadUrl, "video", signal, {
               timeoutMs: analysisMode === "product_doc" ? 90_000 : 180_000,
             }),
             () => { void setStage(videoId, "downloading", "原视频下载较慢，正在自动重试", 24); },
             signal,
-          )
-          : await (async () => {
-            const resolvedUrl = await resolveTokScriptVideoUrl(initial.sourceUrl || "", signal).catch(() => initial.sourceUrl || "");
-            return withOneNetworkRetry(
-              () => downloadTikTokVideoWithYtDlp(videoId, resolvedUrl, signal),
-              () => { void setStage(videoId, "downloading", "TokScript 下载不可用，正在用本地工具重试", 24); },
-              signal,
-            );
-          })();
+          ) : undefined,
+          beforeSource: async source => {
+            await assertVideoAttempt(videoId, signal, expectedAttemptNumber);
+            if (source !== "TokScript") {
+              await setStage(videoId, "downloading", source === "yt-dlp"
+                ? "正在尝试本地工具下载" : "正在尝试网页原视频下载", 24);
+            }
+          },
+        });
+        relativeVideoPath = downloaded.relativePath;
+        trace.push(...downloaded.failures, `视频文件：${downloaded.source}下载`);
         await assertVideoAttempt(videoId, signal, expectedAttemptNumber);
         const coverPath = tok.coverUrl ? await downloadMedia(videoId, tok.coverUrl, "cover", signal).catch((error) => {
           if (signal?.aborted) throw error;

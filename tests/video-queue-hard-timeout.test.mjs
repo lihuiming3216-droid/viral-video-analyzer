@@ -213,8 +213,7 @@ async function loadAnalysis(hooks) {
     export const savePromptDebugCapture = async () => {};
     export const translateTranscriptWithQwen = (...args) => hooks().translateTranscriptWithQwen?.(...args) || Promise.resolve("");
     export const fetchTikTok = (...args) => hooks().fetchTikTok(...args);
-    export const resolveTokScriptVideoUrl = async (url) => url;
-    export const downloadTikTokVideoWithYtDlp = () => { throw new Error("unexpected fallback"); };
+    export const downloadTikTokVideoWithFallback = () => { throw new Error("unexpected fallback"); };
     export const tokScriptTranscriptFailure = () => false;
     export const transcriptAndTranslationAgree = () => true;
     export const emitVideoProgress = (...args) => hooks().emitVideoProgress?.(...args);

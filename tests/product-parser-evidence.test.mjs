@@ -13,7 +13,11 @@ const parserSource = await readFile(
 async function loadProductParserModule() {
   const stubSource = `
     const hooks = () => globalThis.__productParserTestHooks || {};
-    export const existsSync = () => false;
+    export const existsSync = (...args) => hooks().existsSync?.(...args) ?? false;
+    export const chromium = {
+      launch: (...args) => hooks().launch(...args),
+      launchPersistentContext: (...args) => hooks().launchPersistentContext(...args),
+    };
     export const fetchWithProxy = (...args) => hooks().fetchWithProxy(...args);
     export const createProductCaptureDigest = (...args) => hooks().createProductCaptureDigest?.(...args) ?? "capture-digest";
     export const analyzeProductCaptureWithOpenAI = (...args) => hooks().analyzeProductCaptureWithOpenAI?.(...args);
@@ -51,11 +55,14 @@ async function loadProductParserModule() {
   compiled = compiled
     .replace('import "server-only";', "")
     .replaceAll('"node:fs"', JSON.stringify(stubUrl))
+    .replaceAll('"playwright-core"', JSON.stringify(stubUrl))
     .replaceAll('"@/lib/network"', JSON.stringify(stubUrl))
     .replaceAll('"@/lib/openai-product-analyzer"', JSON.stringify(stubUrl))
     .replaceAll('"@/lib/provider-config"', JSON.stringify(stubUrl))
     .replaceAll('"@/lib/json-utils"', JSON.stringify(stubUrl))
     .replaceAll('"@/lib/tiktok-product"', JSON.stringify(stubUrl));
+  // Exercise internal runtime path checks without expanding the production API.
+  compiled += "\nexport { browserExecutable, readExpandedProductPage };\n";
   const moduleUrl = `data:text/javascript;base64,${Buffer.from(compiled).toString("base64")}`;
   return import(moduleUrl);
 }
@@ -329,6 +336,69 @@ test("persistent browser recovery retries only an unavailable capture", () => {
   assert.equal(parser.shouldRetryProductPageCapture({ errorCode: "all_product_images_unavailable" }), false);
   assert.equal(parser.shouldRetryProductPageCapture({ errorCode: "", capture: {} }), false);
 });
+
+test("browser executable paths are checked at runtime in configured-then-system order", (t) => {
+  const previous = process.env.PRODUCT_BROWSER_EXECUTABLE_PATH;
+  t.after(() => {
+    if (previous === undefined) delete process.env.PRODUCT_BROWSER_EXECUTABLE_PATH;
+    else process.env.PRODUCT_BROWSER_EXECUTABLE_PATH = previous;
+    delete globalThis.__productParserTestHooks;
+  });
+  process.env.PRODUCT_BROWSER_EXECUTABLE_PATH = "/runtime/custom-chromium";
+  const checked = [];
+  let available = process.env.PRODUCT_BROWSER_EXECUTABLE_PATH;
+  globalThis.__productParserTestHooks = {
+    existsSync: (candidate) => { checked.push(candidate); return candidate === available; },
+  };
+  assert.equal(parser.browserExecutable(), available);
+  assert.deepEqual(checked, [available]);
+
+  checked.length = 0;
+  available = "/usr/bin/chromium";
+  assert.equal(parser.browserExecutable(), available);
+  assert.deepEqual(checked, ["/runtime/custom-chromium", available]);
+
+  available = "";
+  assert.equal(parser.browserExecutable(), "");
+});
+
+for (const profileExists of [false, true]) {
+  test(`runtime browser profile existence ${profileExists} preserves launch and recovery behavior`, async (t) => {
+    const keys = ["PRODUCT_BROWSER_EXECUTABLE_PATH", "TIKTOK_CHROMIUM_PROFILE_DIR"];
+    const previous = keys.map((key) => process.env[key]);
+    t.after(() => {
+      keys.forEach((key, index) => {
+        if (previous[index] === undefined) delete process.env[key];
+        else process.env[key] = previous[index];
+      });
+      delete globalThis.__productParserTestHooks;
+    });
+    process.env.PRODUCT_BROWSER_EXECUTABLE_PATH = "/runtime/custom-chromium";
+    process.env.TIKTOK_CHROMIUM_PROFILE_DIR = "  /runtime/profile  ";
+    const checked = [];
+    const launches = [];
+    globalThis.__productParserTestHooks = {
+      existsSync: (candidate) => {
+        checked.push(candidate);
+        return candidate === "/runtime/custom-chromium" || (candidate === "/runtime/profile" && profileExists);
+      },
+      launch: async (options) => {
+        launches.push({ kind: "fresh", executable: options.executablePath });
+        throw new Error("intentional offline browser failure");
+      },
+      launchPersistentContext: async (directory, options) => {
+        launches.push({ kind: "persistent", directory, executable: options.executablePath });
+        throw new Error("intentional offline browser failure");
+      },
+    };
+    assert.equal(await parser.readExpandedProductPage(cameraUrl), null);
+    assert.deepEqual(checked, ["/runtime/custom-chromium", "/runtime/profile"]);
+    assert.deepEqual(launches, [
+      ...(profileExists ? [{ kind: "persistent", directory: "/runtime/profile", executable: "/runtime/custom-chromium" }] : []),
+      { kind: "fresh", executable: "/runtime/custom-chromium" },
+    ]);
+  });
+}
 
 test("anonymous product fetch follows only trusted same-PID redirects", async () => {
   const url = `https://shop.tiktokw.us/us/pdp/${cameraPid}`;

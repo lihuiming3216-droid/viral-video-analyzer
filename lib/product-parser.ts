@@ -1565,7 +1565,9 @@ function browserExecutable() {
     "/usr/bin/chromium-browser",
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
   ].filter(Boolean) as string[];
-  return candidates.find((candidate) => existsSync(candidate)) || "";
+  // Chromium is installed on the runtime host (apt in Docker), not a bundled
+  // project asset. Keep this existence check without tracing arbitrary paths.
+  return candidates.find((candidate) => existsSync(/* turbopackIgnore: true */ candidate)) || "";
 }
 
 export const PRODUCT_DETAIL_CONTROL_LABELS = [
@@ -2370,7 +2372,8 @@ async function readExpandedProductPage(productUrl: string): Promise<ProductPageC
     const { chromium } = await import("playwright-core");
     const profileDir = process.env.TIKTOK_CHROMIUM_PROFILE_DIR?.trim()
       || "/app/.data/tiktok-chromium-interactive";
-    const hasPersistentProfile = existsSync(profileDir);
+    // This profile lives in the runtime data volume; never collect it at build time.
+    const hasPersistentProfile = existsSync(/* turbopackIgnore: true */ profileDir);
     const primary = await runProductPageBrowserAttempt(
       chromium,
       executablePath,

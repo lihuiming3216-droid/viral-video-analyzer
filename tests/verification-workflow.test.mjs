@@ -19,6 +19,17 @@ test("verification has read-only GitHub access and no deployment or business cre
   assert.equal((workflow.match(/uses:/g) || []).length, 1, "checkout is the only invoked action");
 });
 
+test("both workflows pin the reviewed Node 24 checkout release without retaining credentials", () => {
+  // actions/checkout v7.0.1 declares runs.using: node24 in its action.yml.
+  const checkout = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1";
+  for (const source of [workflow, read(".github/workflows/deploy.yml")]) {
+    assert.ok(source.includes(checkout));
+    assert.equal((source.match(/uses: actions\/checkout@/g) || []).length, 1);
+    assert.match(source, /persist-credentials: false/);
+    assert.doesNotMatch(source, /ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION|ACTIONS_RUNNER_FORCE_ACTIONS_NODE_VERSION/);
+  }
+});
+
 test("verification reuses the image and smoke test while running regression containers offline", () => {
   assert.match(workflow, /docker build --build-arg VCS_REF="\$GITHUB_SHA"/);
   const runs = workflow.split("\n").filter(line => line.includes("docker run"));

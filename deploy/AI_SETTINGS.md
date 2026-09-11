@@ -2,7 +2,7 @@
 
 ## 当前交付边界
 
-2026-09-11 已完成本地实现与验收，交付到独立验证分支；本文不代表已经部署上线。没有新增付费模型请求，没有请求出海匠、TokScript或飞书，没有修改生产数据、账号或HTTPS。云端隔离验收和上线状态以对应提交的工作流结果及后续部署记录为准。
+2026-09-11 已完成本地实现与云端隔离验收，交付到独立验证分支；新应用尚未部署。首次验收未修改生产环境；负责人随后批准了旧镜像清理、沿用IP配置HTTPS及后台账号准备，实际变更见文末记录。整个过程没有追加付费模型、出海匠、TokScript或飞书业务请求；应用自身原有定时工作仍正常运行。
 
 ## 已确认的业务规则
 
@@ -94,4 +94,18 @@
 - 生产应用和数据库健康，应用仍为 `aef72b68f5a4debed36039e0543f30b420e965d6`；main未变，未部署新代码。原自动化和字幕接口密钥均存在，仅检查了是否配置，没有输出密钥值。
 - Nginx仅监听HTTP，尚无正式HTTPS证书或后台账号。短时、无业务内容的TLS检查在服务器内部返回200，但外部连接失败；这只能确认外部连通性尚未通过，不能直接断言是Lightsail防火墙所致。临时监听和自签诊断证书已撤除，Nginx未改动。AWS控制台当前停在登录页，需负责人登录后核查443规则。
 - 磁盘约6.8GB可用、使用率89%；存在大量历史程序镜像。尚未清理任何程序镜像、数据库、视频或手卡缓存。新版本导入前需核算空间；如需清理旧程序镜像，先取得许可，并保留当前版本、上一正式版本及所有现存容器依赖的镜像。
-- 不强制购买域名：证书机构已支持IP地址证书，但必须安排自动续期并验收。参考[Let's Encrypt IP证书说明](https://letsencrypt.org/2026/03/11/shorter-certs-certbot)。端口规则核查参考[AWS Lightsail防火墙说明](https://docs.aws.amazon.com/lightsail/latest/userguide/amazon-lightsail-editing-firewall-rules.html)。后台地址选择仍待负责人回复。
+- 不强制购买域名：证书机构已支持IP地址证书，但必须安排自动续期并验收。参考[Let's Encrypt IP证书说明](https://letsencrypt.org/2026/03/11/shorter-certs-certbot)。端口规则核查参考[AWS Lightsail防火墙说明](https://docs.aws.amazon.com/lightsail/latest/userguide/amazon-lightsail-editing-firewall-rules.html)。当时后台地址选择尚待回复，后续确认及执行结果如下。
+
+## 2026-09-11 后续批准与实际配置（尚未切换应用）
+
+根据项目负责人随后确认：继续用现有IP，允许清理旧程序镜像，但保留当前版、上一正式版及现存容器依赖，不动业务资料。
+
+- 镜像清理已完成：删除42个旧程序镜像、67个标签，执行前后核对了完整镜像ID及所有容器引用，未使用强制删除或全局prune。保留现用 `aef72b6`、上一版 `91dec9a`、数据库镜像及已停止容器的依赖。释放18,722,316,288字节（约18.7GB）；后续检查磁盘可用约25GiB、使用率59%。数据库、应用容器ID及启动时间未变。更早镜像未作备份，不能直接恢复；清理前确认旧迁移镜像 `/app/.data` 无数据文件。
+- 清理清单、保护逻辑和Nginx改动前配置保存在服务器私有目录 `/opt/viral-video-analyzer/operations/20260911-ai-settings/`。此目录不含业务数据库、视频、模型密钥或后台密码。
+- 已安装官方Certbot 5.8.0 snap。正式IP证书位于 `/etc/letsencrypt/live/viral-backend-ip/`；初次证书到期时间为2026-09-17 15:35:56 UTC，后续应由自动续期更新，不能把本次到期日当作永久值。
+- `snap.certbot.renew.timer` 已启用且运行；申请演练与 `certbot renew --dry-run --run-deploy-hooks --cert-name viral-backend-ip` 均成功。续期后执行Nginx语法检查和热加载。Certbot输出中的“error output”只是Nginx将成功检查信息写到stderr，演练和钩子并未失败。
+- 现有HTTP配置增加 `/.well-known/acme-challenge/` 静态验证路径，根目录 `/var/lib/viral-acme`；其他原有HTTP代理、飞书地址和超时保持不变。改动后的配置SHA256为 `b1fc7ee95a65ccf349305419218d77d6f3509e5445db78743224475171c5de5c`。
+- 新增 `/etc/nginx/conf.d/viral-ip-https.conf`（SHA256 `67a7d1c312176d689f6a7a8e4930191005617cc1f41dd595340497ba10828181`），仅开放HTTPS健康检查，其他HTTPS路径返回准备中503，避免将尚未启用新登录保护的旧后台暴露到新入口。最初即时探测早于热加载完成，已自动撤回该次配置；加入短时就绪重试后重新加载成功，使用真实证书、严格校验IP身份的服务器内部HTTPS健康检查返回200。
+- 后台账号 `mingo` 已通过不回显交互输入设置；私有卷 `/app/.data/admin-auth.json` 为root所有、权限0600，保存加盐scrypt校验值，未保存明文密码。该文件已准备但旧应用不使用新登录模块，不能宣称新后台登录已线上验收。
+- **剩余上线条件**：外部curl和浏览器HTTPS访问仍未通过，尚不能确定是Lightsail防火墙还是外部网络路径所致。服务器Nginx已监听443且内部证书校验成功，需先取得AWS控制台实际登录状态，核对该IP实例的HTTPS/TCP443规则。没有云端防火墙访问权限就不能靠重复确认代替检查。
+- main和生产应用仍停留在 `aef72b68f5a4debed36039e0543f30b420e965d6`。外部访问通过后，还需核查正在进行的任务、切换应用、将上述HTTPS准备页改为受登录保护的应用代理，并验收登录及原机器接口；未触发任何生产发布工作流。

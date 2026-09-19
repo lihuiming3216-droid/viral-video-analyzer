@@ -40,3 +40,7 @@ jobs:
 
       - name: Smoke test with an isolated empty MySQL
         run: bash deploy/smoke-test.sh "viral-video-analyzer:$GITHUB_SHA"
+
+      - name: Test internal hand-card app without network or credentials
+        run: |
+          docker run --rm --network none --entrypoint node -v "$PWD/tests:/app/tests:ro" "viral-video-analyzer:$GITHUB_SHA" --test tests/feishu-handcard-app.test.mjs

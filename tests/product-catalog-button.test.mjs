@@ -60,6 +60,19 @@ test("PID and name alone deliver a reused card link before catalog processing an
   for (const key of Object.keys(types.catalogFields)) assert.ok(derived[key]);
 });
 
+test("omitted hand-card status never writes an empty column or re-enables the default status column", async t => {
+  const f = await fixture(t);
+  f.input.fieldMap = { productCardStatus: "" };
+  await f.run();
+  for (const [kind, fields] of f.events) if (kind === "write") {
+    assert.equal(Object.hasOwn(fields, ""), false);
+    assert.equal(Object.hasOwn(fields, "手卡状态"), false);
+  }
+  const before = f.events.length;
+  await f.automation.updateProductCardStatus({ ...f.input, status: "失败", fieldName: "" });
+  assert.equal(f.events.length, before);
+});
+
 test("provider failure leaves the delivered card available and publishes a safe error", async t => {
   const f = await fixture(t);
   f.hooks.getProductCatalog = async () => { throw Error("private-token https://signed.invalid"); };

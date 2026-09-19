@@ -1,4 +1,5 @@
 import { after, NextRequest, NextResponse } from "next/server";
+import { getFeishuFieldMapping } from "@/lib/database";
 import { ensureFeishuConnection, getConnectedFeishuChannel } from "@/lib/feishu/runtime";
 import {
   handleFeishuAutomation,
@@ -52,7 +53,13 @@ export async function POST(request: NextRequest) {
     const recordId = String(body.recordId || body.record_id || "").trim();
     const fields = payloadFields(body);
     if (!appToken || !tableId || !recordId) return NextResponse.json({ error: "缺少 appToken、tableId 或 recordId" }, { status: 400 });
-    const fieldMap = payloadFieldMap(body.fieldMap || body.field_map);
+    // Use the same saved map for row hydration, processing AND failure status.
+    // Otherwise a custom PID column cannot be read before the handler runs.
+    const storedMapping = await getFeishuFieldMapping(`${appToken}:${tableId}`);
+    const fieldMap: Partial<FeishuAutomationFieldMap> = {
+      ...storedMapping?.fieldMap,
+      ...payloadFieldMap(body.fieldMap || body.field_map),
+    };
     // Every accepted click schedules one refresh. The handler itself holds a
     // per-Base-record lock across shell -> PID cache -> document sync,
     // so concurrent clicks serialize without silently dropping a click.

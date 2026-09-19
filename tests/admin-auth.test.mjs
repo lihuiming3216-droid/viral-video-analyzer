@@ -56,7 +56,7 @@ test("the actual Next proxy rejects plaintext credentials, unauthenticated APIs 
   t.after(() => { if (original === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = original; });
   const url = code => `data:text/javascript;base64,${Buffer.from(code).toString("base64")}`;
   const authUrl = url(compiled);
-  const stub = url(`export { publicMachineRoute } from ${JSON.stringify(authUrl)}; export const checkAdminAuthorization = async header => header === "Basic fixture" ? "ok" : "unauthorized";`);
+  const stub = url(`export { publicMachineRoute, publicFeishuAppRoute } from ${JSON.stringify(authUrl)}; export const checkAdminAuthorization = async header => header === "Basic fixture" ? "ok" : "unauthorized";`);
   const source = await readFile(new URL("../proxy.ts", import.meta.url), "utf8");
   const code = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } }).outputText
     .replaceAll('"@/lib/admin-auth"', JSON.stringify(stub)).replaceAll('"next/server"', JSON.stringify(import.meta.resolve("next/server.js")));
@@ -69,6 +69,10 @@ test("the actual Next proxy rejects plaintext credentials, unauthenticated APIs 
   assert.equal((await proxy(new NextRequest("https://example.test/api/settings", { headers: { authorization: "Basic fixture" } }))).status, 200);
   assert.equal((await proxy(new NextRequest("https://example.test/api/settings", { method: "PUT", headers: { authorization: "Basic fixture", origin: "https://attacker.example", host: "example.test" } }))).status, 403);
   assert.equal((await proxy(new NextRequest("http://localhost/api/feishu/automation", { method: "POST" }))).status, 200);
+  assert.equal((await proxy(new NextRequest("http://localhost/feishu/handcard"))).status, 426);
+  assert.equal((await proxy(new NextRequest("https://example.test/feishu/handcard"))).status, 200);
+  assert.equal((await proxy(new NextRequest("https://example.test/feishu/handcard/api", { method: "POST" }))).status, 200, "route itself must enforce Feishu login and origin");
+  assert.equal((await proxy(new NextRequest("https://example.test/feishu/handcard", { method: "POST", headers: { "next-action": "blocked" } }))).status, 401);
   assert.equal((await proxy(new NextRequest("https://example.test/api/feishu/task-table", { method: "POST" }))).status, 200);
   assert.equal((await proxy(new NextRequest("https://example.test/api/feishu/task-table", { method: "POST", headers: { "next-action": "blocked" } }))).status, 401);
   assert.equal((await proxy(new NextRequest("https://example.test/api/feishu/automation", { method: "POST", headers: { "next-action": "not-public" } }))).status, 401);

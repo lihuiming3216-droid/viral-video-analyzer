@@ -1,11 +1,19 @@
 import { NextRequest, NextResponse } from "next/server";
-import { checkAdminAuthorization, publicMachineRoute } from "@/lib/admin-auth";
+import { checkAdminAuthorization, publicMachineRoute, publicFeishuAppRoute } from "@/lib/admin-auth";
 
 export async function proxy(request: NextRequest) {
   if (publicMachineRoute(request.nextUrl.pathname, request.method, request.headers.has("next-action"))) return NextResponse.next();
   const scheme = request.headers.get("x-forwarded-proto") || request.nextUrl.protocol.replace(":", "");
   if (process.env.NODE_ENV === "production" && scheme !== "https") {
     return new NextResponse("后台需要HTTPS，请使用HTTPS地址登录", { status: 426 });
+  }
+  if (publicFeishuAppRoute(request.nextUrl.pathname, request.method, request.headers.has("next-action"))) {
+    const response = NextResponse.next();
+    response.headers.set("Cache-Control", "no-store");
+    response.headers.set("Referrer-Policy", "no-referrer");
+    response.headers.set("Content-Security-Policy", "frame-ancestors 'none'");
+    response.headers.set("X-Content-Type-Options", "nosniff");
+    return response;
   }
   const auth = await checkAdminAuthorization(request.headers.get("authorization"), request.headers.get("x-real-ip") || "unknown");
   if (auth !== "ok") {

@@ -7,7 +7,7 @@ import {
   updateProductCardStatus,
   type FeishuAutomationFieldMap,
 } from "@/lib/feishu/automation";
-import { automationAuth, payloadFieldMap, payloadFields, safeBackgroundError } from "@/lib/feishu/webhook-shared";
+import { automationAuth, doubaoAutomationAuth, payloadFieldMap, payloadFields, safeBackgroundError } from "@/lib/feishu/webhook-shared";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -44,7 +44,13 @@ export async function POST(request: NextRequest) {
     const body = contentType.includes("application/json")
       ? await request.json() as Record<string, unknown>
       : Object.fromEntries((await request.formData()).entries()) as Record<string, unknown>;
-    const auth = automationAuth(request, body);
+    const standardAuth = automationAuth(request, body);
+    const doubaoAuth = doubaoAutomationAuth(request);
+    // Preserve the existing fail-closed distinction: configured-but-wrong
+    // credentials return 401, while an entirely unconfigured service returns 503.
+    const auth = standardAuth === true || doubaoAuth === true
+      ? true
+      : standardAuth === false || doubaoAuth === false ? false : null;
     if (auth === null) return NextResponse.json({ error: "云端尚未配置自动化接口密钥" }, { status: 503 });
     if (!auth) return NextResponse.json({ error: "自动化接口密钥不正确" }, { status: 401 });
     const appToken = String(body.appToken || body.app_token || "").trim();

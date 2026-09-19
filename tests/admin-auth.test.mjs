@@ -96,3 +96,21 @@ test("all three subtitle machine endpoints reject missing/wrong secrets and stil
     assert.equal((await route.POST(request("isolated-fixture"))).status, 400, "authorized request reaches body validation, but never paid business work");
   }
 });
+
+test("Doubao uses a separate header and secret without changing the existing Feishu credential", async t => {
+  const old = process.env.FEISHU_AUTOMATION_WEBHOOK_SECRET;
+  const doubao = process.env.DOUBAO_FEISHU_WEBHOOK_SECRET;
+  t.after(() => {
+    if (old === undefined) delete process.env.FEISHU_AUTOMATION_WEBHOOK_SECRET; else process.env.FEISHU_AUTOMATION_WEBHOOK_SECRET = old;
+    if (doubao === undefined) delete process.env.DOUBAO_FEISHU_WEBHOOK_SECRET; else process.env.DOUBAO_FEISHU_WEBHOOK_SECRET = doubao;
+  });
+  const compile = text => ts.transpileModule(text, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } }).outputText.replace('import "server-only";', "");
+  const shared = await import(`data:text/javascript;base64,${Buffer.from(compile(await readFile(new URL("../lib/feishu/webhook-shared.ts", import.meta.url), "utf8"))).toString("base64")}`);
+  const request = headers => ({ headers: new Headers(headers) });
+  process.env.FEISHU_AUTOMATION_WEBHOOK_SECRET = "existing-feishu-secret";
+  process.env.DOUBAO_FEISHU_WEBHOOK_SECRET = "isolated-doubao-secret";
+  assert.equal(shared.automationAuth(request({ "x-feishu-automation-secret": "existing-feishu-secret" }), {}), true);
+  assert.equal(shared.doubaoAutomationAuth(request({ "x-doubao-feishu-secret": "isolated-doubao-secret" })), true);
+  assert.equal(shared.doubaoAutomationAuth(request({ "x-feishu-automation-secret": "isolated-doubao-secret" })), false);
+  assert.equal(shared.automationAuth(request({ "x-feishu-automation-secret": "isolated-doubao-secret" }), {}), false);
+});

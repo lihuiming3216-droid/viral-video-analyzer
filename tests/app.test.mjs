@@ -149,7 +149,10 @@ test("owner-approved no-login deployment retains independent Feishu callback aut
   ]);
   assert.doesNotMatch(compose, /APP_BASIC_AUTH_USER|APP_BASIC_AUTH_PASSWORD/);
   assert.match(auth, /FEISHU_AUTOMATION_WEBHOOK_SECRET/);
+  assert.match(auth, /DOUBAO_FEISHU_WEBHOOK_SECRET/);
+  assert.match(auth, /x-doubao-feishu-secret/);
   assert.match(auth, /FEISHU_SUBTITLE_BRIDGE_SECRET/);
+  assert.match(compose, /DOUBAO_FEISHU_WEBHOOK_SECRET/);
   assert.match(compose, /FEISHU_SUBTITLE_BRIDGE_SECRET/);
   assert.match(compose, /\/api\/health/);
 });

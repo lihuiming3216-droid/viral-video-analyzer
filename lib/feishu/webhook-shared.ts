@@ -11,6 +11,13 @@ export function automationAuth(request: NextRequest, body: Record<string, unknow
     || String(body.secret || "") === expected;
 }
 
+/** Optional second credential for Doubao only; it never replaces the existing Feishu secret. */
+export function doubaoAutomationAuth(request: NextRequest) {
+  const expected = process.env.DOUBAO_FEISHU_WEBHOOK_SECRET?.trim();
+  if (!expected) return null;
+  return request.headers.get("x-doubao-feishu-secret") === expected;
+}
+
 /**
  * Shared by the three /feishu/(subtitle|tokscript-subtitle|link-subtitle)
  * routes — deliberately its own secret/header name (X-Subtitle-Secret)

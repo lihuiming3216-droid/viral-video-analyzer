@@ -16,7 +16,7 @@ export function publicMachineRoute(pathname: string, method: string, serverActio
   if ((method === "GET" || method === "HEAD") && (pathname === "/api/health" || pathname.startsWith("/api/media/")
     || /^\/api\/products\/[^/]+\/image$/.test(pathname))) return true;
   return method === "POST" && [
-    "/api/feishu/automation", "/api/feishu/product-doc-sync",
+    "/api/feishu/automation", "/api/feishu/product-doc-sync", "/api/feishu/task-table",
     "/feishu/subtitle", "/feishu/tokscript-subtitle", "/feishu/link-subtitle",
   ].includes(pathname);
 }

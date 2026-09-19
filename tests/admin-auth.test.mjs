@@ -11,9 +11,10 @@ const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.Modu
 const auth = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString("base64")}`);
 
 test("Feishu machine routes keep their existing authentication; admin and server actions never bypass login", () => {
-  for (const route of ["/api/feishu/automation", "/api/feishu/product-doc-sync", "/feishu/subtitle", "/feishu/tokscript-subtitle", "/feishu/link-subtitle"]) {
+  for (const route of ["/api/feishu/automation", "/api/feishu/product-doc-sync", "/api/feishu/task-table", "/feishu/subtitle", "/feishu/tokscript-subtitle", "/feishu/link-subtitle"]) {
     assert.equal(auth.publicMachineRoute(route, "POST"), true);
     assert.equal(auth.publicMachineRoute(route, "POST", true), false);
+    assert.equal(auth.publicMachineRoute(route, "GET"), false);
     assert.equal(auth.publicMachineRoute(route + "/extra", "POST"), false);
   }
   for (const route of ["/admin/providers", "/api/settings", "/api/feishu/settings", "/api/products/ensure-document"]) {
@@ -68,6 +69,8 @@ test("the actual Next proxy rejects plaintext credentials, unauthenticated APIs 
   assert.equal((await proxy(new NextRequest("https://example.test/api/settings", { headers: { authorization: "Basic fixture" } }))).status, 200);
   assert.equal((await proxy(new NextRequest("https://example.test/api/settings", { method: "PUT", headers: { authorization: "Basic fixture", origin: "https://attacker.example", host: "example.test" } }))).status, 403);
   assert.equal((await proxy(new NextRequest("http://localhost/api/feishu/automation", { method: "POST" }))).status, 200);
+  assert.equal((await proxy(new NextRequest("https://example.test/api/feishu/task-table", { method: "POST" }))).status, 200);
+  assert.equal((await proxy(new NextRequest("https://example.test/api/feishu/task-table", { method: "POST", headers: { "next-action": "blocked" } }))).status, 401);
   assert.equal((await proxy(new NextRequest("https://example.test/api/feishu/automation", { method: "POST", headers: { "next-action": "not-public" } }))).status, 401);
 });
 

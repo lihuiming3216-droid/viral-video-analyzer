@@ -463,7 +463,6 @@ export async function updateProductCardStatus(input: {
   status: string;
   fieldName?: string;
 }) {
-  if (input.fieldName !== undefined && !input.fieldName.trim()) return;
   await patchBaseRecord(input.client, {
     appToken: input.appToken,
     tableId: input.tableId,
@@ -767,9 +766,8 @@ async function handleFeishuAutomationUnlocked(input: FeishuAutomationInput) {
   let product = null as Awaited<ReturnType<typeof getProductByPid>>;
 
   const queuePatch = (fields: Record<string, unknown>) => {
-    const selected = Object.fromEntries(Object.entries(fields).filter(([name]) => name.trim()));
-    Object.assign(patch, selected);
-    Object.assign(pendingPatch, selected);
+    Object.assign(patch, fields);
+    Object.assign(pendingPatch, fields);
   };
   const flushPatch = async () => {
     if (!writeBack || !Object.keys(pendingPatch).length) return;

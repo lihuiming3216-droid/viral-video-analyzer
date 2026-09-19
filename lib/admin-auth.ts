@@ -10,15 +10,6 @@ const accepted = new Map<string, number>();
 const failedLogins = new Map<string, { count: number; expires: number }>();
 let activeChecks = 0;
 
-/** Exact app entry points only. Every data route enforces its own Feishu session. */
-export function publicFeishuAppRoute(pathname: string, method: string, serverAction = false) {
-  if (serverAction) return false;
-  if (method === "GET" || method === "HEAD") return [
-    "/feishu/handcard", "/feishu/handcard/auth/login", "/feishu/handcard/auth/callback", "/feishu/handcard/api",
-  ].includes(pathname);
-  return (method === "POST" || method === "DELETE") && pathname === "/feishu/handcard/api";
-}
-
 export function publicMachineRoute(pathname: string, method: string, serverAction = false) {
   if (serverAction) return false;
   if ((method === "GET" || method === "HEAD") && (pathname.startsWith("/_next/static/") || pathname === "/_next/image" || pathname === "/favicon.ico")) return true;

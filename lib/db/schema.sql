@@ -435,28 +435,6 @@ CREATE TABLE IF NOT EXISTS feishu_field_mappings (
   updated_at VARCHAR(32) NOT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
--- Separate app login: no change to the existing feishu_settings singleton.
-CREATE TABLE IF NOT EXISTS feishu_handcard_sessions (
-  session_hash CHAR(64) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
-  app_id VARCHAR(100) NOT NULL,
-  tenant_key VARCHAR(100) NOT NULL,
-  open_id VARCHAR(100) NOT NULL,
-  display_name VARCHAR(255) NOT NULL,
-  encrypted_token TEXT NOT NULL,
-  expires_at BIGINT NOT NULL,
-  INDEX idx_handcard_session_expiry (expires_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
-
-CREATE TABLE IF NOT EXISTS feishu_handcard_config_audit (
-  id CHAR(36) PRIMARY KEY,
-  scope_key VARCHAR(191) NOT NULL,
-  open_id VARCHAR(100) NOT NULL,
-  before_json JSON NOT NULL,
-  after_json JSON NOT NULL,
-  created_at VARCHAR(32) NOT NULL,
-  INDEX idx_handcard_config_scope (scope_key, created_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
-
 CREATE TABLE IF NOT EXISTS prompt_debug_captures (
   id VARCHAR(36) PRIMARY KEY,
   video_id VARCHAR(36) NOT NULL,

@@ -248,7 +248,7 @@ async function service(t, initial = null) {
     finishCatalogAnalysis: async (_pid, value) => { row.analysis_state = "ready"; row.result_json = value; },
     failCatalog: async (_pid, stage, error) => { row[`${stage}_state`] = "failed"; row.error_message = error; },
     cachedProduct: async () => disk.get("raw") || null,
-    fetchProductOnce: async pid => { paid++; const item = { product_id: pid }; disk.set("raw", item); return item; },
+    fetchProductOnce: async pid => { paid++; const item = { product_id: pid, product_name: "Supplier bottle" }; disk.set("raw", item); return item; },
     prepareCatalogEvidence: async pid => ({ pid }),
     analyzeCatalog: async input => { ai++; return result(input.pid); },
     catalogDirectory: pid => `/isolated/${pid}`,
@@ -273,6 +273,120 @@ test("twenty simultaneous clicks plus restart organize exactly once and reuse gl
   assert.equal(out.length, 20);
   await (await f.restart()).getProductCatalog(fixturePid);
   assert.deepEqual(f.counts(), { paid: 1, ai: 1 });
+});
+
+test("PID-only name retrieval charges once, skips AI, and shares the source with later catalog analysis", async t => {
+  env(t, "CHUHAIJIANG_API_KEY", "test");
+  const f = await service(t);
+  assert.equal(await f.api.getProductNameByPid(fixturePid), "Supplier bottle");
+  assert.deepEqual(f.counts(), { paid: 1, ai: 0 });
+  assert.equal(f.row().fetch_state, "ready");
+  assert.equal(f.row().analysis_state, "waiting");
+  await f.api.getProductCatalog(fixturePid);
+  const restarted = await f.restart();
+  assert.equal(await restarted.getProductNameByPid(fixturePid), "Supplier bottle");
+  await restarted.getProductCatalog(fixturePid);
+  assert.deepEqual(f.counts(), { paid: 1, ai: 1 });
+});
+
+test("concurrent name-only and full catalog lookups share one fetch in either order", async t => {
+  env(t, "CHUHAIJIANG_API_KEY", "test");
+  for (const nameFirst of [true, false]) {
+    const f = await service(t);
+    const tasks = Array.from({ length: 20 }, (_, i) => (i % 2 === 0) === nameFirst
+      ? f.api.getProductNameByPid(fixturePid) : f.api.getProductCatalog(fixturePid));
+    await Promise.all(tasks);
+    assert.deepEqual(f.counts(), { paid: 1, ai: 1 });
+  }
+});
+
+test("verified cached names need no API credentials and do not depend on AI success", async t => {
+  env(t, "CHUHAIJIANG_API_KEY", "");
+  const f = await service(t, { pid: fixturePid, fetch_state: "ready", analysis_state: "failed", error_message: "AI unavailable" });
+  for (const item of [
+    { product_name: "  原始商品名\n 商品型号  ", product_title: "备用名称" },
+    { product_name: " ", product_title: " 原始商品名 商品型号 " },
+    { product_name: { title: "不接受对象" }, product_title: "原始商品名 商品型号" },
+  ]) {
+    f.disk.set("raw", { product_id: fixturePid, ...item });
+    assert.equal(await f.api.getProductNameByPid(fixturePid), "原始商品名 商品型号");
+  }
+  assert.deepEqual(f.counts(), { paid: 0, ai: 0 });
+  assert.equal(f.row().analysis_state, "failed");
+});
+
+test("missing provider titles are not guessed or refetched, including after restart", async t => {
+  const f = await service(t);
+  f.disk.set("raw", { product_id: fixturePid, product_name: " ", product_title: 123, name: "Unverified", related: { product_name: "Another product" } });
+  await assert.rejects(f.api.getProductNameByPid(fixturePid), /补填产品名称/);
+  await assert.rejects((await f.restart()).getProductNameByPid(fixturePid), /补填产品名称/);
+  assert.deepEqual(f.counts(), { paid: 0, ai: 0 });
+});
+
+test("name lookup does not repeat a persisted or uncertain source request", async t => {
+  for (const state of ["requested", "ready", "failed"]) {
+    const f = await service(t, { pid: fixturePid, fetch_state: state, analysis_state: "waiting", error_message: "此前取数失败" });
+    await assert.rejects(f.api.getProductNameByPid(fixturePid));
+    await assert.rejects((await f.restart()).getProductNameByPid(fixturePid));
+    assert.deepEqual(f.counts(), { paid: 0, ai: 0 });
+  }
+});
+
+test("missing credentials or invalid PID cannot consume the source claim", async t => {
+  env(t, "CHUHAIJIANG_API_KEY", "");
+  const f = await service(t);
+  assert.throws(() => f.api.getProductNameByPid("../../invalid"), /PID/);
+  await assert.rejects(f.api.getProductNameByPid(fixturePid), /未配置/);
+  assert.equal(f.row(), null);
+  assert.deepEqual(f.counts(), { paid: 0, ai: 0 });
+});
+
+test("source failure during name lookup remains failed and cannot charge again", async t => {
+  env(t, "CHUHAIJIANG_API_KEY", "test");
+  const f = await service(t);
+  let calls = 0;
+  f.hooks.fetchProductOnce = async () => { calls++; throw Error("private provider error"); };
+  await assert.rejects(f.api.getProductNameByPid(fixturePid));
+  assert.equal(f.row().fetch_state, "failed");
+  assert.doesNotMatch(f.row().error_message, /private provider/);
+  await assert.rejects((await f.restart()).getProductNameByPid(fixturePid));
+  assert.equal(calls, 1);
+});
+
+test("another process winning the DB claim blocks a second name fetch", async t => {
+  env(t, "CHUHAIJIANG_API_KEY", "test");
+  const f = await service(t);
+  f.hooks.claimCatalog = async () => false;
+  await assert.rejects(f.api.getProductNameByPid(fixturePid), /取数已开始/);
+  assert.deepEqual(f.counts(), { paid: 0, ai: 0 });
+});
+
+test("corrupted raw cache never falls back to a new paid name request", async t => {
+  env(t, "CHUHAIJIANG_API_KEY", "test");
+  const f = await service(t);
+  f.hooks.cachedProduct = async () => { throw new types.CatalogError("商品缓存校验失败"); };
+  await assert.rejects(f.api.getProductNameByPid(fixturePid), /校验失败/);
+  assert.deepEqual(f.counts(), { paid: 0, ai: 0 });
+});
+
+test("name and catalog share the real checksummed disk response and durable request marker", async t => {
+  env(t, "CHUHAIJIANG_API_KEY", "isolated-test-key");
+  const { file } = await modules(t);
+  const f = await service(t);
+  for (const name of ["cachedProduct", "fetchProductOnce", "catalogDirectory", "readPrivateJson", "savePrivate"])
+    f.hooks[name] = file[name];
+  let requests = 0;
+  globalThis.__catalogFetch = async () => {
+    requests++;
+    return Response.json({ data: { items: [{ product_id: fixturePid, product_name: "Real cached title" }] } });
+  };
+  assert.equal(await f.api.getProductNameByPid(fixturePid), "Real cached title");
+  assert.ok(await file.readPrivateJson(path.join(file.catalogDirectory(fixturePid), "request-started.json")));
+  await f.api.getProductCatalog(fixturePid);
+  env(t, "CHUHAIJIANG_API_KEY", "");
+  assert.equal(await (await f.restart()).getProductNameByPid(fixturePid), "Real cached title");
+  assert.equal(requests, 1);
+  assert.equal(f.counts().ai, 1);
 });
 
 test("failed or uncertain persisted requests never retry after restart", async t => {

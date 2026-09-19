@@ -70,9 +70,9 @@ export async function POST(request: NextRequest) {
           fields,
           fieldMap,
         });
-        // The first external write is deliberately the newly created/reused
-        // hand-card URL inside handleFeishuAutomation. Product-data organization
-        // and even status-column failures must come after the document exists.
+        // Manual names keep the link-first flow. With PID only, the handler
+        // first resolves a supplier title from the once-only source cache.
+        // AI organization and status writes still follow document creation.
         const result = await handleFeishuAutomation({
           client: channel.rawClient,
           appToken,

@@ -23,6 +23,7 @@ async function fixture(t) {
       return { currentValues, duplicateLabels: [], missingLabels: [], skippedLabels: [] };
     },
     getProductCatalog: async value => { events.push(["catalog", value]); return catalog; },
+    getProductNameByPid: async value => { events.push(["name", value]); return "Supplier bottle"; },
     getProductByPid: async () => ({ id: "product", pid }),
     updateProduct: async () => ({ id: "product", pid }),
     upsertFeishuProductCardMapping: async () => {},
@@ -36,11 +37,11 @@ async function fixture(t) {
     const stub = names.split(",").map(name => name.trim()).filter(Boolean).map(name => `export const ${name} = async (...a) => globalThis[${JSON.stringify(key)}][${JSON.stringify(name)}]?.(...a);`).join("\n");
     code = code.replaceAll(JSON.stringify(module), JSON.stringify(url(stub)));
   }
-  code = code.replaceAll('"@/lib/products/catalog"', JSON.stringify(url(`export const getProductCatalog = (...a) => globalThis[${JSON.stringify(key)}].getProductCatalog(...a);`)));
+  code = code.replaceAll('"@/lib/products/catalog"', JSON.stringify(url(["getProductCatalog", "getProductNameByPid"].map(name => `export const ${name} = (...a) => globalThis[${JSON.stringify(key)}].${name}(...a);`).join("\n"))));
   const automation = await import(url(code));
   const client = { request: async request => { events.push(["write", request.data.fields]); return { code: 0 }; } };
   const input = { client, appToken: "app", tableId: "table", recordId: "row", fields: { 产品名称: "分装瓶", PID: pid }, writeBack: true };
-  return { hooks, events, catalog, currentValues, input, run: () => automation.handleFeishuAutomation(input) };
+  return { hooks, events, catalog, currentValues, input, automation, run: () => automation.handleFeishuAutomation(input) };
 }
 
 test("PID and name alone deliver a reused card link before catalog processing and fill six fields", async t => {
@@ -48,6 +49,7 @@ test("PID and name alone deliver a reused card link before catalog processing an
   const out = await f.run();
   assert.equal(out.productRefreshError, "");
   assert.equal(out.productCardStatus, "手卡商品资料已整理");
+  assert.equal(f.events.some(([kind]) => kind === "name"), false, "manual names do not cause a source lookup");
   const linkIndex = f.events.findIndex(([kind, input]) => kind === "write" && input.产品手卡);
   const catalogIndex = f.events.findIndex(([kind]) => kind === "catalog");
   assert.ok(linkIndex >= 0 && linkIndex < catalogIndex);
@@ -110,4 +112,76 @@ test("the live template may keep product name only in its title, without a false
   const out = await f.run();
   assert.equal(out.productCardWarning, "");
   assert.equal(out.productRefreshError, "");
+});
+
+test("PID-only click resolves the supplier name before reusing a card and still writes link before AI", async t => {
+  const f = await fixture(t);
+  delete f.input.fields.产品名称;
+  const out = await f.run();
+  assert.equal(out.productName, "Supplier bottle");
+  assert.deepEqual(f.events.find(([kind]) => kind === "name"), ["name", f.input.fields.PID]);
+  const shell = f.events.findIndex(([kind]) => kind === "shell");
+  assert.equal(f.events[shell][1].name, "Supplier bottle");
+  assert.equal(f.events[shell][1].pid, f.input.fields.PID);
+  const link = f.events.findIndex(([kind, input]) => kind === "write" && input.产品手卡);
+  assert.ok(shell < link && link < f.events.findIndex(([kind]) => kind === "catalog"));
+});
+
+test("supplier names containing 测试 never force a duplicate card", async t => {
+  const f = await fixture(t);
+  f.input.fields.产品名称 = "  ";
+  f.hooks.getProductNameByPid = async () => "水质测试仪";
+  await f.run();
+  assert.equal(f.events.find(([kind]) => kind === "shell")[1].forceNew, false);
+});
+
+test("missing supplier name stops without a placeholder document and preserves the manual-fill instruction", async t => {
+  const f = await fixture(t);
+  delete f.input.fields.产品名称;
+  f.hooks.getProductNameByPid = async () => { throw new types.CatalogError("资料没有产品名称，请补填"); };
+  await assert.rejects(f.run(), /请补填/);
+  assert.equal(f.events.length, 0);
+});
+
+test("name lookup failures do not expose provider secrets", async t => {
+  const f = await fixture(t);
+  delete f.input.fields.产品名称;
+  f.hooks.getProductNameByPid = async () => { throw Error("private-token https://signed.invalid"); };
+  await assert.rejects(f.run(), error => {
+    assert.match(error.message, /补填产品名称/);
+    assert.doesNotMatch(error.message, /private-token|signed.invalid/);
+    return true;
+  });
+  assert.equal(f.events.length, 0);
+});
+
+test("invalid or missing PID stops before looking up a missing name", async t => {
+  const f = await fixture(t);
+  delete f.input.fields.产品名称;
+  for (const pid of ["", "123", "123456?bad"]) {
+    f.input.fields.PID = pid;
+    await assert.rejects(f.run(), /PID/);
+  }
+  assert.equal(f.events.length, 0);
+});
+
+test("omitted name is hydrated from the current row before any supplier name lookup", async t => {
+  const f = await fixture(t);
+  f.input.fields = f.automation.hydrateAutomationProductFields({ PID: f.input.fields.PID }, {
+    产品名称: "人工行名称", 视频链接: "https://www.tiktok.com/t/ignored/", 中文翻译: "人工文字",
+  });
+  assert.equal(f.input.fields.视频链接, undefined);
+  const out = await f.run();
+  assert.equal(out.productName, "人工行名称");
+  assert.equal(f.events.some(([kind]) => kind === "name"), false);
+});
+
+test("a table without a product-name column can disable its mapping and use PID only", async t => {
+  const f = await fixture(t);
+  f.input.fieldMap = { productName: "", pid: "PID" };
+  f.input.fields = f.automation.hydrateAutomationProductFields({ PID: f.input.fields.PID }, {}, f.input.fieldMap);
+  const out = await f.run();
+  assert.equal(out.productName, "Supplier bottle");
+  assert.equal(Object.hasOwn(out.patch, ""), false);
+  assert.equal(Object.hasOwn(out.patch, "产品名称"), false);
 });

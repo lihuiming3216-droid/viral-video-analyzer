@@ -798,17 +798,25 @@ async function handleFeishuAutomationUnlocked(input: FeishuAutomationInput) {
     recordId: input.recordId,
   };
   const effectivePid = resolved.pid.trim();
-  const effectiveName = resolved.productName.trim();
-  if (!effectiveName) throw new Error("缺少产品名称，无法按“产品名称_PID”命名手卡");
+  let effectiveName = resolved.productName.trim();
   if (!effectivePid) throw new Error("缺少商品 PID，无法按“产品名称_PID”命名手卡");
   if (!/^\d{6,30}$/.test(effectivePid)) throw new Error("商品 PID 格式不正确，必须为 6–30 位数字");
+  if (!effectiveName) {
+    try {
+      const { getProductNameByPid } = await import("@/lib/products/catalog");
+      effectiveName = await getProductNameByPid(effectivePid);
+    } catch (error) {
+      throw new Error(`无法自动获取产品名称：${catalogError(error)}；可在表格补填产品名称后再点击`);
+    }
+  }
   // This optional display link is never crawled or used to establish identity.
   const effectiveProductUrl = resolved.productUrl || `https://shop.tiktok.com/us/pdp/${effectivePid}?source=anchor`;
   // Testing convenience: a product name containing "测试" always gets a fresh
   // card, bypassing the existing-by-PID reuse — lets a real PID be reused
   // across repeated test clicks to check the field-fill behavior without
   // "已有手卡不碰" silently skipping every run after the first.
-  const isTestRequest = effectiveName.includes("测试");
+  // Supplier text must not accidentally opt into the manual test-only bypass.
+  const isTestRequest = resolved.productName.trim().includes("测试");
 
   // Only an explicit Feishu button click reaches this handler. The product
   // folder and exact `_PID` title suffix are authoritative; row fields and

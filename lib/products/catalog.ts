@@ -9,6 +9,39 @@ import { analyzeCatalog } from "@/lib/products/catalog-analyzer";
 const inFlight = new Map<string, Promise<CatalogResult>>();
 let catalogQueue: Promise<unknown> = Promise.resolve();
 
+function enqueueCatalog<T>(operation: () => Promise<T>): Promise<T> {
+  const task = catalogQueue.then(operation);
+  catalogQueue = task.catch(() => undefined);
+  return task;
+}
+
+/** Read the supplier's exact-PID title without invoking AI or guessing from a URL. */
+export function getProductNameByPid(pid: string): Promise<string> {
+  validatePid(pid);
+  // Share the catalog queue so a name lookup cannot race a same-process fetch.
+  // The existing DB claim and durable request marker protect other processes.
+  return enqueueCatalog(async () => {
+    let item = await cachedProduct(pid);
+    if (!item) {
+      const row = await readCatalog(pid);
+      if (row?.fetch_state === "failed") throw new CatalogError(row.error_message);
+      if (row) throw new CatalogError("该 PID 已取数或正在取数，但没有可用的原始资料；不会自动重复收费，请稍后重试或手动填写产品名称");
+      if (!process.env.CHUHAIJIANG_API_KEY?.trim()) throw new CatalogError("未配置出海匠接口密钥，请管理员配置或手动填写产品名称");
+      if (!await claimCatalog(pid)) throw new CatalogError("该 PID 的取数已开始，不会重复收费；请稍后重试或手动填写产品名称");
+      try { item = await fetchProductOnce(pid); }
+      catch (error) { await failCatalog(pid, "fetch", catalogError(error)); throw error; }
+      await markCatalogFetched(pid);
+    }
+    // Only documented title fields are accepted. Never coerce an object,
+    // generate a placeholder, or use a related/recommended product's name.
+    for (const key of ["product_name", "product_title"]) {
+      const value = item[key];
+      if (typeof value === "string" && value.trim()) return value.trim().replace(/\s+/g, " ");
+    }
+    throw new CatalogError("该 PID 的商品资料没有可用的产品名称，请在表格中补填产品名称后再点击；已保留资料，不会重复收费取数");
+  });
+}
+
 /** One paid source request and one automatic organization per PID, across all buttons/cards. */
 export function getProductCatalog(pid: string): Promise<CatalogResult> {
   validatePid(pid);
@@ -16,8 +49,7 @@ export function getProductCatalog(pid: string): Promise<CatalogResult> {
   if (active) return active;
   // One product pipeline per process bounds image/base64 memory. This queue is
   // separate from the existing two-video analysis queue and never changes it.
-  const task = catalogQueue.then(() => runCatalog(pid)).finally(() => { inFlight.delete(pid); });
-  catalogQueue = task.catch(() => undefined);
+  const task = enqueueCatalog(() => runCatalog(pid)).finally(() => { inFlight.delete(pid); });
   inFlight.set(pid, task);
   return task;
 }

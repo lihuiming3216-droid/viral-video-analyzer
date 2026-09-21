@@ -13,7 +13,7 @@ import {
   upsertFeishuProductCardMapping,
   type FeishuAutomationJob,
 } from "@/lib/database";
-import { ensureFeishuConnection, getConnectedFeishuChannel } from "@/lib/feishu/runtime";
+import { ensureFeishuConnection, getChatgptFeishuClient, getConnectedFeishuChannel } from "@/lib/feishu/runtime";
 import { ensureProductCardByPid, syncProductCardManagedFields } from "@/lib/feishu/document";
 import { uploadBaseAttachment } from "@/lib/feishu/media-upload";
 import { enqueueVideos } from "@/lib/queue";
@@ -250,13 +250,17 @@ export function parseFeishuBaseUrl(input: string): { appToken: string; tableId: 
 }
 
 /** Every real column on one Base table, straight from Feishu — not our guess. */
-export async function listBitableTableFieldNames(input: { appToken: string; tableId: string }): Promise<string[]> {
-  const channel = getConnectedFeishuChannel() || await ensureFeishuConnection();
-  if (!channel) throw new Error("飞书未连接，请先在“飞书设置”里完成连接");
+export async function listBitableTableFieldNames(
+  input: { appToken: string; tableId: string },
+  suppliedClient?: Client,
+): Promise<string[]> {
+  const channel = suppliedClient ? null : getConnectedFeishuChannel() || await ensureFeishuConnection();
+  const client = suppliedClient || channel?.rawClient;
+  if (!client) throw new Error("飞书未连接，请先在“飞书设置”里完成连接");
   const names: string[] = [];
   let pageToken: string | undefined;
   for (let guard = 0; guard < 20; guard += 1) {
-    const response = await channel.rawClient.request<{
+    const response = await client.request<{
       code?: number; msg?: string;
       data?: { items?: { field_name?: string }[]; has_more?: boolean; page_token?: string };
     }>({
@@ -272,6 +276,56 @@ export async function listBitableTableFieldNames(input: { appToken: string; tabl
     pageToken = response.data.page_token;
   }
   return names;
+}
+
+const automationFieldCandidates: Record<keyof FeishuAutomationFieldMap, string[]> = {
+  productUrl: ["产品链接", "商品链接"],
+  pid: ["商品ID", "PID", "pid", "商品ID/PID", "产品id", "产品ID"],
+  productName: ["产品名称", "商品名称", "产品名"],
+  productDocument: ["产品手卡", "产品文档"],
+  productCardStatus: ["手卡状态"],
+  videoUrl: ["视频链接", "样片链接"],
+  analysis: ["视频分析"],
+  translation: ["中文翻译"],
+  status: ["分析状态"],
+  transcript: ["原口播", "口播文案"],
+  videoFile: ["视频文件"],
+  subtitle: ["音频字幕"],
+  timestampedTranscript: ["时间戳原口播"],
+  timestampedTranslation: ["时间戳中文"],
+  linkedSubtitle: ["链接字幕"],
+};
+
+/**
+ * Fit standard/aliased field names to the real columns of one Base table.
+ * Missing optional outputs become an explicit empty mapping so a table that
+ * only wants 文件/原口播/中文翻译 is not rejected for lacking subtitle/status
+ * columns. A user-entered override is strict to surface typos immediately.
+ */
+export async function fitAutomationFieldMapToTable(
+  client: Client,
+  input: { appToken: string; tableId: string; fieldMap?: Partial<FeishuAutomationFieldMap> },
+) {
+  const names = new Set(await listBitableTableFieldNames(input, client));
+  const result = {} as FeishuAutomationFieldMap;
+  for (const key of Object.keys(defaultFeishuAutomationFieldMap) as Array<keyof FeishuAutomationFieldMap>) {
+    const explicit = input.fieldMap?.[key]?.trim();
+    if (explicit) {
+      if (!names.has(explicit)) throw new Error(`多维表格中找不到字段“${explicit}”`);
+      result[key] = explicit;
+      continue;
+    }
+    const candidates = [defaultFeishuAutomationFieldMap[key], ...automationFieldCandidates[key]];
+    result[key] = candidates.find((candidate) => names.has(candidate)) || "";
+  }
+  return result;
+}
+
+async function automationJobClient(job: FeishuAutomationJob) {
+  if (job.credentialSource === "chatgpt") return getChatgptFeishuClient();
+  const channel = getConnectedFeishuChannel() || await ensureFeishuConnection();
+  if (!channel) throw new Error("飞书未连接");
+  return channel.rawClient;
 }
 
 // ~5 delivery passes (default 30s interval) before giving up on the
@@ -506,8 +560,6 @@ export async function deliverEarlyTranscript(videoId: string) {
   const video = await getVideo(videoId);
   if (!video?.transcriptOriginal?.trim()) return;
   try {
-    const channel = getConnectedFeishuChannel() || await ensureFeishuConnection();
-    if (!channel) return;
     for (const job of jobs) {
       if (job.blockedReason) continue;
       const map = { ...defaultFeishuAutomationFieldMap, ...job.fieldMap };
@@ -516,7 +568,8 @@ export async function deliverEarlyTranscript(videoId: string) {
       if (video.transcriptZh?.trim()) setMappedField(fields, map.translation, video.transcriptZh);
       if (!Object.keys(fields).length) continue;
       try {
-        await withProductCardRecordLock(job, () => patchEmptyDeliveryFields(channel.rawClient, job, video.sourceUrl, map, fields));
+        const client = await automationJobClient(job);
+        await withProductCardRecordLock(job, () => patchEmptyDeliveryFields(client, job, video.sourceUrl, map, fields));
       } catch (error) {
         if (await pausePermanentDelivery(job, error)) continue;
         console.warn(`[feishu-automation] 提前写回口播失败 video=${videoId} record=${job.recordId}: ${safeAutomationFailure(feishuApiErrorDetail(error))}`);
@@ -534,12 +587,11 @@ export async function completeFeishuAutomation(videoId: string) {
   if (!jobs.length || !video || !["completed", "failed", "stopped"].includes(video.status)) return false;
   const product = await getProduct(video.productId);
   try {
-    const channel = getConnectedFeishuChannel() || await ensureFeishuConnection();
-    if (!channel) return false;
     let allDelivered = true;
     for (const job of jobs) {
       if (job.blockedReason) { allDelivered = false; continue; }
       try {
+        const client = await automationJobClient(job);
         const delivered = await withProductCardRecordLock(job, async () => {
           // Re-read after acquiring the row lock. A newer click transactionally
           // removes this job, so an older completion can never overwrite it.
@@ -557,24 +609,24 @@ export async function completeFeishuAutomation(videoId: string) {
             recordId: current.recordId,
           });
           const map = { ...defaultFeishuAutomationFieldMap, ...current.fieldMap };
-          const latest = await currentDeliveryRow(channel.rawClient, current, video.sourceUrl, map);
+          const latest = await currentDeliveryRow(client, current, video.sourceUrl, map);
           if (!latest) return true;
           // Validate real columns before an upload or subtitle-model request.
           // Input-only/card-button fields are deliberately outside this list.
           const outputNames = [map.status, map.translation, map.transcript, map.videoFile,
             map.productDocument, map.linkedSubtitle, map.timestampedTranscript, map.timestampedTranslation,
             ...(video.analysisMode === "product_doc" || video.status !== "completed" ? [map.analysis] : [])];
-          assertDeliveryFields(await listBitableTableFieldNames(current), outputNames);
+          assertDeliveryFields(await listBitableTableFieldNames(current, client), outputNames);
           const fields: Record<string, unknown> = {};
           let filePending = false;
           // File delivery is independent of analysis/subtitles. Never replace
           // an attachment already present, and never re-analyze a cached file.
           if (video.originalPath && map.videoFile && !fieldHasContent(latest[map.videoFile])) {
             try {
-              const attachment = await uploadBaseAttachment(channel.rawClient, {
+              const attachment = await uploadBaseAttachment(client, {
                 appToken: current.appToken, absolutePath: resolveMediaPath(video.originalPath), fileName: `${video.id}.mp4`,
               });
-              if (!await patchEmptyDeliveryFields(channel.rawClient, current, video.sourceUrl, map, { [map.videoFile]: attachment })) return true;
+              if (!await patchEmptyDeliveryFields(client, current, video.sourceUrl, map, { [map.videoFile]: attachment })) return true;
             } catch (error) {
               if (await pausePermanentDelivery(current, error)) return false;
               filePending = true;
@@ -619,7 +671,7 @@ export async function completeFeishuAutomation(videoId: string) {
                   // 用户最终确认：只写"链接字幕"（视频链接提取 TokScript 时间戳这条
                   // 原生流程对应的字段），不再写"音频字幕"。
                   if (map.linkedSubtitle && !fieldHasContent(latest[map.linkedSubtitle])) {
-                    const attachment = await uploadBaseAttachment(channel.rawClient, {
+                    const attachment = await uploadBaseAttachment(client, {
                       appToken: current.appToken,
                       absolutePath: subtitleFile.filePath,
                       fileName: `${video.id}.srt`,
@@ -640,7 +692,7 @@ export async function completeFeishuAutomation(videoId: string) {
           }
           for (let attempt = 1; attempt <= 3; attempt += 1) {
             try {
-              if (!await patchEmptyDeliveryFields(channel.rawClient, current, video.sourceUrl, map, fields)) return true;
+              if (!await patchEmptyDeliveryFields(client, current, video.sourceUrl, map, fields)) return true;
               if (filePending) {
                 await incrementFeishuAutomationJobAttempts(current);
                 return false;
@@ -769,6 +821,9 @@ async function handleFeishuAutomationUnlocked(input: FeishuAutomationInput) {
     Object.assign(patch, fields);
     Object.assign(pendingPatch, fields);
   };
+  const queueMappedPatch = (fieldName: string, value: unknown) => {
+    if (fieldName) queuePatch({ [fieldName]: value });
+  };
   const flushPatch = async () => {
     if (!writeBack || !Object.keys(pendingPatch).length) return;
     const snapshot = Object.entries(pendingPatch);
@@ -829,8 +884,8 @@ async function handleFeishuAutomationUnlocked(input: FeishuAutomationInput) {
   documentUrl = shell.documentUrl;
   // Deliver the card before any paid/slow operation. A failed analysis must
   // never prevent staff from opening or editing the successfully created card.
-  queuePatch({ [resolved.map.productDocument]: shell.documentUrl });
-  queuePatch({ [resolved.map.productCardStatus]: "手卡已就绪，正在整理商品资料" });
+  queueMappedPatch(resolved.map.productDocument, shell.documentUrl);
+  queueMappedPatch(resolved.map.productCardStatus, "手卡已就绪，正在整理商品资料");
   await flushPatch();
 
   productCardWarning = [shell.permissionWarning, shell.ownershipWarning]
@@ -925,7 +980,7 @@ async function handleFeishuAutomationUnlocked(input: FeishuAutomationInput) {
   if (writeBack && documentWriteFailure) {
     productCardStatus = `手卡已创建，但表格手卡链接回写待重试：${documentWriteFailure}`.slice(0, 500);
   }
-  queuePatch({ [resolved.map.productCardStatus]: productCardStatus });
+  queueMappedPatch(resolved.map.productCardStatus, productCardStatus);
 
   if (resolved.videoUrl) {
     const targetProduct = product || await getProductByPid(resolved.pid) || await getProduct("system-unclassified");
@@ -947,7 +1002,7 @@ async function handleFeishuAutomationUnlocked(input: FeishuAutomationInput) {
       });
     }
     await enqueueVideos([video.id]);
-    queuePatch({ [resolved.map.status]: "排队中" });
+    queueMappedPatch(resolved.map.status, "排队中");
   }
 
   await flushPatch();

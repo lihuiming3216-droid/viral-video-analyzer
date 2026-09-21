@@ -1,0 +1,17 @@
+{
+  "name": "chatgpt-video-action",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "block-basekit-cli test",
+    "upload": "block-basekit-cli upload"
+  },
+  "dependencies": {
+    "@lark-opdev/block-basekit-server-api": "1.0.6"
+  },
+  "devDependencies": {
+    "@lark-opdev/block-basekit-cli": "1.0.5",
+    "typescript": "5.9.3"
+  }
+}

@@ -280,6 +280,7 @@ export interface FeishuAutomationJobKey {
 
 export interface FeishuAutomationJob extends FeishuAutomationJobKey {
   fieldMap: Record<string, string>;
+  credentialSource: "primary" | "chatgpt";
   attempts: number;
   blockedReason: string;
   createdAt: string;
@@ -310,6 +311,7 @@ function feishuAutomationJobFromRow(source: Row): FeishuAutomationJob {
     tableId: String(source.table_id),
     recordId: String(source.record_id),
     fieldMap: json<Record<string, string>>(source.field_map_json, {}),
+    credentialSource: source.credential_source === "chatgpt" ? "chatgpt" : "primary",
     attempts: Number(source.attempts ?? 0),
     blockedReason: String(source.blocked_reason || ""),
     createdAt: String(source.created_at),
@@ -323,6 +325,7 @@ export async function saveFeishuAutomationJob(input: {
   tableId: string;
   recordId: string;
   fieldMap?: Record<string, string>;
+  credentialSource?: "primary" | "chatgpt";
 }) {
   const timestamp = now();
   const videoId = input.videoId.trim();
@@ -346,6 +349,17 @@ export async function saveFeishuAutomationJob(input: {
       ON DUPLICATE KEY UPDATE field_map_json=VALUES(field_map_json), attempts=0, updated_at=VALUES(updated_at)`,
       [videoId, appToken, tableId, recordId, JSON.stringify(safeFeishuAutomationFieldMap(input.fieldMap)), timestamp, timestamp],
     );
+    if (input.credentialSource === "chatgpt") {
+      await run(db, `INSERT INTO feishu_automation_job_clients(
+        video_id, app_token, table_id, record_id, credential_source, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, 'chatgpt', ?, ?)
+      ON DUPLICATE KEY UPDATE credential_source='chatgpt', updated_at=VALUES(updated_at)`,
+      [videoId, appToken, tableId, recordId, timestamp, timestamp]);
+    } else {
+      await run(db, `DELETE FROM feishu_automation_job_clients
+        WHERE video_id=? AND app_token=? AND table_id=? AND record_id=?`,
+      [videoId, appToken, tableId, recordId]);
+    }
     await run(db, `DELETE FROM feishu_automation_delivery_blocks
       WHERE video_id=? AND app_token=? AND table_id=? AND record_id=?`, [videoId, appToken, tableId, recordId]);
   });
@@ -359,8 +373,9 @@ export async function getFeishuAutomationJobs(videoId: string) {
   const db = await getDb();
   const found = await rows(
     db,
-    `SELECT j.*, b.reason AS blocked_reason FROM feishu_automation_jobs j
+    `SELECT j.*, b.reason AS blocked_reason, c.credential_source FROM feishu_automation_jobs j
       LEFT JOIN feishu_automation_delivery_blocks b USING (video_id, app_token, table_id, record_id)
+      LEFT JOIN feishu_automation_job_clients c USING (video_id, app_token, table_id, record_id)
       WHERE j.video_id=? ORDER BY j.created_at, j.app_token, j.table_id, j.record_id`,
     [videoId],
   );

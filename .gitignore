@@ -43,3 +43,7 @@ next-env.d.ts
 /work/
 /.data/
 /data/
+
+# Feishu Base action build artifacts
+feishu-actions/**/node_modules/
+feishu-actions/**/output/

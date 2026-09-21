@@ -275,6 +275,23 @@ CREATE TABLE IF NOT EXISTS feishu_automation_delivery_blocks (
     REFERENCES feishu_automation_jobs(video_id, app_token, table_id, record_id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
+-- Which Feishu app owns the permission used for one asynchronous Base
+-- delivery. Existing jobs have no row here and therefore keep using the
+-- original connected app. A separate table keeps this migration additive on
+-- already-running MySQL databases (CREATE TABLE IF NOT EXISTS is sufficient).
+CREATE TABLE IF NOT EXISTS feishu_automation_job_clients (
+  video_id VARCHAR(36) NOT NULL,
+  app_token VARCHAR(191) NOT NULL,
+  table_id VARCHAR(191) NOT NULL,
+  record_id VARCHAR(191) NOT NULL,
+  credential_source VARCHAR(32) NOT NULL DEFAULT 'primary',
+  created_at VARCHAR(32) NOT NULL,
+  updated_at VARCHAR(32) NOT NULL,
+  PRIMARY KEY (video_id, app_token, table_id, record_id),
+  CONSTRAINT fk_feishu_job_client_job FOREIGN KEY (video_id, app_token, table_id, record_id)
+    REFERENCES feishu_automation_jobs(video_id, app_token, table_id, record_id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
 CREATE TABLE IF NOT EXISTS product_document_video_rows (
   document_id VARCHAR(191) NOT NULL,
   link_block_id VARCHAR(191) NOT NULL,

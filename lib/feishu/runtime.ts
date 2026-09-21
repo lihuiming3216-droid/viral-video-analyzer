@@ -1,6 +1,6 @@
 import "server-only";
 
-import { createLarkChannel, Domain, LoggerLevel, type LarkChannel } from "@larksuiteoapi/node-sdk";
+import { Client, createLarkChannel, Domain, LoggerLevel, type LarkChannel } from "@larksuiteoapi/node-sdk";
 import { decryptSecret } from "@/lib/crypto";
 import { getMediaRoot } from "@/lib/video-processing";
 import { registerFeishuHandlers } from "@/lib/feishu/handler";
@@ -10,6 +10,8 @@ type RuntimeGlobal = typeof globalThis & {
   __feishuChannel?: LarkChannel | null;
   __feishuSignature?: string;
   __feishuConnectPromise?: Promise<LarkChannel | null> | null;
+  __chatgptFeishuClient?: Client;
+  __chatgptFeishuClientSignature?: string;
 };
 
 const state = globalThis as RuntimeGlobal;
@@ -106,6 +108,24 @@ export async function restartFeishuConnection() {
 
 export function getConnectedFeishuChannel() {
   return state.__feishuChannel || null;
+}
+
+/** Dedicated client for the ChatGPT app's Base action deliveries. */
+export function getChatgptFeishuClient() {
+  const appId = (process.env.FEISHU_CHATGPT_APP_ID || "cli_aabd673313b85be").trim();
+  const appSecret = process.env.FEISHU_CHATGPT_APP_SECRET?.trim() || "";
+  if (!appId || !appSecret) throw new Error("chatgpt 飞书应用尚未配置");
+  const signature = `${appId}:${appSecret.slice(-8)}`;
+  if (!state.__chatgptFeishuClient || state.__chatgptFeishuClientSignature !== signature) {
+    state.__chatgptFeishuClient = new Client({
+      appId,
+      appSecret,
+      domain: Domain.Feishu,
+      loggerLevel: LoggerLevel.warn,
+    });
+    state.__chatgptFeishuClientSignature = signature;
+  }
+  return state.__chatgptFeishuClient;
 }
 
 export async function stopFeishuConnection() {

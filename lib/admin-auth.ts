@@ -17,6 +17,7 @@ export function publicMachineRoute(pathname: string, method: string, serverActio
     || /^\/api\/products\/[^/]+\/image$/.test(pathname))) return true;
   return method === "POST" && [
     "/api/feishu/automation", "/api/feishu/product-doc-sync", "/api/feishu/task-table",
+    "/api/feishu/app-actions/handcard", "/api/feishu/app-actions/video",
     "/feishu/subtitle", "/feishu/tokscript-subtitle", "/feishu/link-subtitle",
   ].includes(pathname);
 }

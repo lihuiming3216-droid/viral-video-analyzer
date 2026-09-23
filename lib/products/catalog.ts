@@ -2,7 +2,7 @@ import "server-only";
 import path from "node:path";
 import { requireAiRuntime } from "@/lib/ai/settings";
 import { catalogError, CatalogError, validatePid, cachedCatalogResult, type CatalogResult } from "@/lib/products/catalog-types";
-import { readCatalog, claimCatalog, claimCatalogCreditRetry, markCatalogFetched, claimCatalogAnalysis, finishCatalogAnalysis, failCatalog, readCatalogMetadata, saveCatalogMetadata, type CatalogRow } from "@/lib/products/catalog-store";
+import { readCatalog, claimCatalog, claimCatalogCreditRetry, claimCatalogPublicRecovery, markCatalogFetched, claimCatalogAnalysis, finishCatalogAnalysis, failCatalog, readCatalogMetadata, saveCatalogMetadata, type CatalogRow } from "@/lib/products/catalog-store";
 import { cachedProduct, fetchProductOnce, prepareCatalogEvidence, catalogDirectory, readPrivateJson, savePrivate, readCreditRejection, archiveCreditRejection, catalogSourceMetadata } from "@/lib/products/catalog-source";
 import { cachedPublicProduct, fetchPublicProductOnce } from "@/lib/products/tiktok-public-source";
 import { analyzeCatalog } from "@/lib/products/catalog-analyzer";
@@ -40,10 +40,32 @@ async function fetchCatalogProductOnce(pid: string): Promise<Record<string, unkn
   try {
     return await fetchPublicProductOnce(pid);
   } catch {
+    if (process.env.CHUHAIJIANG_FALLBACK_ENABLED !== "true") {
+      throw new CatalogError("TikTok公开商品资料不可用；出海匠付费备选当前已停用");
+    }
     if (!process.env.CHUHAIJIANG_API_KEY?.trim()) {
       throw new CatalogError("TikTok公开商品资料不可用，且未配置出海匠备选接口");
     }
     return supplierItem(await fetchProductOnce(pid), true);
+  }
+}
+
+async function recoverFailedWithPublicSource(pid: string, row: CatalogRow): Promise<Record<string, unknown>> {
+  if (!await claimCatalogPublicRecovery(pid, row.updated_at)) {
+    throw new CatalogError("该 PID 已开始免费资料恢复，请稍后查看");
+  }
+  try {
+    const item = await fetchPublicProductOnce(pid);
+    await markCatalogFetched(pid);
+    return item;
+  } catch (error) {
+    await failCatalog(pid, "fetch", catalogError(error));
+    const failed = await readCatalog(pid);
+    if (process.env.CHUHAIJIANG_FALLBACK_ENABLED === "true" && failed) {
+      const proof = await readCreditRejection(pid);
+      if (proof) return retryCreditRejection(pid, failed);
+    }
+    throw error;
   }
 }
 
@@ -63,11 +85,11 @@ export async function getProductMetadataByPid(pid: string) {
   return rememberCatalogProduct(pid, item);
 }
 
-// A new button invocation may retry an explicitly rejected credit check. Never
-// retry within the failed invocation, or recycle uncertain/paid/AI requests.
-async function retryCreditRejection(pid: string, row: CatalogRow) {
+/** Paid legacy recovery exists only behind an explicit operator switch. */
+async function retryCreditRejection(pid: string, row: CatalogRow): Promise<Record<string, unknown>> {
   const proof = row.analysis_state === "waiting" && !row.result_json ? await readCreditRejection(pid) : null;
   if (!proof) throw new CatalogError(row.error_message);
+  if (process.env.CHUHAIJIANG_FALLBACK_ENABLED !== "true") throw new CatalogError("出海匠付费备选当前已停用");
   if (!process.env.CHUHAIJIANG_API_KEY?.trim()) throw new CatalogError("未配置出海匠接口密钥，请管理员配置后再点击");
   if (!await claimCatalogCreditRetry(pid, row.updated_at)) throw new CatalogError("该 PID 已开始重试，请稍后查看手卡，不会重复取数");
   try {
@@ -89,7 +111,7 @@ export function getProductNameByPid(pid: string): Promise<string> {
   return enqueueCatalog(async () => {
     const existing = await readCatalog(pid);
     let item = existing?.fetch_state === "failed"
-      ? await retryCreditRejection(pid, existing) : await cachedCatalogProduct(pid);
+      ? await recoverFailedWithPublicSource(pid, existing) : await cachedCatalogProduct(pid);
     if (!item) {
       const row = await readCatalog(pid);
       if (row?.fetch_state === "failed") throw new CatalogError(row.error_message);
@@ -130,7 +152,7 @@ async function runCatalog(pid: string): Promise<CatalogResult> {
   }
   if (row?.analysis_state === "failed") throw new CatalogError(row.error_message);
   if (row?.fetch_state === "failed") await requireAiRuntime("product");
-  let item = row?.fetch_state === "failed" ? await retryCreditRejection(pid, row) : await cachedCatalogProduct(pid);
+  let item = row?.fetch_state === "failed" ? await recoverFailedWithPublicSource(pid, row) : await cachedCatalogProduct(pid);
   if (row?.fetch_state === "failed") row = await readCatalog(pid);
   const resultFile = path.join(catalogDirectory(pid), "organized.json");
   const durable = cachedCatalogResult(await readPrivateJson(resultFile), pid);

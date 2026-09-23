@@ -341,7 +341,8 @@ test("OpenAI gets actual image bytes plus supplier text, strict structured outpu
   assert.equal(calls, 1);
 });
 
-async function service(t, initial = null) {
+async function service(t, initial = null, fallback = "true") {
+  env(t, "CHUHAIJIANG_FALLBACK_ENABLED", fallback);
   const key = `catalogState${Math.random()}`;
   let row = initial;
   let metadata = null;
@@ -351,6 +352,10 @@ async function service(t, initial = null) {
     readCatalog: async () => row && structuredClone(row),
     claimCatalog: async pid => { if (row) return false; row = { pid, fetch_state: "requested", analysis_state: "waiting" }; return true; },
     claimCatalogCreditRetry: async (_pid, updatedAt) => {
+      if (row.fetch_state !== "failed" || row.analysis_state !== "waiting" || row.result_json || row.updated_at !== updatedAt) return false;
+      row.fetch_state = "requested"; return true;
+    },
+    claimCatalogPublicRecovery: async (_pid, updatedAt) => {
       if (row.fetch_state !== "failed" || row.analysis_state !== "waiting" || row.result_json || row.updated_at !== updatedAt) return false;
       row.fetch_state = "requested"; return true;
     },
@@ -466,6 +471,13 @@ test("public TikTok source needs no ChuhaiJiang credential and invalid PID canno
   };
   assert.equal(await f.api.getProductNameByPid(fixturePid), "Public product");
   assert.equal(f.row().fetch_state, "ready");
+  assert.deepEqual(f.counts(), { paid: 0, ai: 0 });
+});
+
+test("disabled ChuhaiJiang fallback never calls the paid provider even when a key is configured", async t => {
+  env(t, "CHUHAIJIANG_API_KEY", "configured-but-must-not-be-used");
+  const f = await service(t, null, "false");
+  await assert.rejects(f.api.getProductCatalog(fixturePid), /付费备选当前已停用/);
   assert.deepEqual(f.counts(), { paid: 0, ai: 0 });
 });
 

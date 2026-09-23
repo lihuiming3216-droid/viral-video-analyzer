@@ -31,6 +31,15 @@ export async function claimCatalogCreditRetry(pid: string, updatedAt: string) {
   );
   return result.affectedRows === 1;
 }
+/** Recover a legacy failed supplier row through the free public source. */
+export async function claimCatalogPublicRecovery(pid: string, updatedAt: string) {
+  const pool = await getPool();
+  const [result] = await pool.execute<ResultSetHeader>(
+    "UPDATE product_catalog_cache SET fetch_state='requested',error_message='',updated_at=? WHERE pid=? AND fetch_state='failed' AND analysis_state='waiting' AND result_json IS NULL AND updated_at=?",
+    [new Date().toISOString(), pid, updatedAt],
+  );
+  return result.affectedRows === 1;
+}
 export async function markCatalogFetched(pid: string) {
   const pool = await getPool();
   await pool.execute("UPDATE product_catalog_cache SET fetch_state='ready',error_message='',updated_at=? WHERE pid=? AND fetch_state='requested'", [new Date().toISOString(), pid]);
@@ -89,4 +98,36 @@ export async function readCatalogMetadata(pid: string): Promise<CatalogSourceMet
     sourceUrl: row.source_url,
     updatedAt: row.updated_at,
   };
+}
+
+export type CatalogStatus = {
+  pid: string; source: "tiktok-public" | "chuhaijiang" | null;
+  fetchState: CatalogRow["fetch_state"] | null;
+  analysisState: CatalogRow["analysis_state"] | null;
+  model: string; errorMessage: string; updatedAt: string;
+};
+
+/** Batch status read for the admin page; never invokes a provider or model. */
+export async function readCatalogStatuses(pids: string[]): Promise<Map<string, CatalogStatus>> {
+  const unique = [...new Set(pids.map(value => value.trim()).filter(Boolean))];
+  if (!unique.length) return new Map();
+  const pool = await getPool();
+  const placeholders = unique.map(() => "?").join(",");
+  const [rows] = await pool.execute<RowDataPacket[]>(
+    `SELECT c.pid,c.fetch_state,c.analysis_state,c.error_message,c.result_json,c.updated_at,m.source
+       FROM product_catalog_cache c LEFT JOIN product_catalog_metadata m ON m.pid=c.pid
+      WHERE c.pid IN (${placeholders})`, unique,
+  );
+  return new Map(rows.map(row => {
+    let result: unknown = row.result_json;
+    if (typeof result === "string") { try { result = JSON.parse(result); } catch { result = null; } }
+    const model = result && typeof result === "object" && typeof (result as { model?: unknown }).model === "string"
+      ? String((result as { model: string }).model) : "";
+    const source = row.source === "tiktok-public" || row.source === "chuhaijiang" ? row.source : null;
+    return [String(row.pid), {
+      pid: String(row.pid), source, fetchState: row.fetch_state as CatalogRow["fetch_state"],
+      analysisState: row.analysis_state as CatalogRow["analysis_state"], model,
+      errorMessage: String(row.error_message || ""), updatedAt: String(row.updated_at || ""),
+    }];
+  }));
 }

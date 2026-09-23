@@ -5,6 +5,7 @@ import { getPool } from "@/lib/db/pool";
 import { requireAiRuntime } from "@/lib/ai/settings";
 import { analyzeCatalog } from "@/lib/products/catalog-analyzer";
 import { cachedProduct, prepareCatalogEvidence, catalogDirectory, readPrivateJson, savePrivate } from "@/lib/products/catalog-source";
+import { cachedPublicProduct } from "@/lib/products/tiktok-public-source";
 import { CatalogError, catalogError, validatePid, cachedCatalogResult } from "@/lib/products/catalog-types";
 
 let queue: Promise<unknown> = Promise.resolve();
@@ -42,7 +43,7 @@ async function runReorganization(pid: string, id: string) {
       if (active.length) throw new CatalogError("该PID有未确认完成的重新整理任务，请管理员先核查，不重复收费");
       const [rows] = await connection.execute<RowDataPacket[]>("SELECT fetch_state,analysis_state FROM product_catalog_cache WHERE pid=?", [pid]);
       if (!rows[0] || rows[0].fetch_state !== "ready" || rows[0].analysis_state === "requested") throw new CatalogError("该PID尚无完整缓存或原整理仍在进行，不能重新整理");
-      const item = await cachedProduct(pid);
+      const item = await cachedPublicProduct(pid) || await cachedProduct(pid);
       if (!item) throw new CatalogError("没有完整商品缓存，不会调用出海匠补取");
       const runtime = await requireAiRuntime("product");
       const evidence = await prepareCatalogEvidence(pid, item, { cacheOnly: true });

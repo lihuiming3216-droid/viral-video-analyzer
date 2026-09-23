@@ -4,6 +4,7 @@ import { Pagination } from "../Pagination";
 import { randomUUID } from "node:crypto";
 import { requireAdmin } from "@/lib/require-admin";
 import { ReorganizeForm } from "./ReorganizeForm";
+import { readCatalogStatuses } from "@/lib/products/catalog-store";
 
 export const dynamic = "force-dynamic";
 
@@ -20,6 +21,7 @@ export default async function AdminProductsPage({ searchParams }: { searchParams
     countProducts({ excludeSystem: true, search }),
     listProducts({ excludeSystem: true }),
   ]);
+  const statuses = await readCatalogStatuses(products.map(product => product.pid || ""));
   const withCard = withCardTotal.filter((product) => product.documentUrl).length;
   const pending = withCardTotal.length - withCard;
 
@@ -68,13 +70,22 @@ export default async function AdminProductsPage({ searchParams }: { searchParams
                 <th>产品名称</th>
                 <th>品类</th>
                 <th>关联手卡</th>
+                <th>资料分析方式</th>
                 <th>视频数</th>
                 <th>最近更新</th>
               </tr>
             </thead>
             <tbody>
-              {products.map((product) => (
-                <tr key={product.id}>
+              {products.map((product) => {
+                const status = product.pid ? statuses.get(product.pid) : undefined;
+                const source = status?.source === "tiktok-public" ? "TikTok 公开详情"
+                  : status?.source === "chuhaijiang" ? "出海匠" : status ? "历史资料（来源未记录）" : "未取资料";
+                const state = status?.analysisState === "ready" ? "已完成"
+                  : status?.analysisState === "requested" ? "模型处理中"
+                    : status?.fetchState === "requested" ? "正在取资料"
+                      : status?.fetchState === "failed" ? "取资料失败"
+                        : status?.analysisState === "failed" ? "模型分析失败" : "未分析";
+                return <tr key={product.id}>
                   <td style={{ fontFamily: "var(--mono)", color: "var(--text-muted)" }}>{product.pid || "—"}</td>
                   <td style={{ fontWeight: 650 }}>{product.name}</td>
                   <td style={{ color: "var(--text-muted)" }}>{product.category || "—"}</td>
@@ -87,13 +98,19 @@ export default async function AdminProductsPage({ searchParams }: { searchParams
                       <span className="admin-badge" style={{ background: "var(--warning-soft)", color: "var(--warning)" }}>待补录</span>
                     )}
                   </td>
+                  <td style={{ minWidth: 150 }}>
+                    <div style={{ fontSize: 11.5, fontWeight: 650 }}>{source}</div>
+                    <div style={{ marginTop: 3, color: "var(--text-faint)", fontSize: 10 }}>
+                      {status?.model ? `Qwen · ${status.model} · ${state}` : state}
+                    </div>
+                  </td>
                   <td style={{ fontFamily: "var(--mono)" }}>{product.videoCount}</td>
                   <td style={{ color: "var(--text-faint)", fontFamily: "var(--mono)" }}>{new Date(product.updatedAt).toLocaleString("zh-CN", { hour12: false })}</td>
-                </tr>
-              ))}
+                </tr>;
+              })}
               {!products.length && (
                 <tr>
-                  <td colSpan={6} style={{ color: "var(--text-faint)", textAlign: "center", padding: 24 }}>
+                  <td colSpan={7} style={{ color: "var(--text-faint)", textAlign: "center", padding: 24 }}>
                     {search ? "没有匹配的产品" : "还没有产品"}
                   </td>
                 </tr>

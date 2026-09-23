@@ -37,6 +37,7 @@ async function load(t) {
     getPool: async () => ({ getConnection: async () => connection }),
     requireAiRuntime: async () => ({ model: "new", provider: "qwen", retries: 0 }),
     cachedProduct: async () => state.rawPresent ? { product_id: pid } : null,
+    cachedPublicProduct: async () => null,
     prepareCatalogEvidence: async (_pid, _item, options) => { assert.equal(options.cacheOnly, true); return { pid }; },
     analyzeCatalog: async (_input, _runtime, runId) => { state.modelCalls++; assert.ok(runId); if (state.failModel) throw Error("untrusted provider secret"); return result("new"); },
     catalogDirectory: () => "/private-fixture/" + pid,

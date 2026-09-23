@@ -23,7 +23,7 @@ import { fetchTikTok } from "@/lib/providers/tokscript";
 import { buildBilingualSrt, buildTimestampedText, generateBilingualSubtitleFile, type TranscriptSegment } from "@/lib/subtitle";
 import { resolveMediaPath } from "@/lib/video-processing";
 import { assertDeliveryFields, assertDeliverySource, emptyFieldPatch, fieldHasContent, permanentDeliveryFailure } from "@/lib/feishu/delivery-guard";
-import { catalogError, catalogFields } from "@/lib/products/catalog-types";
+import { catalogError, catalogFields, type CatalogSourceMetadata } from "@/lib/products/catalog-types";
 
 export interface FeishuAutomationFieldMap {
   productUrl: string;
@@ -815,6 +815,7 @@ async function handleFeishuAutomationUnlocked(input: FeishuAutomationInput) {
   let productRefreshError = "";
   let productCardWarning = "";
   let productCardStatus = "";
+  let catalogMetadata: CatalogSourceMetadata | null = null;
   let product = null as Awaited<ReturnType<typeof getProductByPid>>;
 
   const queuePatch = (fields: Record<string, unknown>) => {
@@ -914,14 +915,17 @@ async function handleFeishuAutomationUnlocked(input: FeishuAutomationInput) {
       productUrl: effectiveProductUrl, pid: effectivePid,
       expectedValues: preflight.currentValues, protectRevision: true,
     });
-    const { getProductCatalog } = await import("@/lib/products/catalog");
+    const { getProductCatalog, getProductMetadataByPid } = await import("@/lib/products/catalog");
     const catalog = await getProductCatalog(effectivePid);
+    catalogMetadata = await getProductMetadataByPid(effectivePid);
     const fieldText = (key: keyof typeof catalogFields) => catalog.fields[key].text;
     const synced = await syncProductCardManagedFields(input.client, {
       documentId: shell.documentId, mode: "verified-basic", derivedOnly: true,
       sku: fieldText("sku"), coreFunctions: [fieldText("coreFunctions")],
       productParameters: fieldText("productParameters"), usageMethod: fieldText("usageMethod"),
       audience: fieldText("audience"), scenes: fieldText("scenes"),
+      shopName: catalogMetadata?.shopName || "",
+      mainImageUrl: catalogMetadata?.mainImageUrls[0] || "",
       expectedValues: preflight.currentValues, preserveExistingOnMissing: true, protectRevision: true,
     });
     const missing = Object.entries(catalog.fields).filter(([, fact]) => fact.basis === "missing")
@@ -948,6 +952,9 @@ async function handleFeishuAutomationUnlocked(input: FeishuAutomationInput) {
         productUrl: effectiveProductUrl,
         documentId: shell.documentId,
         documentUrl: shell.documentUrl,
+        ...(catalogMetadata?.title ? { sourceTitle: catalogMetadata.title } : {}),
+        ...(catalogMetadata?.description ? { sourceDescription: catalogMetadata.description } : {}),
+        ...(catalogMetadata?.mainImageUrls.length ? { sourceImageUrls: catalogMetadata.mainImageUrls } : {}),
       })) || current;
     }
     return createProduct({
@@ -956,6 +963,9 @@ async function handleFeishuAutomationUnlocked(input: FeishuAutomationInput) {
       productUrl: effectiveProductUrl,
       documentId: shell.documentId,
       documentUrl: shell.documentUrl,
+      sourceTitle: catalogMetadata?.title || "",
+      sourceDescription: catalogMetadata?.description || "",
+      sourceImageUrls: catalogMetadata?.mainImageUrls || [],
     });
   });
   if (!product) throw new Error("创建产品档案失败");

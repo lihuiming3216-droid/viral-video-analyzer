@@ -1289,9 +1289,11 @@ const PRODUCT_CARD_IDENTITY_LABELS = ["商品名称", "产品链接", "商品ID"
 const PRODUCT_CARD_DERIVED_LABELS = [
   "产品SKU", "产品主要功能", "产品参数", "使用方法", "适用人群", "使用场景",
 ] as const;
+const PRODUCT_CARD_METADATA_LABELS = ["店铺名称", "商品主图"] as const;
 const PRODUCT_CARD_MANAGED_LABELS = [
   ...PRODUCT_CARD_IDENTITY_LABELS,
   ...PRODUCT_CARD_DERIVED_LABELS,
+  ...PRODUCT_CARD_METADATA_LABELS,
 ] as const;
 type ProductCardManagedLabel = typeof PRODUCT_CARD_MANAGED_LABELS[number];
 
@@ -1309,6 +1311,8 @@ export type ProductCardManagedFieldsInput = {
   usageMethod?: string;
   audience?: string;
   scenes?: string;
+  shopName?: string;
+  mainImageUrl?: string;
   /** Clear omitted derived fields after a fresh, verified parse. */
   clearDerived?: boolean;
   /** Restrict a preflight clear to derived labels; identity is handled next. */
@@ -1376,6 +1380,8 @@ function productCardManagedValues(input: Omit<ProductCardManagedFieldsInput, "do
   for (const [label, key, value] of derived) {
     if (input.clearDerived || hasOwn(input, key)) values.set(label, value);
   }
+  if (hasOwn(input, "shopName")) values.set("店铺名称", String(input.shopName || "").trim());
+  if (hasOwn(input, "mainImageUrl")) values.set("商品主图", String(input.mainImageUrl || "").trim());
   return values;
 }
 
@@ -1388,7 +1394,10 @@ export function syncProductCardManagedBlockText(
   if (!matched) return content;
   const values = productCardManagedValues(input);
   if (!values.has(matched.label)) return content;
-  if (input.expectedValues && input.expectedValues[matched.label] !== matched.value.trim()) return content;
+  if (input.expectedValues && hasOwn(input.expectedValues, matched.label)
+    && input.expectedValues[matched.label] !== matched.value.trim()) return content;
+  if (PRODUCT_CARD_METADATA_LABELS.includes(matched.label as typeof PRODUCT_CARD_METADATA_LABELS[number])
+    && matched.value.trim()) return content;
   if (input.preserveExistingOnMissing && matched.value.trim() && (!values.get(matched.label) || values.get(matched.label) === "未找到")) return content;
   return `${matched.prefix}${values.get(matched.label) || ""}${matched.tail}`;
 }
@@ -1422,7 +1431,7 @@ function syncProductFieldText(content: string, values: Record<string, string>) {
   return next;
 }
 
-function styledProductFieldElements(content: string, productUrl: string): FeishuTextElement[] {
+function styledProductFieldElements(content: string, linkUrl: string): FeishuTextElement[] {
   const labels = [...PRODUCT_CARD_MANAGED_LABELS, "产品卖点"];
   const matched = labels
     .map((label) => ({ label, line: matchProductFieldLine(content, label) }))
@@ -1435,13 +1444,13 @@ function styledProductFieldElements(content: string, productUrl: string): Feishu
     elements.push({ text_run: { content: content.slice(0, prefixEnd), text_element_style: { bold: true } } });
   }
   const suffix = content.slice(prefixEnd);
-  if (label === "产品链接" && /^https:\/\//i.test(productUrl)) {
-    const linkIndex = suffix.indexOf(productUrl);
+  if ((label === "产品链接" || label === "商品主图") && /^https:\/\//i.test(linkUrl)) {
+    const linkIndex = suffix.indexOf(linkUrl);
     if (linkIndex >= 0) {
       if (linkIndex > 0) elements.push({ text_run: { content: suffix.slice(0, linkIndex) } });
-      elements.push({ text_run: { content: productUrl, text_element_style: { link: { url: productUrl } } } });
-      if (linkIndex + productUrl.length < suffix.length) {
-        elements.push({ text_run: { content: suffix.slice(linkIndex + productUrl.length) } });
+      elements.push({ text_run: { content: linkUrl, text_element_style: { link: { url: linkUrl } } } });
+      if (linkIndex + linkUrl.length < suffix.length) {
+        elements.push({ text_run: { content: suffix.slice(linkIndex + linkUrl.length) } });
       }
       return elements;
     }
@@ -1478,9 +1487,10 @@ async function syncProductCardManagedFieldsUnlocked(client: Client, input: Produ
   const blocks = await listFeishuDocumentBlocks(client, documentId, revision);
   const values = productCardManagedValues(input);
   const expectedLabels = input.preflightOnly && input.mode === "verified-basic"
-    ? [...PRODUCT_CARD_MANAGED_LABELS]
+    ? [...PRODUCT_CARD_IDENTITY_LABELS, ...PRODUCT_CARD_DERIVED_LABELS]
     : [...values.keys()].filter((label) => !input.derivedOnly
-      || PRODUCT_CARD_DERIVED_LABELS.includes(label as typeof PRODUCT_CARD_DERIVED_LABELS[number]));
+      || PRODUCT_CARD_DERIVED_LABELS.includes(label as typeof PRODUCT_CARD_DERIVED_LABELS[number])
+      || PRODUCT_CARD_METADATA_LABELS.includes(label as typeof PRODUCT_CARD_METADATA_LABELS[number]));
   type ManagedBlock = {
     block: Record<string, unknown>;
     elements: Array<{
@@ -1552,12 +1562,15 @@ async function syncProductCardManagedFieldsUnlocked(client: Client, input: Produ
     .sort((left, right) => {
     // Identity is always committed before derived facts regardless of the
     // physical block order in an old/rearranged template.
-    const leftDerived = PRODUCT_CARD_DERIVED_LABELS.includes(left.matched.label as typeof PRODUCT_CARD_DERIVED_LABELS[number]);
-    const rightDerived = PRODUCT_CARD_DERIVED_LABELS.includes(right.matched.label as typeof PRODUCT_CARD_DERIVED_LABELS[number]);
+    const leftDerived = PRODUCT_CARD_DERIVED_LABELS.includes(left.matched.label as typeof PRODUCT_CARD_DERIVED_LABELS[number])
+      || PRODUCT_CARD_METADATA_LABELS.includes(left.matched.label as typeof PRODUCT_CARD_METADATA_LABELS[number]);
+    const rightDerived = PRODUCT_CARD_DERIVED_LABELS.includes(right.matched.label as typeof PRODUCT_CARD_DERIVED_LABELS[number])
+      || PRODUCT_CARD_METADATA_LABELS.includes(right.matched.label as typeof PRODUCT_CARD_METADATA_LABELS[number]);
     return Number(leftDerived) - Number(rightDerived);
   });
   for (const { block, elements, content, matched } of managedBlocks) {
-    if (input.expectedValues && input.expectedValues[matched.label] !== matched.value.trim()) {
+    if (input.expectedValues && hasOwn(input.expectedValues, matched.label)
+      && input.expectedValues[matched.label] !== matched.value.trim()) {
       skippedLabels.push(matched.label);
       continue;
     }
@@ -1566,7 +1579,9 @@ async function syncProductCardManagedFieldsUnlocked(client: Client, input: Produ
       continue;
     }
     const next = syncProductCardManagedBlockText(content, input);
-    const expectedProductUrl = matched.label === "产品链接" ? values.get("产品链接") || "" : "";
+    const expectedProductUrl = matched.label === "产品链接"
+      ? values.get("产品链接") || ""
+      : matched.label === "商品主图" ? values.get("商品主图") || "" : "";
     const expectedLink = /^https:\/\//i.test(expectedProductUrl) ? expectedProductUrl : "";
     const currentLinks = elements
       .map((element) => element.text_run?.text_element_style?.link?.url || "")

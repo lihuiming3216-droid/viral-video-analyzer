@@ -10,6 +10,16 @@ export type CatalogResult = {
 };
 export type CatalogImage = { id: string; label: string; dataUrl: string };
 export type CatalogEvidence = { pid: string; text: string; images: CatalogImage[]; warnings: string[] };
+export type CatalogSourceMetadata = {
+  pid: string;
+  source: "tiktok-public" | "chuhaijiang";
+  title: string;
+  shopName: string;
+  description: string;
+  mainImageUrls: string[];
+  sourceUrl: string;
+  updatedAt: string;
+};
 export function object(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }

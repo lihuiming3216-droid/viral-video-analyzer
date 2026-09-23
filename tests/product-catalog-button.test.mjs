@@ -23,9 +23,14 @@ async function fixture(t) {
       return { currentValues, duplicateLabels: [], missingLabels: [], skippedLabels: [] };
     },
     getProductCatalog: async value => { events.push(["catalog", value]); return catalog; },
+    getProductMetadataByPid: async value => { events.push(["metadata", value]); return {
+      pid: value, source: "tiktok-public", title: "Detail-image product", shopName: "Fixture Shop",
+      description: "Use after washing.", mainImageUrls: ["https://p16-oec-general-useast5.ttcdn-us.com/main.webp"],
+      sourceUrl: `https://www.tiktok.com/view/product/${value}`, updatedAt: "t",
+    }; },
     getProductNameByPid: async value => { events.push(["name", value]); return "Supplier bottle"; },
     getProductByPid: async () => ({ id: "product", pid }),
-    updateProduct: async () => ({ id: "product", pid }),
+    updateProduct: async (_id, input) => { events.push(["update-product", input]); return { id: "product", pid }; },
     upsertFeishuProductCardMapping: async () => {},
     createVideo: async () => { throw Error("UNEXPECTED_VIDEO_TASK"); },
   };
@@ -37,7 +42,7 @@ async function fixture(t) {
     const stub = names.split(",").map(name => name.trim()).filter(Boolean).map(name => `export const ${name} = async (...a) => globalThis[${JSON.stringify(key)}][${JSON.stringify(name)}]?.(...a);`).join("\n");
     code = code.replaceAll(JSON.stringify(module), JSON.stringify(url(stub)));
   }
-  code = code.replaceAll('"@/lib/products/catalog"', JSON.stringify(url(["getProductCatalog", "getProductNameByPid"].map(name => `export const ${name} = (...a) => globalThis[${JSON.stringify(key)}].${name}(...a);`).join("\n"))));
+  code = code.replaceAll('"@/lib/products/catalog"', JSON.stringify(url(["getProductCatalog", "getProductNameByPid", "getProductMetadataByPid"].map(name => `export const ${name} = (...a) => globalThis[${JSON.stringify(key)}].${name}(...a);`).join("\n"))));
   const automation = await import(url(code));
   const client = { request: async request => { events.push(["write", request.data.fields]); return { code: 0 }; } };
   const input = { client, appToken: "app", tableId: "table", recordId: "row", fields: { 产品名称: "分装瓶", PID: pid }, writeBack: true };
@@ -57,6 +62,12 @@ test("PID and name alone deliver a reused card link before catalog processing an
   assert.equal(derived.preserveExistingOnMissing, true);
   assert.equal(derived.protectRevision, true);
   assert.deepEqual(derived.expectedValues, f.currentValues);
+  assert.equal(derived.shopName, "Fixture Shop");
+  assert.match(derived.mainImageUrl, /main\.webp$/);
+  const productUpdate = f.events.find(([kind]) => kind === "update-product")[1];
+  assert.equal(productUpdate.sourceTitle, "Detail-image product");
+  assert.equal(productUpdate.sourceDescription, "Use after washing.");
+  assert.deepEqual(productUpdate.sourceImageUrls, ["https://p16-oec-general-useast5.ttcdn-us.com/main.webp"]);
   for (const key of Object.keys(types.catalogFields)) assert.ok(derived[key]);
 });
 

@@ -3,7 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, open, readFile, rename, stat } from "node:fs/promises";
 import path from "node:path";
 import { fetchWithProxy } from "@/lib/network";
-import { CatalogError, exactProduct, object, validatePid, type CatalogEvidence } from "@/lib/products/catalog-types";
+import { CatalogError, exactProduct, object, validatePid, type CatalogEvidence, type CatalogSourceMetadata } from "@/lib/products/catalog-types";
 
 const ROOT = path.join(process.cwd(), ".data/provider-evidence/chuhaijiang/us");
 export const MAX_CATALOG_IMAGES = 8;
@@ -156,22 +156,74 @@ export function imageMime(body: Buffer) {
   throw new CatalogError("图片内容不是支持的图片格式");
 }
 
-export function imageCandidates(item: Record<string, unknown>) {
-  const images = Array.isArray(item.product_images) ? item.product_images : [];
-  const props = Array.isArray(item.product_sku_props) ? item.product_sku_props : [];
-  const candidates: Array<{ label: string; image: Record<string, unknown>; kind: "product" | "sku" }> =
-    images.map((image, index) => ({ label: `商品图${index + 1}`, image: object(image), kind: "product" }));
-  for (const prop of props.map(object)) {
-    for (const value of (Array.isArray(prop.sale_prop_values) ? prop.sale_prop_values : []).map(object)) {
-      if (value.image) candidates.push({ label: String(value.prop_value || "SKU图片"), image: object(value.image), kind: "sku" });
-    }
-  }
-  return candidates.map(({ label, image, kind }, index) => ({ label, index, kind, url: String(image.url || image.thumb_url || "") }));
+function imageUrl(value: unknown) {
+  if (typeof value === "string") return value;
+  const image = object(value);
+  const list = Array.isArray(image.url_list) ? image.url_list : [];
+  return String(image.url || image.thumb_url || list[0] || "");
 }
 
-/** Product-card extraction uses overview images only; SKU images are excluded. */
+/**
+ * Only images embedded in the product-description/detail area are eligible for
+ * model analysis. Main-gallery and SKU images are intentionally never added.
+ */
+export function imageCandidates(item: Record<string, unknown>) {
+  const groups = [item.product_detail_images, item.description_images, item.detail_images];
+  const urls = groups.flatMap(group => Array.isArray(group) ? group.map(imageUrl) : [])
+    .map(url => url.trim())
+    .filter((url, index, all) => Boolean(url) && all.indexOf(url) === index);
+  return urls.map((url, index) => ({ label: `详情图${index + 1}`, index, kind: "detail" as const, url }));
+}
+
+/** Description-area detail images only; main and SKU images never backfill. */
 export function selectCatalogImages(candidates: ReturnType<typeof imageCandidates>) {
-  return candidates.filter(candidate => candidate.kind === "product").slice(0, MAX_CATALOG_IMAGES);
+  return candidates.slice(0, MAX_CATALOG_IMAGES);
+}
+
+const TRUSTED_TIKTOK_IMAGE_HOST_SUFFIXES = [
+  "ibyteimg.com", "byteimg.com", "tiktokcdn.com", "tiktokcdn-us.com",
+  "tiktokcdn-eu.com", "muscdn.com", "ttcdn-us.com", "ttcdn-eu.com",
+] as const;
+
+function trustedCatalogImageUrl(raw: string) {
+  try {
+    const url = new URL(raw);
+    const hostname = url.hostname.toLowerCase();
+    if (url.protocol !== "https:" || url.username || url.password || url.port) return null;
+    const trusted = hostname === "oss-t.chuhaijiang.com"
+      || TRUSTED_TIKTOK_IMAGE_HOST_SUFFIXES.some(suffix => hostname === suffix || hostname.endsWith(`.${suffix}`));
+    return trusted ? url : null;
+  } catch {
+    return null;
+  }
+}
+
+export function catalogSourceMetadata(pid: string, item: Record<string, unknown>): CatalogSourceMetadata {
+  const normalized = validatePid(pid);
+  const source = item._catalog_source === "tiktok-public" ? "tiktok-public" : "chuhaijiang";
+  const mainImageUrls = (Array.isArray(item.product_images) ? item.product_images : [])
+    .map(imageUrl)
+    .map(raw => trustedCatalogImageUrl(raw)?.toString() || "")
+    .filter((url, index, all) => Boolean(url) && all.indexOf(url) === index)
+    .slice(0, 20);
+  const rawSourceUrl = typeof item._source_url === "string" ? item._source_url.trim() : "";
+  let sourceUrl = `https://www.tiktok.com/view/product/${normalized}`;
+  try {
+    const parsed = new URL(rawSourceUrl);
+    if (parsed.protocol === "https:"
+      && (parsed.hostname === "www.tiktok.com" || parsed.hostname === "shop.tiktok.com")
+      && parsed.pathname.includes(normalized)) sourceUrl = parsed.toString();
+  } catch { /* Keep the exact-PID canonical URL. */ }
+  return {
+    pid: normalized,
+    source,
+    title: String(item.product_name || item.product_title || "").replace(/\s+/g, " ").trim(),
+    shopName: String(item.shop_name || "").replace(/\s+/g, " ").trim(),
+    description: String(item.product_description || item.description || "").trim().slice(0, 100_000),
+    mainImageUrls,
+    sourceUrl,
+    updatedAt: new Date().toISOString(),
+  };
 }
 
 // Signed image URLs are private cache data, never model text or log messages.
@@ -186,7 +238,8 @@ function removeUrls(value: unknown): unknown {
 export async function prepareCatalogEvidence(pid: string, item: Record<string, unknown>, options: { cacheOnly?: boolean } = {}): Promise<CatalogEvidence> {
   const directory = catalogDirectory(pid);
   const fields = Object.fromEntries(Object.entries(item).filter(([key]) =>
-    /^(product_name|product_title|product_specifications|product_sku_props)$/.test(key) || /description|detail|feature|function|instruction|usage/i.test(key)));
+    /^(product_name|product_title|product_specifications|product_sku_props|product_skus|shop_name)$/.test(key)
+      || /description|detail|feature|function|instruction|usage/i.test(key)));
   const text = JSON.stringify(removeUrls(fields));
   if (text.length > 100_000) throw new CatalogError("商品文字资料过长，已保留原文，需管理员处理");
   const allCandidates = imageCandidates(item);
@@ -195,16 +248,26 @@ export async function prepareCatalogEvidence(pid: string, item: Record<string, u
   const oldManifest = Array.isArray(prior) ? prior.map(object) : [];
   const manifest: Record<string, unknown>[] = [];
   const evidence: CatalogEvidence = { pid, text, images: [], warnings: [] };
-  if (allCandidates.length > candidates.length) {
-    evidence.warnings.push(`商品图片共${allCandidates.length}张；为控制费用，本次仅选取${candidates.length}张主商品图，SKU图未送入模型`);
+  if (typeof item._source_warning === "string" && item._source_warning.trim()) {
+    evidence.warnings.push(item._source_warning.trim().slice(0, 200));
   }
+  const mainCount = Array.isArray(item.product_images) ? item.product_images.length : 0;
+  const skuCount = Array.isArray(item.product_sku_props)
+    ? item.product_sku_props.map(object).reduce((count, prop) => count
+      + (Array.isArray(prop.sale_prop_values) ? prop.sale_prop_values.filter(value => object(value).image).length : 0), 0)
+    : 0;
+  if (allCandidates.length > candidates.length) {
+    evidence.warnings.push(`商品描述详情图共${allCandidates.length}张；本次只分析前${candidates.length}张`);
+  }
+  if (!candidates.length) evidence.warnings.push("商品描述区域没有可用详情图；未使用主图或SKU图补位");
+  if (mainCount || skuCount) evidence.warnings.push(`主商品图${mainCount}张、SKU图${skuCount}张未送入模型`);
   let totalBytes = 0;
   const deadline = AbortSignal.timeout(90_000);
   for (const candidate of candidates) {
     const id = `image-${candidate.index + 1}`;
     try {
-      const url = new URL(candidate.url);
-      if (url.protocol !== "https:" || url.hostname !== "oss-t.chuhaijiang.com" || url.username || url.password || url.port) throw new CatalogError("图片来源不在已验证范围内");
+      const url = trustedCatalogImageUrl(candidate.url);
+      if (!url) throw new CatalogError("图片来源不在已验证范围内");
       const entry = oldManifest[candidate.index];
       let body: Buffer | undefined;
       // Import the earlier evidence trial using basename + digest, never its old absolute path.

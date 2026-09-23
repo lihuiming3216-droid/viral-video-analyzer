@@ -47,6 +47,18 @@ test("missing catalog facts preserve manual values, while supported facts replac
   assert.equal(documentModule.syncProductCardManagedBlockText("使用方法：刚改的步骤", { ...input, usageMethod: "打开盖子", expectedValues: { 使用方法: "人工步骤" } }), "使用方法：刚改的步骤");
 });
 
+test("source shop and main-image metadata fill empty template rows but never replace manual text", () => {
+  const input = {
+    mode: "verified-basic",
+    shopName: "Fixture Shop",
+    mainImageUrl: "https://p16-oec-general-useast5.ttcdn-us.com/main.webp",
+  };
+  assert.equal(documentModule.syncProductCardManagedBlockText("店铺名称：", input), "店铺名称：Fixture Shop");
+  assert.equal(documentModule.syncProductCardManagedBlockText("商品主图：", input), `商品主图：${input.mainImageUrl}`);
+  assert.equal(documentModule.syncProductCardManagedBlockText("店铺名称：人工店铺", input), "店铺名称：人工店铺");
+  assert.equal(documentModule.syncProductCardManagedBlockText("商品主图：https://manual.invalid/image", input), "商品主图：https://manual.invalid/image");
+});
+
 test("catalog writes re-read target at a revision and skip a concurrent manual change", async () => {
   const block = textBlock("usage", "使用方法：旧步骤");
   const patches = [];

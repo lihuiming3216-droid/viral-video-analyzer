@@ -1,7 +1,7 @@
 import "server-only";
 import type { ResultSetHeader, RowDataPacket } from "mysql2/promise";
 import { getPool } from "@/lib/db/pool";
-import type { CatalogResult } from "@/lib/products/catalog-types";
+import type { CatalogResult, CatalogSourceMetadata } from "@/lib/products/catalog-types";
 
 export interface CatalogRow extends RowDataPacket {
   pid: string; fetch_state: "requested" | "ready" | "failed";
@@ -50,4 +50,43 @@ export async function failCatalog(pid: string, stage: "fetch" | "analysis", mess
   const pool = await getPool();
   const column = stage === "fetch" ? "fetch_state" : "analysis_state";
   await pool.execute(`UPDATE product_catalog_cache SET ${column}='failed',error_message=?,updated_at=? WHERE pid=? AND ${column}='requested'`, [message.slice(0, 500), new Date().toISOString(), pid]);
+}
+
+export async function saveCatalogMetadata(value: CatalogSourceMetadata) {
+  const pool = await getPool();
+  await pool.execute(
+    `INSERT INTO product_catalog_metadata
+      (pid,source,title,shop_name,description,main_image_urls_json,source_url,updated_at)
+      VALUES (?,?,?,?,?,?,?,?)
+      ON DUPLICATE KEY UPDATE source=VALUES(source),title=VALUES(title),shop_name=VALUES(shop_name),
+        description=VALUES(description),main_image_urls_json=VALUES(main_image_urls_json),
+        source_url=VALUES(source_url),updated_at=VALUES(updated_at)`,
+    [value.pid, value.source, value.title, value.shopName, value.description,
+      JSON.stringify(value.mainImageUrls), value.sourceUrl, value.updatedAt],
+  );
+}
+
+interface CatalogMetadataRow extends RowDataPacket {
+  pid: string; source: string; title: string; shop_name: string; description: string;
+  main_image_urls_json: string[] | string; source_url: string; updated_at: string;
+}
+
+export async function readCatalogMetadata(pid: string): Promise<CatalogSourceMetadata | null> {
+  const pool = await getPool();
+  const [rows] = await pool.execute<CatalogMetadataRow[]>("SELECT * FROM product_catalog_metadata WHERE pid=?", [pid]);
+  const row = rows[0];
+  if (!row) return null;
+  const images = typeof row.main_image_urls_json === "string"
+    ? JSON.parse(row.main_image_urls_json) as unknown
+    : row.main_image_urls_json;
+  return {
+    pid: row.pid,
+    source: row.source === "tiktok-public" ? "tiktok-public" : "chuhaijiang",
+    title: row.title,
+    shopName: row.shop_name,
+    description: row.description,
+    mainImageUrls: Array.isArray(images) ? images.filter(value => typeof value === "string") : [],
+    sourceUrl: row.source_url,
+    updatedAt: row.updated_at,
+  };
 }

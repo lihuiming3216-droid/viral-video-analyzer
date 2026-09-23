@@ -2,8 +2,9 @@ import "server-only";
 import path from "node:path";
 import { requireAiRuntime } from "@/lib/ai/settings";
 import { catalogError, CatalogError, validatePid, cachedCatalogResult, type CatalogResult } from "@/lib/products/catalog-types";
-import { readCatalog, claimCatalog, claimCatalogCreditRetry, markCatalogFetched, claimCatalogAnalysis, finishCatalogAnalysis, failCatalog, type CatalogRow } from "@/lib/products/catalog-store";
-import { cachedProduct, fetchProductOnce, prepareCatalogEvidence, catalogDirectory, readPrivateJson, savePrivate, readCreditRejection, archiveCreditRejection } from "@/lib/products/catalog-source";
+import { readCatalog, claimCatalog, claimCatalogCreditRetry, markCatalogFetched, claimCatalogAnalysis, finishCatalogAnalysis, failCatalog, readCatalogMetadata, saveCatalogMetadata, type CatalogRow } from "@/lib/products/catalog-store";
+import { cachedProduct, fetchProductOnce, prepareCatalogEvidence, catalogDirectory, readPrivateJson, savePrivate, readCreditRejection, archiveCreditRejection, catalogSourceMetadata } from "@/lib/products/catalog-source";
+import { cachedPublicProduct, fetchPublicProductOnce } from "@/lib/products/tiktok-public-source";
 import { analyzeCatalog } from "@/lib/products/catalog-analyzer";
 
 const inFlight = new Map<string, Promise<CatalogResult>>();
@@ -15,6 +16,53 @@ function enqueueCatalog<T>(operation: () => Promise<T>): Promise<T> {
   return task;
 }
 
+function supplierItem(item: Record<string, unknown>, publicFailure = false): Record<string, unknown> {
+  return {
+    ...item,
+    _catalog_source: "chuhaijiang",
+    ...(publicFailure ? { _source_warning: "TikTok公开商品资料不可用，已使用出海匠备选资料" } : {}),
+  };
+}
+
+async function cachedCatalogProduct(pid: string): Promise<Record<string, unknown> | null> {
+  let publicFailed = false;
+  try {
+    const item = await cachedPublicProduct(pid);
+    if (item) return item;
+  } catch {
+    publicFailed = true;
+  }
+  const item = await cachedProduct(pid);
+  return item ? supplierItem(item, publicFailed) : null;
+}
+
+async function fetchCatalogProductOnce(pid: string): Promise<Record<string, unknown>> {
+  try {
+    return await fetchPublicProductOnce(pid);
+  } catch {
+    if (!process.env.CHUHAIJIANG_API_KEY?.trim()) {
+      throw new CatalogError("TikTok公开商品资料不可用，且未配置出海匠备选接口");
+    }
+    return supplierItem(await fetchProductOnce(pid), true);
+  }
+}
+
+async function rememberCatalogProduct(pid: string, item: Record<string, unknown>) {
+  const metadata = catalogSourceMetadata(pid, item);
+  await saveCatalogMetadata(metadata);
+  return metadata;
+}
+
+/** Exact source metadata for DB/product-card writeback; never invokes a provider. */
+export async function getProductMetadataByPid(pid: string) {
+  validatePid(pid);
+  const existing = await readCatalogMetadata(pid);
+  if (existing) return existing;
+  const item = await cachedCatalogProduct(pid);
+  if (!item) return null;
+  return rememberCatalogProduct(pid, item);
+}
+
 // A new button invocation may retry an explicitly rejected credit check. Never
 // retry within the failed invocation, or recycle uncertain/paid/AI requests.
 async function retryCreditRejection(pid: string, row: CatalogRow) {
@@ -24,7 +72,7 @@ async function retryCreditRejection(pid: string, row: CatalogRow) {
   if (!await claimCatalogCreditRetry(pid, row.updated_at)) throw new CatalogError("该 PID 已开始重试，请稍后查看手卡，不会重复取数");
   try {
     await archiveCreditRejection(pid, proof);
-    const item = await fetchProductOnce(pid);
+    const item = supplierItem(await fetchProductOnce(pid), true);
     await markCatalogFetched(pid);
     return item;
   } catch (error) {
@@ -41,17 +89,17 @@ export function getProductNameByPid(pid: string): Promise<string> {
   return enqueueCatalog(async () => {
     const existing = await readCatalog(pid);
     let item = existing?.fetch_state === "failed"
-      ? await retryCreditRejection(pid, existing) : await cachedProduct(pid);
+      ? await retryCreditRejection(pid, existing) : await cachedCatalogProduct(pid);
     if (!item) {
       const row = await readCatalog(pid);
       if (row?.fetch_state === "failed") throw new CatalogError(row.error_message);
       if (row) throw new CatalogError("该 PID 已取数或正在取数，但没有可用的原始资料；不会自动重复收费，请稍后重试或手动填写产品名称");
-      if (!process.env.CHUHAIJIANG_API_KEY?.trim()) throw new CatalogError("未配置出海匠接口密钥，请管理员配置或手动填写产品名称");
       if (!await claimCatalog(pid)) throw new CatalogError("该 PID 的取数已开始，不会重复收费；请稍后重试或手动填写产品名称");
-      try { item = await fetchProductOnce(pid); }
+      try { item = await fetchCatalogProductOnce(pid); }
       catch (error) { await failCatalog(pid, "fetch", catalogError(error)); throw error; }
       await markCatalogFetched(pid);
     }
+    await rememberCatalogProduct(pid, item);
     // Only documented title fields are accepted. Never coerce an object,
     // generate a placeholder, or use a related/recommended product's name.
     for (const key of ["product_name", "product_title"]) {
@@ -82,22 +130,22 @@ async function runCatalog(pid: string): Promise<CatalogResult> {
   }
   if (row?.analysis_state === "failed") throw new CatalogError(row.error_message);
   if (row?.fetch_state === "failed") await requireAiRuntime("product");
-  let item = row?.fetch_state === "failed" ? await retryCreditRejection(pid, row) : await cachedProduct(pid);
+  let item = row?.fetch_state === "failed" ? await retryCreditRejection(pid, row) : await cachedCatalogProduct(pid);
   if (row?.fetch_state === "failed") row = await readCatalog(pid);
   const resultFile = path.join(catalogDirectory(pid), "organized.json");
   const durable = cachedCatalogResult(await readPrivateJson(resultFile), pid);
   if (!row) {
     // Missing credentials should not burn the once-only request slot.
     if (!durable) await requireAiRuntime("product");
-    if (!item && !process.env.CHUHAIJIANG_API_KEY?.trim()) throw new CatalogError("未配置出海匠接口密钥，请管理员配置后再点击");
     const owner = await claimCatalog(pid);
     if (owner && !item) {
-      try { item = await fetchProductOnce(pid); }
+      try { item = await fetchCatalogProductOnce(pid); }
       catch (error) { await failCatalog(pid, "fetch", catalogError(error)); throw error; }
     }
     row = await readCatalog(pid);
   }
   if (!item) throw new CatalogError("该 PID 的取数已开始或结果待核查，不会自动重复收费；请稍后再点击查看");
+  await rememberCatalogProduct(pid, item);
   await markCatalogFetched(pid);
   if (row?.analysis_state === "requested") {
     const recovered = cachedCatalogResult(await readPrivateJson(resultFile), pid);

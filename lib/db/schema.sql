@@ -28,6 +28,20 @@ CREATE TABLE IF NOT EXISTS product_catalog_reorganizations (
   INDEX idx_catalog_reorganization_pid (pid, state)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
+-- Source metadata is separate from the AI-organized facts. This additive table
+-- preserves the exact shop/title/description/main-image evidence without
+-- changing legacy product rows or treating a model inference as source data.
+CREATE TABLE IF NOT EXISTS product_catalog_metadata (
+  pid VARCHAR(30) PRIMARY KEY,
+  source VARCHAR(32) NOT NULL,
+  title VARCHAR(512) NOT NULL DEFAULT '',
+  shop_name VARCHAR(512) NOT NULL DEFAULT '',
+  description LONGTEXT NOT NULL,
+  main_image_urls_json JSON NOT NULL DEFAULT ('[]'),
+  source_url TEXT NOT NULL,
+  updated_at VARCHAR(32) NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
 -- 时间戳全部沿用原来 SQLite 里 now() 产生的 ISO-8601 字符串（如 2026-08-30T09:57:10.484Z），
 -- 不改存 MySQL 原生 DATETIME，省去时区/格式转换，直接保持和现有业务代码一致。VARCHAR 索引排序
 -- 对定长 ISO-8601 UTC 字符串等价于按时间排序。

@@ -14,6 +14,7 @@ const fixturePid = "1732350695360139845";
 const result = pid => ({ pid, fields: Object.fromEntries(Object.keys(types.catalogFields).map(key => [key, { text: key, basis: "direct", evidence: ["product-text"] }])), warnings: [], model: "test", createdAt: "t" });
 const networkUrl = dataUrl("export const fetchWithProxy = (...args) => globalThis.__catalogFetch(...args);");
 const settingsUrl = dataUrl('export const requireAiRuntime = async () => globalThis.__catalogRuntime || ({ provider: "openai", apiKey: "fixture", model: "fixture-model", baseUrl: "https://api.openai.com/v1", retries: 0 });');
+const tiktokProductUrl = dataUrl('export const tiktokProductUrlFromPid = pid => `https://www.tiktok.com/view/product/${pid}`;');
 const envSnapshots = new WeakMap();
 function env(t, key, value) {
   if (!envSnapshots.has(t)) {
@@ -43,6 +44,70 @@ async function modules(t) {
   t.after(() => { delete globalThis.__catalogFetch; delete globalThis.__catalogRuntime; });
   return { file, analyzer: await import(dataUrl(code)) };
 }
+
+async function publicSource(t) {
+  const directory = await mkdtemp(path.join(tmpdir(), "public-product-test-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const code = compile(await source("tiktok-public-source"))
+    .replace('process.cwd()', JSON.stringify(directory))
+    .replaceAll('"@/lib/products/catalog-types"', JSON.stringify(typesUrl))
+    .replaceAll('"@/lib/network"', JSON.stringify(networkUrl))
+    .replaceAll('"@/lib/tiktok-product"', JSON.stringify(tiktokProductUrl));
+  globalThis.__catalogFetch = () => { throw Error("UNEXPECTED_NETWORK_ACCESS"); };
+  t.after(() => { delete globalThis.__catalogFetch; });
+  return import(dataUrl(code));
+}
+
+function publicProductHtml(pid, options = {}) {
+  const product = {
+    product_id: pid,
+    name: "Detail-image product",
+    seller_id: "seller-1",
+    images: [{ url_list: ["https://p16-oec-general-useast5.ttcdn-us.com/main.webp"] }],
+    description: JSON.stringify([
+      { text: "Use after washing." },
+      { image: { url_list: ["https://p16-oec-general-useast5.ttcdn-us.com/detail-1.webp"] } },
+      { image: { url_list: ["https://p16-oec-general-useast5.ttcdn-us.com/detail-2.webp"] } },
+    ]),
+    product_properties: [{ property_name: "Material", property_values: [{ property_value_name: "Silicone" }] }],
+    skus: [{ sku_id: "sku-1", sku_name: "Blue", sku_image: { url_list: ["https://p16-oec-general-useast5.ttcdn-us.com/sku.webp"] } }],
+    ...options,
+  };
+  return `<script id="__MODERN_ROUTER_DATA__" type="application/json">${JSON.stringify({ loaderData: { product_model: product, seller: { seller_id: "seller-1", shop_name: "Fixture Shop" } } })}</script>`;
+}
+
+test("public TikTok parser keeps main and SKU images as metadata but exposes only description detail images", async t => {
+  const file = await publicSource(t);
+  const product = file.parsePublicTikTokProductHtml(publicProductHtml(fixturePid), fixturePid);
+  assert.equal(product.product_id, fixturePid);
+  assert.equal(product.product_name, "Detail-image product");
+  assert.equal(product.shop_name, "Fixture Shop");
+  assert.deepEqual(product.product_images.map(image => image.url), ["https://p16-oec-general-useast5.ttcdn-us.com/main.webp"]);
+  assert.deepEqual(product.product_detail_images.map(image => image.url), [
+    "https://p16-oec-general-useast5.ttcdn-us.com/detail-1.webp",
+    "https://p16-oec-general-useast5.ttcdn-us.com/detail-2.webp",
+  ]);
+  assert.doesNotMatch(JSON.stringify(product.product_detail_images), /main|sku/);
+  assert.equal(product.product_skus[0].sku_name, "Blue");
+});
+
+test("public TikTok source verifies exact PID, caches one capture and never retries a recorded failure", async t => {
+  const file = await publicSource(t);
+  let calls = 0;
+  globalThis.__catalogFetch = async () => {
+    calls++;
+    return new Response(publicProductHtml(fixturePid), { status: 200 });
+  };
+  assert.equal((await file.fetchPublicProductOnce(fixturePid)).product_id, fixturePid);
+  assert.equal((await file.fetchPublicProductOnce(fixturePid)).product_id, fixturePid);
+  assert.equal(calls, 1);
+
+  const other = "1732350695360139846";
+  globalThis.__catalogFetch = async () => { calls++; return new Response(publicProductHtml(fixturePid), { status: 200 }); };
+  await assert.rejects(file.fetchPublicProductOnce(other), /PID/);
+  await assert.rejects(file.fetchPublicProductOnce(other), /不可用/);
+  assert.equal(calls, 2);
+});
 
 test("PID identity is exact, textual and unambiguous; no URL/name guesses", () => {
   for (const pid of ["../123456", "123", "1e18", "123456?x", "１２３４５６"]) assert.throws(() => types.validatePid(pid));
@@ -93,17 +158,19 @@ test("HTTP failure and mismatched PID are not billed again", async t => {
   assert.equal(calls, 2);
 });
 
-test("main product images are read by bytes even with octet-stream MIME, then reused without SKU downloads", async t => {
+test("description detail images are read by bytes and reused without main or SKU downloads", async t => {
   const { file } = await modules(t);
   const bytes = Buffer.from("RIFF1234WEBPpayload");
   const item = { product_name: "四合一分装瓶", product_specifications: [{ name: "Function", value: "Shampoo, Body Wash" }],
-    product_images: [{ url: "https://oss-t.chuhaijiang.com/a?signature=secret" }],
+    product_detail_images: [{ url: "https://oss-t.chuhaijiang.com/detail?signature=secret" }],
+    product_images: [{ url: "https://oss-t.chuhaijiang.com/main?signature=secret" }],
     product_sku_props: [{ prop_name: "颜色", sale_prop_values: [{ prop_value: "白", image: { url: "https://oss-t.chuhaijiang.com/b?signature=secret" } }] }] };
   let calls = 0;
   globalThis.__catalogFetch = async () => { calls++; return new Response(bytes, { headers: { "Content-Type": "application/octet-stream" } }); };
   const evidence = await file.prepareCatalogEvidence(fixturePid, item);
   assert.equal(evidence.images.length, 1);
-  assert.ok(evidence.warnings.some(warning => warning.includes("SKU图未送入模型")));
+  assert.equal(evidence.images[0].label, "详情图1");
+  assert.ok(evidence.warnings.some(warning => warning.includes("主商品图1张、SKU图1张未送入模型")));
   assert.match(evidence.images[0].dataUrl, /^data:image\/webp;base64,/);
   assert.match(evidence.text, /Shampoo/);
   assert.doesNotMatch(evidence.text, /signature|https|secret/);
@@ -111,11 +178,12 @@ test("main product images are read by bytes even with octet-stream MIME, then re
   assert.equal(calls, 1);
 });
 
-test("Qwen receives at most eight main product images and no SKU images", async t => {
+test("Qwen receives at most eight description detail images and no main or SKU images", async t => {
   const { file } = await modules(t);
   const url = index => `https://oss-t.chuhaijiang.com/${index}`;
   const item = {
     product_name: "Many-image product",
+    product_detail_images: Array.from({ length: 12 }, (_, index) => ({ url: url(`detail-${index + 1}`) })),
     product_images: Array.from({ length: 12 }, (_, index) => ({ url: url(`product-${index + 1}`) })),
     product_sku_props: [{ prop_name: "颜色", sale_prop_values: Array.from({ length: 12 }, (_, index) => ({
       prop_value: `SKU-${index + 1}`, image: { url: url(`sku-${index + 1}`) },
@@ -129,29 +197,28 @@ test("Qwen receives at most eight main product images and no SKU images", async 
   const evidence = await file.prepareCatalogEvidence(fixturePid, item);
   assert.equal(evidence.images.length, 8);
   assert.deepEqual(evidence.images.map(image => image.label), [
-    "商品图1", "商品图2", "商品图3", "商品图4", "商品图5", "商品图6", "商品图7", "商品图8",
+    "详情图1", "详情图2", "详情图3", "详情图4", "详情图5", "详情图6", "详情图7", "详情图8",
   ]);
   assert.equal(requested.length, 8);
-  assert.ok(evidence.warnings.some(warning => warning.includes("共24张") && warning.includes("SKU图未送入模型")));
+  assert.ok(evidence.warnings.some(warning => warning.includes("详情图共12张") && warning.includes("前8张")));
+  assert.ok(evidence.warnings.some(warning => warning.includes("主商品图12张、SKU图12张未送入模型")));
 });
 
-test("SKU-only products send no image to Qwen", async t => {
+test("products without description detail images send no main or SKU image to Qwen", async t => {
   const { file } = await modules(t);
-  const productOnly = file.imageCandidates({
-    product_images: Array.from({ length: 10 }, (_, index) => ({ url: `https://oss-t.chuhaijiang.com/${index}` })),
+  const candidates = file.imageCandidates({
+    product_images: Array.from({ length: 10 }, (_, index) => ({ url: `https://oss-t.chuhaijiang.com/main-${index}` })),
+    product_sku_props: [{ sale_prop_values: Array.from({ length: 10 }, (_, index) => ({
+      prop_value: `SKU-${index + 1}`, image: { url: `https://oss-t.chuhaijiang.com/${index}` },
+    })) }],
   });
-  assert.deepEqual(file.selectCatalogImages(productOnly).map(candidate => candidate.label),
-    Array.from({ length: 8 }, (_, index) => `商品图${index + 1}`));
-  const skuOnly = file.imageCandidates({ product_sku_props: [{ sale_prop_values: Array.from({ length: 10 }, (_, index) => ({
-    prop_value: `SKU-${index + 1}`, image: { url: `https://oss-t.chuhaijiang.com/${index}` },
-  })) }] });
-  assert.deepEqual(file.selectCatalogImages(skuOnly), []);
+  assert.deepEqual(file.selectCatalogImages(candidates), []);
 });
 
 test("untrusted image hosts never receive a request, and partial missing images do not block text", async t => {
   const { file } = await modules(t);
   for (const url of ["http://oss-t.chuhaijiang.com/a", "https://127.0.0.1/a", "https://user@oss-t.chuhaijiang.com/a", "https://oss-t.chuhaijiang.com.evil.test/a"]) {
-    const evidence = await file.prepareCatalogEvidence(fixturePid, { product_name: "Bottle", product_images: [{ url }] });
+    const evidence = await file.prepareCatalogEvidence(fixturePid, { product_name: "Bottle", product_detail_images: [{ url }] });
     assert.equal(evidence.images.length, 0);
     assert.ok(evidence.warnings.some(w => w.includes("无法获取图片信息")));
     assert.match(evidence.text, /Bottle/);
@@ -207,6 +274,8 @@ test("Qwen product request uses selected endpoint/model, exact schema enum and a
     assert.deepEqual(request.response_format.json_schema.schema.properties.pid.enum, [fixturePid]);
     assert.deepEqual(request.response_format.json_schema.schema.properties.fields.properties.coreFunctions.properties.evidence.items.enum, ["product-text", "image-1"]);
     assert.equal(request.messages[1].content.find(c => c.type === "image_url").image_url.url, input.images[0].dataUrl);
+    assert.match(request.messages[0].content, /视觉证据只包含商品描述区域的详情图，最多8张/);
+    assert.match(request.messages[0].content, /主商品图和SKU图没有提供给你/);
     assert.match(request.messages[0].content, /整机、外壳、内部容器、配件或包装/);
     assert.match(request.messages[0].content, /对应字段正文紧邻/);
     return Response.json({ choices: [{ finish_reason: "stop", message: { content: JSON.stringify([result(fixturePid)]) } }] });
@@ -275,6 +344,7 @@ test("OpenAI gets actual image bytes plus supplier text, strict structured outpu
 async function service(t, initial = null) {
   const key = `catalogState${Math.random()}`;
   let row = initial;
+  let metadata = null;
   let paid = 0, ai = 0;
   const disk = new Map();
   const hooks = {
@@ -288,9 +358,19 @@ async function service(t, initial = null) {
     claimCatalogAnalysis: async () => { if (row.analysis_state !== "waiting") return false; row.analysis_state = "requested"; return true; },
     finishCatalogAnalysis: async (_pid, value) => { row.analysis_state = "ready"; row.result_json = value; },
     failCatalog: async (_pid, stage, error) => { row[`${stage}_state`] = "failed"; row.error_message = error; },
+    readCatalogMetadata: async () => metadata,
+    saveCatalogMetadata: async value => { metadata = structuredClone(value); },
+    catalogSourceMetadata: (pid, item) => ({
+      pid, source: item._catalog_source === "tiktok-public" ? "tiktok-public" : "chuhaijiang",
+      title: String(item.product_name || item.product_title || ""), shopName: String(item.shop_name || ""),
+      description: String(item.product_description || ""), mainImageUrls: [],
+      sourceUrl: `https://www.tiktok.com/view/product/${pid}`, updatedAt: "t",
+    }),
     cachedProduct: async () => disk.get("raw") || null,
     readCreditRejection: async () => null,
     archiveCreditRejection: async () => { throw Error("UNEXPECTED_RETRY"); },
+    cachedPublicProduct: async () => disk.get("public-raw") || null,
+    fetchPublicProductOnce: async () => { throw new types.CatalogError("public unavailable"); },
     fetchProductOnce: async pid => { paid++; const item = { product_id: pid, product_name: "Supplier bottle" }; disk.set("raw", item); return item; },
     prepareCatalogEvidence: async pid => ({ pid }),
     analyzeCatalog: async input => { ai++; return result(input.pid); },
@@ -304,7 +384,7 @@ async function service(t, initial = null) {
   const code = compile(await source("catalog"))
     .replaceAll('"@/lib/ai/settings"', JSON.stringify(settingsUrl))
     .replaceAll('"@/lib/products/catalog-types"', JSON.stringify(typesUrl))
-    .replace(/"@\/lib\/products\/catalog-(?:store|source|analyzer)"/g, JSON.stringify(stub));
+    .replace(/"@\/lib\/products\/(?:catalog-(?:store|source|analyzer)|tiktok-public-source)"/g, JSON.stringify(stub));
   const load = suffix => import(dataUrl(`${code}\n// ${suffix}`));
   return { api: await load("first"), restart: () => load("restart"), hooks, disk, counts: () => ({ paid, ai }), row: () => row };
 }
@@ -375,12 +455,17 @@ test("name lookup does not repeat a persisted or uncertain source request", asyn
   }
 });
 
-test("missing credentials or invalid PID cannot consume the source claim", async t => {
+test("public TikTok source needs no ChuhaiJiang credential and invalid PID cannot consume a claim", async t => {
   env(t, "CHUHAIJIANG_API_KEY", "");
   const f = await service(t);
   assert.throws(() => f.api.getProductNameByPid("../../invalid"), /PID/);
-  await assert.rejects(f.api.getProductNameByPid(fixturePid), /未配置/);
-  assert.equal(f.row(), null);
+  f.hooks.fetchPublicProductOnce = async pid => {
+    const item = { product_id: pid, product_name: "Public product", _catalog_source: "tiktok-public" };
+    f.disk.set("public-raw", item);
+    return item;
+  };
+  assert.equal(await f.api.getProductNameByPid(fixturePid), "Public product");
+  assert.equal(f.row().fetch_state, "ready");
   assert.deepEqual(f.counts(), { paid: 0, ai: 0 });
 });
 

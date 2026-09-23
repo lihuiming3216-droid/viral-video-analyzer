@@ -22,7 +22,7 @@ test("real MySQL catalog claims are atomic, migration is additive and failure su
   const openPool = () => mysql.createPool({ ...config, database: "catalog_test", multipleStatements: true, connectionLimit: 10 });
   pool = openPool();
   const schema = await readFile(new URL("../lib/db/schema.sql", import.meta.url), "utf8");
-  const prior = schema.replace(/CREATE TABLE IF NOT EXISTS (?:product_catalog_cache|product_catalog_reorganizations|ai_purpose_settings) \([\s\S]+?;\n/g, "");
+  const prior = schema.replace(/CREATE TABLE IF NOT EXISTS (?:product_catalog_cache|product_catalog_reorganizations|product_catalog_metadata|ai_purpose_settings) \([\s\S]+?;\n/g, "");
   assert.notEqual(prior, schema);
   await pool.query(prior);
   await pool.query("INSERT INTO products(id,name,created_at,updated_at) VALUES ('preserved','人工资料','t','t')");
@@ -61,6 +61,16 @@ test("real MySQL catalog claims are atomic, migration is additive and failure su
   await store.finishCatalogAnalysis(second, { pid: second, fields: {}, warnings: [], model: "test", createdAt: "t" });
   assert.equal((await store.readCatalog(second)).analysis_state, "ready");
   assert.equal((await store.readCatalog(second)).result_json.pid, second);
+  await store.saveCatalogMetadata({
+    pid: second, source: "tiktok-public", title: "Product", shopName: "Shop", description: "Description",
+    mainImageUrls: ["https://p16-oec-general-useast5.ttcdn-us.com/main.webp"],
+    sourceUrl: `https://www.tiktok.com/view/product/${second}`, updatedAt: "t",
+  });
+  assert.deepEqual(await store.readCatalogMetadata(second), {
+    pid: second, source: "tiktok-public", title: "Product", shopName: "Shop", description: "Description",
+    mainImageUrls: ["https://p16-oec-general-useast5.ttcdn-us.com/main.webp"],
+    sourceUrl: `https://www.tiktok.com/view/product/${second}`, updatedAt: "t",
+  });
   const rejected = "1732464639200366758";
   await store.claimCatalog(rejected);
   await store.failCatalog(rejected, "fetch", "HTTP 402");

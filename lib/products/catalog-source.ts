@@ -8,6 +8,42 @@ import { CatalogError, exactProduct, object, validatePid, type CatalogEvidence }
 const ROOT = path.join(process.cwd(), ".data/provider-evidence/chuhaijiang/us");
 const hash = (body: Buffer) => createHash("sha256").update(body).digest("hex");
 export const catalogDirectory = (pid: string) => path.join(ROOT, validatePid(pid));
+const creditsMessage = "出海匠余额不足，商品资料尚未获取；请充值后再次点击“补录手卡”重试";
+
+function insufficientCredits(body: Buffer) {
+  try { return ["INSUFFICIENT_CREDITS", "INSUFFICIENT_BALANCE"].includes(String(object(JSON.parse(body.toString("utf8"))).code)); }
+  catch { return false; }
+}
+
+/** Only a checksummed, explicit credit rejection can release a failed claim. */
+export async function readCreditRejection(pid: string): Promise<string | null> {
+  const directory = catalogDirectory(pid);
+  const receipt = object(await readPrivateJson(path.join(directory, "receipt.json")));
+  if (receipt.pid !== pid || receipt.country !== "us" || receipt.httpStatus !== 402) return null;
+  if (await readPrivateJson(path.join(directory, "organized.json"))
+    || await readPrivateJson(path.join(directory, "analysis-started.json"))) return null;
+  const file = path.join(directory, "response.json");
+  try {
+    if ((await stat(file)).size > 10 * 1024 * 1024) return null;
+    const body = await readFile(file);
+    return hash(body) === receipt.sha256 && insufficientCredits(body) ? hash(body) : null;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+/** Called only after winning the DB retry claim. Preserve the complete rejected attempt. */
+export async function archiveCreditRejection(pid: string, expectedHash: string) {
+  if (await readCreditRejection(pid) !== expectedHash) throw new CatalogError("商品取数记录已变化，已停止重试，请管理员检查");
+  const archive = path.join(ROOT, "credit-rejections");
+  await mkdir(archive, { recursive: true, mode: 0o700 });
+  await rename(catalogDirectory(pid), path.join(archive, `${pid}-${randomUUID()}`));
+  for (const directory of [archive, ROOT]) {
+    const handle = await open(directory, "r");
+    try { await handle.sync(); } finally { await handle.close(); }
+  }
+}
 
 export async function claimAnalysisFile(pid: string, runId?: string) {
   if (runId && !/^[a-f0-9-]{36}$/.test(runId)) throw new CatalogError("资料重新整理任务标识无效");
@@ -70,9 +106,11 @@ export async function cachedProduct(pid: string) {
   const file = path.join(directory, "response.json");
   if ((await stat(file)).size > 10 * 1024 * 1024) throw new CatalogError("商品缓存过大");
   const body = await readFile(file);
-  if (receipt.pid !== pid || receipt.country !== "us" || receipt.httpStatus !== 200 || hash(body) !== receipt.sha256) {
+  if (receipt.pid !== pid || receipt.country !== "us" || hash(body) !== receipt.sha256) {
     throw new CatalogError("商品缓存校验失败，不会自动重新取数");
   }
+  if (receipt.httpStatus === 402 && insufficientCredits(body)) throw new CatalogError(creditsMessage);
+  if (receipt.httpStatus !== 200) throw new CatalogError("商品缓存校验失败，不会自动重新取数");
   return exactProduct(JSON.parse(body.toString("utf8")), pid);
 }
 
@@ -83,7 +121,7 @@ export async function fetchProductOnce(pid: string) {
   if (!key) throw new CatalogError("未配置出海匠接口密钥，请管理员配置后再点击");
   const directory = catalogDirectory(pid);
   await mkdir(directory, { recursive: true, mode: 0o700 });
-  // Never remove this marker, including HTTP failures and uncertain timeouts.
+  // Never clear this marker here. Only a DB-claimed credit rejection may be archived.
   let marker;
   try { marker = await open(path.join(directory, "request-started.json"), "wx", 0o600); }
   catch (error) {
@@ -105,6 +143,7 @@ export async function fetchProductOnce(pid: string) {
     pid, country: "us", fetchedAt: new Date().toISOString(), httpStatus: response.status,
     bytes: body.length, sha256: hash(body), automaticRetries: 0,
   }));
+  if (response.status === 402 && insufficientCredits(body)) throw new CatalogError(creditsMessage);
   if (!response.ok) throw new CatalogError(`出海匠取数失败（HTTP ${response.status}），不会自动再次收费请求`);
   return exactProduct(JSON.parse(body.toString("utf8")), pid);
 }

@@ -243,11 +243,17 @@ async function service(t, initial = null) {
   const hooks = {
     readCatalog: async () => row && structuredClone(row),
     claimCatalog: async pid => { if (row) return false; row = { pid, fetch_state: "requested", analysis_state: "waiting" }; return true; },
+    claimCatalogCreditRetry: async (_pid, updatedAt) => {
+      if (row.fetch_state !== "failed" || row.analysis_state !== "waiting" || row.result_json || row.updated_at !== updatedAt) return false;
+      row.fetch_state = "requested"; return true;
+    },
     markCatalogFetched: async () => { row.fetch_state = "ready"; },
     claimCatalogAnalysis: async () => { if (row.analysis_state !== "waiting") return false; row.analysis_state = "requested"; return true; },
     finishCatalogAnalysis: async (_pid, value) => { row.analysis_state = "ready"; row.result_json = value; },
     failCatalog: async (_pid, stage, error) => { row[`${stage}_state`] = "failed"; row.error_message = error; },
     cachedProduct: async () => disk.get("raw") || null,
+    readCreditRejection: async () => null,
+    archiveCreditRejection: async () => { throw Error("UNEXPECTED_RETRY"); },
     fetchProductOnce: async pid => { paid++; const item = { product_id: pid, product_name: "Supplier bottle" }; disk.set("raw", item); return item; },
     prepareCatalogEvidence: async pid => ({ pid }),
     analyzeCatalog: async input => { ai++; return result(input.pid); },
@@ -394,6 +400,90 @@ test("failed or uncertain persisted requests never retry after restart", async t
   await assert.rejects(f.api.getProductCatalog(fixturePid), /取数已开始/);
   await assert.rejects((await f.restart()).getProductCatalog(fixturePid));
   assert.deepEqual(f.counts(), { paid: 0, ai: 0 });
+});
+
+test("a persisted insufficient-credit rejection retries on the next click, preserves evidence, and then reuses paid data", async t => {
+  env(t, "CHUHAIJIANG_API_KEY", "isolated-test-key");
+  for (const nameOnly of [false, true]) {
+    const { file } = await modules(t);
+    const f = await service(t);
+    for (const name of ["cachedProduct", "fetchProductOnce", "catalogDirectory", "readPrivateJson", "savePrivate", "readCreditRejection", "archiveCreditRejection"])
+      f.hooks[name] = file[name];
+    let calls = 0;
+    globalThis.__catalogFetch = async () => {
+      calls++;
+      if (calls === 1) return Response.json({ code: nameOnly ? "INSUFFICIENT_BALANCE" : "INSUFFICIENT_CREDITS", message: "private provider details" }, { status: 402 });
+      return Response.json({ data: { items: [{ product_id: fixturePid, product_name: "Recovered product" }] } });
+    };
+    const invoke = api => nameOnly ? api.getProductNameByPid(fixturePid) : api.getProductCatalog(fixturePid);
+    await assert.rejects(invoke(f.api), /余额不足.*充值后/);
+    assert.equal(calls, 1);
+    assert.equal(f.row().fetch_state, "failed");
+    assert.doesNotMatch(f.row().error_message, /private/);
+    const restarted = await f.restart();
+    await Promise.all(Array.from({ length: 20 }, () => invoke(restarted)));
+    await restarted.getProductCatalog(fixturePid);
+    assert.equal(calls, 2);
+    assert.equal(f.counts().ai, 1);
+    const { readdir } = await import("node:fs/promises");
+    const archive = path.join(path.dirname(file.catalogDirectory(fixturePid)), "credit-rejections");
+    const attempts = await readdir(archive);
+    assert.equal(attempts.length, 1);
+    const receipt = await file.readPrivateJson(path.join(archive, attempts[0], "receipt.json"));
+    assert.equal(receipt.httpStatus, 402);
+    assert.ok(await file.readPrivateJson(path.join(archive, attempts[0], "request-started.json")));
+  }
+});
+
+test("credit recovery rejects unrelated 402 errors, corrupt evidence and attempts with AI results", async t => {
+  env(t, "CHUHAIJIANG_API_KEY", "isolated-test-key");
+  const { file } = await modules(t);
+  let calls = 0;
+  globalThis.__catalogFetch = async () => { calls++; return Response.json({ code: "OTHER_BILLING_ERROR" }, { status: 402 }); };
+  await assert.rejects(file.fetchProductOnce(fixturePid), /HTTP 402/);
+  assert.equal(await file.readCreditRejection(fixturePid), null);
+  globalThis.__catalogFetch = async () => { calls++; return Response.json({ code: "INSUFFICIENT_CREDITS" }, { status: 402 }); };
+  const pid = "123456";
+  await assert.rejects(file.fetchProductOnce(pid), /余额不足/);
+  const proof = await file.readCreditRejection(pid);
+  assert.ok(proof);
+  await file.savePrivate(path.join(file.catalogDirectory(pid), "response.json"), '{"code":"CHANGED"}');
+  assert.equal(await file.readCreditRejection(pid), null);
+  await assert.rejects(file.archiveCreditRejection(pid, proof), /记录已变化/);
+  const other = "123457";
+  await assert.rejects(file.fetchProductOnce(other), /余额不足/);
+  await file.savePrivate(path.join(file.catalogDirectory(other), "analysis-started.json"), '{}');
+  assert.equal(await file.readCreditRejection(other), null);
+  assert.equal(calls, 3);
+});
+
+test("losing a concurrent credit retry claim cannot archive evidence or call the provider", async t => {
+  env(t, "CHUHAIJIANG_API_KEY", "test");
+  const f = await service(t, { pid: fixturePid, fetch_state: "failed", analysis_state: "waiting", updated_at: "old", error_message: "HTTP 402" });
+  f.hooks.readCreditRejection = async () => "verified-proof";
+  f.hooks.claimCatalogCreditRetry = async () => false;
+  await assert.rejects(f.api.getProductNameByPid(fixturePid), /已开始重试/);
+  await assert.rejects(f.api.getProductCatalog(fixturePid), /已开始重试/);
+  assert.deepEqual(f.counts(), { paid: 0, ai: 0 });
+});
+
+test("an empty balance never creates a retry loop and a later uncertain retry stays blocked", async t => {
+  env(t, "CHUHAIJIANG_API_KEY", "test");
+  const { file } = await modules(t);
+  const f = await service(t);
+  for (const name of ["cachedProduct", "fetchProductOnce", "catalogDirectory", "readPrivateJson", "savePrivate", "readCreditRejection", "archiveCreditRejection"])
+    f.hooks[name] = file[name];
+  let calls = 0;
+  globalThis.__catalogFetch = async () => { calls++; return Response.json({ code: "INSUFFICIENT_CREDITS" }, { status: 402 }); };
+  await assert.rejects(f.api.getProductCatalog(fixturePid), /余额不足/);
+  assert.equal(calls, 1);
+  await assert.rejects(f.api.getProductCatalog(fixturePid), /余额不足/);
+  assert.equal(calls, 2);
+  globalThis.__catalogFetch = async () => { calls++; throw Error("uncertain timeout"); };
+  await assert.rejects(f.api.getProductCatalog(fixturePid));
+  await assert.rejects((await f.restart()).getProductCatalog(fixturePid));
+  assert.equal(calls, 3);
+  assert.equal(f.counts().ai, 0);
 });
 
 test("provider and AI failures stop independently without repeated paid calls", async t => {

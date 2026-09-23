@@ -2,8 +2,8 @@ import "server-only";
 import path from "node:path";
 import { requireAiRuntime } from "@/lib/ai/settings";
 import { catalogError, CatalogError, validatePid, cachedCatalogResult, type CatalogResult } from "@/lib/products/catalog-types";
-import { readCatalog, claimCatalog, markCatalogFetched, claimCatalogAnalysis, finishCatalogAnalysis, failCatalog } from "@/lib/products/catalog-store";
-import { cachedProduct, fetchProductOnce, prepareCatalogEvidence, catalogDirectory, readPrivateJson, savePrivate } from "@/lib/products/catalog-source";
+import { readCatalog, claimCatalog, claimCatalogCreditRetry, markCatalogFetched, claimCatalogAnalysis, finishCatalogAnalysis, failCatalog, type CatalogRow } from "@/lib/products/catalog-store";
+import { cachedProduct, fetchProductOnce, prepareCatalogEvidence, catalogDirectory, readPrivateJson, savePrivate, readCreditRejection, archiveCreditRejection } from "@/lib/products/catalog-source";
 import { analyzeCatalog } from "@/lib/products/catalog-analyzer";
 
 const inFlight = new Map<string, Promise<CatalogResult>>();
@@ -15,13 +15,33 @@ function enqueueCatalog<T>(operation: () => Promise<T>): Promise<T> {
   return task;
 }
 
+// A new button invocation may retry an explicitly rejected credit check. Never
+// retry within the failed invocation, or recycle uncertain/paid/AI requests.
+async function retryCreditRejection(pid: string, row: CatalogRow) {
+  const proof = row.analysis_state === "waiting" && !row.result_json ? await readCreditRejection(pid) : null;
+  if (!proof) throw new CatalogError(row.error_message);
+  if (!process.env.CHUHAIJIANG_API_KEY?.trim()) throw new CatalogError("未配置出海匠接口密钥，请管理员配置后再点击");
+  if (!await claimCatalogCreditRetry(pid, row.updated_at)) throw new CatalogError("该 PID 已开始重试，请稍后查看手卡，不会重复取数");
+  try {
+    await archiveCreditRejection(pid, proof);
+    const item = await fetchProductOnce(pid);
+    await markCatalogFetched(pid);
+    return item;
+  } catch (error) {
+    await failCatalog(pid, "fetch", catalogError(error));
+    throw error;
+  }
+}
+
 /** Read the supplier's exact-PID title without invoking AI or guessing from a URL. */
 export function getProductNameByPid(pid: string): Promise<string> {
   validatePid(pid);
   // Share the catalog queue so a name lookup cannot race a same-process fetch.
   // The existing DB claim and durable request marker protect other processes.
   return enqueueCatalog(async () => {
-    let item = await cachedProduct(pid);
+    const existing = await readCatalog(pid);
+    let item = existing?.fetch_state === "failed"
+      ? await retryCreditRejection(pid, existing) : await cachedProduct(pid);
     if (!item) {
       const row = await readCatalog(pid);
       if (row?.fetch_state === "failed") throw new CatalogError(row.error_message);
@@ -60,8 +80,10 @@ async function runCatalog(pid: string): Promise<CatalogResult> {
     const result = typeof row.result_json === "string" ? JSON.parse(row.result_json) : row.result_json;
     return cachedCatalogResult(result, pid)!;
   }
-  if (row?.fetch_state === "failed" || row?.analysis_state === "failed") throw new CatalogError(row.error_message);
-  let item = await cachedProduct(pid);
+  if (row?.analysis_state === "failed") throw new CatalogError(row.error_message);
+  if (row?.fetch_state === "failed") await requireAiRuntime("product");
+  let item = row?.fetch_state === "failed" ? await retryCreditRejection(pid, row) : await cachedProduct(pid);
+  if (row?.fetch_state === "failed") row = await readCatalog(pid);
   const resultFile = path.join(catalogDirectory(pid), "organized.json");
   const durable = cachedCatalogResult(await readPrivateJson(resultFile), pid);
   if (!row) {

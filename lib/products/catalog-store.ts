@@ -7,6 +7,7 @@ export interface CatalogRow extends RowDataPacket {
   pid: string; fetch_state: "requested" | "ready" | "failed";
   analysis_state: "waiting" | "requested" | "ready" | "failed";
   error_message: string; result_json: CatalogResult | string | null;
+  updated_at: string;
 }
 export async function readCatalog(pid: string) {
   const pool = await getPool();
@@ -18,6 +19,15 @@ export async function claimCatalog(pid: string) {
   const now = new Date().toISOString();
   const [result] = await pool.execute<ResultSetHeader>(
     "INSERT IGNORE INTO product_catalog_cache(pid,fetch_state,analysis_state,created_at,updated_at) VALUES (?,'requested','waiting',?,?)", [pid, now, now],
+  );
+  return result.affectedRows === 1;
+}
+/** A caller must first verify the durable INSUFFICIENT_CREDITS receipt. */
+export async function claimCatalogCreditRetry(pid: string, updatedAt: string) {
+  const pool = await getPool();
+  const [result] = await pool.execute<ResultSetHeader>(
+    "UPDATE product_catalog_cache SET fetch_state='requested',error_message='',updated_at=? WHERE pid=? AND fetch_state='failed' AND analysis_state='waiting' AND result_json IS NULL AND updated_at=?",
+    [new Date().toISOString(), pid, updatedAt],
   );
   return result.affectedRows === 1;
 }

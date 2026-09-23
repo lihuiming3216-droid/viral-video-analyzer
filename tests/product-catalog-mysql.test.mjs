@@ -61,4 +61,14 @@ test("real MySQL catalog claims are atomic, migration is additive and failure su
   await store.finishCatalogAnalysis(second, { pid: second, fields: {}, warnings: [], model: "test", createdAt: "t" });
   assert.equal((await store.readCatalog(second)).analysis_state, "ready");
   assert.equal((await store.readCatalog(second)).result_json.pid, second);
+  const rejected = "1732464639200366758";
+  await store.claimCatalog(rejected);
+  await store.failCatalog(rejected, "fetch", "HTTP 402");
+  const beforeRetry = await store.readCatalog(rejected);
+  const retries = await Promise.all(Array.from({ length: 50 }, () => store.claimCatalogCreditRetry(rejected, beforeRetry.updated_at)));
+  assert.equal(retries.filter(Boolean).length, 1);
+  await store.failCatalog(rejected, "fetch", "余额不足");
+  assert.equal(await store.claimCatalogCreditRetry(rejected, beforeRetry.updated_at), false);
+  assert.equal(await store.claimCatalogCreditRetry(second, (await store.readCatalog(second)).updated_at), false);
+  assert.equal(await store.claimCatalogCreditRetry(pid, (await store.readCatalog(pid)).updated_at), false);
 });

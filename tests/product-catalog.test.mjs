@@ -111,6 +111,44 @@ test("all product and SKU images are read by bytes even with octet-stream MIME, 
   assert.equal(calls, 2);
 });
 
+test("Qwen receives at most eight representative product and SKU images", async t => {
+  const { file } = await modules(t);
+  const url = index => `https://oss-t.chuhaijiang.com/${index}`;
+  const item = {
+    product_name: "Many-image product",
+    product_images: Array.from({ length: 12 }, (_, index) => ({ url: url(`product-${index + 1}`) })),
+    product_sku_props: [{ prop_name: "颜色", sale_prop_values: Array.from({ length: 12 }, (_, index) => ({
+      prop_value: `SKU-${index + 1}`, image: { url: url(`sku-${index + 1}`) },
+    })) }],
+  };
+  const requested = [];
+  globalThis.__catalogFetch = async requestedUrl => {
+    requested.push(requestedUrl);
+    return new Response(Buffer.from("RIFF1234WEBPpayload"));
+  };
+  const evidence = await file.prepareCatalogEvidence(fixturePid, item);
+  assert.equal(evidence.images.length, 8);
+  assert.deepEqual(evidence.images.map(image => image.label), [
+    "商品图1", "商品图2", "商品图3", "商品图4", "SKU-1", "SKU-2", "SKU-3", "SKU-4",
+  ]);
+  assert.equal(requested.length, 8);
+  assert.ok(evidence.warnings.some(warning => warning.includes("共24张") && warning.includes("选取8张")));
+});
+
+test("an absent image category lets the other category fill all eight slots", async t => {
+  const { file } = await modules(t);
+  const productOnly = file.imageCandidates({
+    product_images: Array.from({ length: 10 }, (_, index) => ({ url: `https://oss-t.chuhaijiang.com/${index}` })),
+  });
+  assert.deepEqual(file.selectCatalogImages(productOnly).map(candidate => candidate.label),
+    Array.from({ length: 8 }, (_, index) => `商品图${index + 1}`));
+  const skuOnly = file.imageCandidates({ product_sku_props: [{ sale_prop_values: Array.from({ length: 10 }, (_, index) => ({
+    prop_value: `SKU-${index + 1}`, image: { url: `https://oss-t.chuhaijiang.com/${index}` },
+  })) }] });
+  assert.deepEqual(file.selectCatalogImages(skuOnly).map(candidate => candidate.label),
+    Array.from({ length: 8 }, (_, index) => `SKU-${index + 1}`));
+});
+
 test("untrusted image hosts never receive a request, and partial missing images do not block text", async t => {
   const { file } = await modules(t);
   for (const url of ["http://oss-t.chuhaijiang.com/a", "https://127.0.0.1/a", "https://user@oss-t.chuhaijiang.com/a", "https://oss-t.chuhaijiang.com.evil.test/a"]) {

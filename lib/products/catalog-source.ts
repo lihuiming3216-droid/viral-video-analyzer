@@ -6,6 +6,7 @@ import { fetchWithProxy } from "@/lib/network";
 import { CatalogError, exactProduct, object, validatePid, type CatalogEvidence } from "@/lib/products/catalog-types";
 
 const ROOT = path.join(process.cwd(), ".data/provider-evidence/chuhaijiang/us");
+export const MAX_CATALOG_IMAGES = 8;
 const hash = (body: Buffer) => createHash("sha256").update(body).digest("hex");
 export const catalogDirectory = (pid: string) => path.join(ROOT, validatePid(pid));
 const creditsMessage = "出海匠余额不足，商品资料尚未获取；请充值后再次点击“补录手卡”重试";
@@ -158,13 +159,31 @@ export function imageMime(body: Buffer) {
 export function imageCandidates(item: Record<string, unknown>) {
   const images = Array.isArray(item.product_images) ? item.product_images : [];
   const props = Array.isArray(item.product_sku_props) ? item.product_sku_props : [];
-  const candidates = images.map((image, index) => ({ label: `商品图${index + 1}`, image: object(image) }));
+  const candidates: Array<{ label: string; image: Record<string, unknown>; kind: "product" | "sku" }> =
+    images.map((image, index) => ({ label: `商品图${index + 1}`, image: object(image), kind: "product" }));
   for (const prop of props.map(object)) {
     for (const value of (Array.isArray(prop.sale_prop_values) ? prop.sale_prop_values : []).map(object)) {
-      if (value.image) candidates.push({ label: String(value.prop_value || "SKU图片"), image: object(value.image) });
+      if (value.image) candidates.push({ label: String(value.prop_value || "SKU图片"), image: object(value.image), kind: "sku" });
     }
   }
-  return candidates.map(({ label, image }, index) => ({ label, index, url: String(image.url || image.thumb_url || "") }));
+  return candidates.map(({ label, image, kind }, index) => ({ label, index, kind, url: String(image.url || image.thumb_url || "") }));
+}
+
+/** Keep both overview and variant evidence while bounding vision-token cost. */
+export function selectCatalogImages(candidates: ReturnType<typeof imageCandidates>) {
+  if (candidates.length <= MAX_CATALOG_IMAGES) return candidates;
+  const product = candidates.filter(candidate => candidate.kind === "product");
+  const sku = candidates.filter(candidate => candidate.kind === "sku");
+  const selected = [...product.slice(0, 4), ...sku.slice(0, 4)];
+  const selectedIndexes = new Set(selected.map(candidate => candidate.index));
+  for (const candidate of candidates) {
+    if (selected.length >= MAX_CATALOG_IMAGES) break;
+    if (!selectedIndexes.has(candidate.index)) {
+      selected.push(candidate);
+      selectedIndexes.add(candidate.index);
+    }
+  }
+  return selected.sort((left, right) => left.index - right.index);
 }
 
 // Signed image URLs are private cache data, never model text or log messages.
@@ -182,12 +201,15 @@ export async function prepareCatalogEvidence(pid: string, item: Record<string, u
     /^(product_name|product_title|product_specifications|product_sku_props)$/.test(key) || /description|detail|feature|function|instruction|usage/i.test(key)));
   const text = JSON.stringify(removeUrls(fields));
   if (text.length > 100_000) throw new CatalogError("商品文字资料过长，已保留原文，需管理员处理");
-  const candidates = imageCandidates(item);
-  if (candidates.length > 50) throw new CatalogError("商品图片超过 50 张，已保留原始资料，需管理员处理");
+  const allCandidates = imageCandidates(item);
+  const candidates = selectCatalogImages(allCandidates);
   const prior = await readPrivateJson(path.join(directory, "image-manifest.json"));
   const oldManifest = Array.isArray(prior) ? prior.map(object) : [];
   const manifest: Record<string, unknown>[] = [];
   const evidence: CatalogEvidence = { pid, text, images: [], warnings: [] };
+  if (allCandidates.length > candidates.length) {
+    evidence.warnings.push(`商品图片共${allCandidates.length}张；为控制费用，本次选取${candidates.length}张代表图（兼顾主图与SKU图）`);
+  }
   let totalBytes = 0;
   const deadline = AbortSignal.timeout(90_000);
   for (const candidate of candidates) {

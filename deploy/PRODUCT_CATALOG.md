@@ -79,7 +79,7 @@ flowchart LR
 
 出海匠固定入口 `GET /open/v1/products/{PID}?country=us&include=channel,core`，主机 `openapi.gateway.chuhaijiang.com`。45 秒取数超时，不跟随重定向、不重试；响应上限 10 MiB。
 
-图片只从已实际验证的 HTTPS 主机 `oss-t.chuhaijiang.com` 获取，拒绝 URL 内账号、非标准端口和重定向。每个 PID 最多选择 8 张代表图送入模型：优先保留前 4 张主商品图和前 4 张 SKU 图，任一类别不足时由另一类别补足。每图最多 8 MiB，纳入模型的图片合计最多 25 MiB；单次下载 25 秒、下载阶段最多 90 秒。依真实字节识别 JPEG/PNG/WebP，因此 `application/octet-stream` 不会误判为无图片。图片被限量或缺失时写入资料警告，绝不宣称已经读取未获取的图片。文字上限 10 万字符，超出停止而非静默截断。
+图片只从已实际验证的 HTTPS 主机 `oss-t.chuhaijiang.com` 获取，拒绝 URL 内账号、非标准端口和重定向。每个 PID 最多选择前 8 张主商品图送入模型，SKU 图全部排除；没有主商品图时只使用供应商文字资料，不用 SKU 图补位。每图最多 8 MiB，纳入模型的图片合计最多 25 MiB；单次下载 25 秒、下载阶段最多 90 秒。依真实字节识别 JPEG/PNG/WebP，因此 `application/octet-stream` 不会误判为无图片。图片被限量或缺失时写入资料警告，绝不宣称已经读取未获取的图片。文字上限 10 万字符，超出停止而非静默截断。
 
 OpenAI 请求限时 120 秒、最多输出 5000 tokens，不自动重试，`store:false`。采用 [图片输入](https://developers.openai.com/api/docs/guides/images-vision) 与 [结构化输出](https://developers.openai.com/api/docs/guides/structured-outputs) 的官方格式（本次 OpenAI Docs 技能核验）。来源编号校验只能验证引用存在，不能从程序上保证模型绝不会读错图片，资料冲突及重要参数仍应人工确认。
 

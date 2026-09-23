@@ -169,21 +169,9 @@ export function imageCandidates(item: Record<string, unknown>) {
   return candidates.map(({ label, image, kind }, index) => ({ label, index, kind, url: String(image.url || image.thumb_url || "") }));
 }
 
-/** Keep both overview and variant evidence while bounding vision-token cost. */
+/** Product-card extraction uses overview images only; SKU images are excluded. */
 export function selectCatalogImages(candidates: ReturnType<typeof imageCandidates>) {
-  if (candidates.length <= MAX_CATALOG_IMAGES) return candidates;
-  const product = candidates.filter(candidate => candidate.kind === "product");
-  const sku = candidates.filter(candidate => candidate.kind === "sku");
-  const selected = [...product.slice(0, 4), ...sku.slice(0, 4)];
-  const selectedIndexes = new Set(selected.map(candidate => candidate.index));
-  for (const candidate of candidates) {
-    if (selected.length >= MAX_CATALOG_IMAGES) break;
-    if (!selectedIndexes.has(candidate.index)) {
-      selected.push(candidate);
-      selectedIndexes.add(candidate.index);
-    }
-  }
-  return selected.sort((left, right) => left.index - right.index);
+  return candidates.filter(candidate => candidate.kind === "product").slice(0, MAX_CATALOG_IMAGES);
 }
 
 // Signed image URLs are private cache data, never model text or log messages.
@@ -208,7 +196,7 @@ export async function prepareCatalogEvidence(pid: string, item: Record<string, u
   const manifest: Record<string, unknown>[] = [];
   const evidence: CatalogEvidence = { pid, text, images: [], warnings: [] };
   if (allCandidates.length > candidates.length) {
-    evidence.warnings.push(`商品图片共${allCandidates.length}张；为控制费用，本次选取${candidates.length}张代表图（兼顾主图与SKU图）`);
+    evidence.warnings.push(`商品图片共${allCandidates.length}张；为控制费用，本次仅选取${candidates.length}张主商品图，SKU图未送入模型`);
   }
   let totalBytes = 0;
   const deadline = AbortSignal.timeout(90_000);

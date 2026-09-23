@@ -93,7 +93,7 @@ test("HTTP failure and mismatched PID are not billed again", async t => {
   assert.equal(calls, 2);
 });
 
-test("all product and SKU images are read by bytes even with octet-stream MIME, then reused", async t => {
+test("main product images are read by bytes even with octet-stream MIME, then reused without SKU downloads", async t => {
   const { file } = await modules(t);
   const bytes = Buffer.from("RIFF1234WEBPpayload");
   const item = { product_name: "四合一分装瓶", product_specifications: [{ name: "Function", value: "Shampoo, Body Wash" }],
@@ -102,16 +102,16 @@ test("all product and SKU images are read by bytes even with octet-stream MIME, 
   let calls = 0;
   globalThis.__catalogFetch = async () => { calls++; return new Response(bytes, { headers: { "Content-Type": "application/octet-stream" } }); };
   const evidence = await file.prepareCatalogEvidence(fixturePid, item);
-  assert.equal(evidence.images.length, 2);
-  assert.equal(evidence.warnings.length, 0);
+  assert.equal(evidence.images.length, 1);
+  assert.ok(evidence.warnings.some(warning => warning.includes("SKU图未送入模型")));
   assert.match(evidence.images[0].dataUrl, /^data:image\/webp;base64,/);
   assert.match(evidence.text, /Shampoo/);
   assert.doesNotMatch(evidence.text, /signature|https|secret/);
   await file.prepareCatalogEvidence(fixturePid, item);
-  assert.equal(calls, 2);
+  assert.equal(calls, 1);
 });
 
-test("Qwen receives at most eight representative product and SKU images", async t => {
+test("Qwen receives at most eight main product images and no SKU images", async t => {
   const { file } = await modules(t);
   const url = index => `https://oss-t.chuhaijiang.com/${index}`;
   const item = {
@@ -129,13 +129,13 @@ test("Qwen receives at most eight representative product and SKU images", async 
   const evidence = await file.prepareCatalogEvidence(fixturePid, item);
   assert.equal(evidence.images.length, 8);
   assert.deepEqual(evidence.images.map(image => image.label), [
-    "商品图1", "商品图2", "商品图3", "商品图4", "SKU-1", "SKU-2", "SKU-3", "SKU-4",
+    "商品图1", "商品图2", "商品图3", "商品图4", "商品图5", "商品图6", "商品图7", "商品图8",
   ]);
   assert.equal(requested.length, 8);
-  assert.ok(evidence.warnings.some(warning => warning.includes("共24张") && warning.includes("选取8张")));
+  assert.ok(evidence.warnings.some(warning => warning.includes("共24张") && warning.includes("SKU图未送入模型")));
 });
 
-test("an absent image category lets the other category fill all eight slots", async t => {
+test("SKU-only products send no image to Qwen", async t => {
   const { file } = await modules(t);
   const productOnly = file.imageCandidates({
     product_images: Array.from({ length: 10 }, (_, index) => ({ url: `https://oss-t.chuhaijiang.com/${index}` })),
@@ -145,8 +145,7 @@ test("an absent image category lets the other category fill all eight slots", as
   const skuOnly = file.imageCandidates({ product_sku_props: [{ sale_prop_values: Array.from({ length: 10 }, (_, index) => ({
     prop_value: `SKU-${index + 1}`, image: { url: `https://oss-t.chuhaijiang.com/${index}` },
   })) }] });
-  assert.deepEqual(file.selectCatalogImages(skuOnly).map(candidate => candidate.label),
-    Array.from({ length: 8 }, (_, index) => `SKU-${index + 1}`));
+  assert.deepEqual(file.selectCatalogImages(skuOnly), []);
 });
 
 test("untrusted image hosts never receive a request, and partial missing images do not block text", async t => {

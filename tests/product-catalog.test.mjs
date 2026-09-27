@@ -91,6 +91,27 @@ test("public TikTok parser keeps main and SKU images as metadata but exposes onl
   assert.equal(product.product_skus[0].sku_name, "Blue");
 });
 
+test("public TikTok parser preserves plain and nested description text without treating image URLs as copy", async t => {
+  const file = await publicSource(t);
+  const descriptions = [
+    "Standalone plain product copy",
+    ["Plain product copy", "Second paragraph"],
+    JSON.stringify(["JSON string item", { content: "Content field" }, { text_content: "Text content field" }]),
+    { description: { textContent: "Nested description" }, image: { url_list: ["https://p16-oec-general-useast5.ttcdn-us.com/detail.webp"] } },
+  ];
+  for (const [index, description] of descriptions.entries()) {
+    const product = file.parsePublicTikTokProductHtml(publicProductHtml(fixturePid, { description }), fixturePid);
+    if (index === 0) assert.equal(product.product_description, "Standalone plain product copy");
+    if (index === 1) assert.equal(product.product_description, "Plain product copy\nSecond paragraph");
+    if (index === 2) assert.equal(product.product_description, "JSON string item\nContent field\nText content field");
+    if (index === 3) {
+      assert.equal(product.product_description, "Nested description");
+      assert.deepEqual(product.product_detail_images.map(image => image.url), ["https://p16-oec-general-useast5.ttcdn-us.com/detail.webp"]);
+      assert.doesNotMatch(product.product_description, /https?:\/\//);
+    }
+  }
+});
+
 test("public TikTok source verifies exact PID, caches one capture and never retries a recorded failure", async t => {
   const file = await publicSource(t);
   let calls = 0;

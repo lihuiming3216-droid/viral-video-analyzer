@@ -74,13 +74,35 @@ function imageUrls(value: unknown) {
 function descriptionEvidence(value: unknown) {
   let parsed = value;
   if (typeof parsed === "string" && /^[\s]*[\[{]/.test(parsed)) {
-    try { parsed = JSON.parse(parsed); } catch { return { texts: [clean(parsed)].filter(Boolean), detailImages: [] as string[] }; }
+    try { parsed = JSON.parse(parsed); } catch { /* Treat malformed JSON-like content as plain text. */ }
   }
   const texts: string[] = [];
   const detailImages: string[] = [];
+  const addText = (candidate: unknown) => {
+    const text = clean(candidate);
+    if (!text || /^https?:\/\//i.test(text) || texts.includes(text)) return;
+    texts.push(text);
+  };
+  const visitText = (candidate: unknown) => {
+    if (typeof candidate === "string") {
+      if (/^[\s]*[\[{]/.test(candidate)) {
+        try { visitText(JSON.parse(candidate)); return; } catch { /* Keep the original plain text. */ }
+      }
+      addText(candidate);
+      return;
+    }
+    if (Array.isArray(candidate)) {
+      candidate.forEach(visitText);
+      return;
+    }
+    if (!candidate || typeof candidate !== "object") return;
+    const record = candidate as Record<string, unknown>;
+    for (const key of ["text", "t", "content", "description", "text_content", "textContent"]) {
+      if (record[key] != null) visitText(record[key]);
+    }
+  };
+  visitText(parsed);
   for (const record of records(parsed)) {
-    const text = clean(record.text || record.t);
-    if (text && !texts.includes(text)) texts.push(text);
     for (const url of imageUrls(record.image || record)) {
       if (!detailImages.includes(url)) detailImages.push(url);
     }

@@ -2,6 +2,7 @@ import "server-only";
 
 import { Client, createLarkChannel, Domain, LoggerLevel, type LarkChannel } from "@larksuiteoapi/node-sdk";
 import { decryptSecret } from "@/lib/crypto";
+import { safeFeishuLogger } from "@/lib/feishu/safe-logger";
 import { getMediaRoot } from "@/lib/video-processing";
 import { registerFeishuHandlers } from "@/lib/feishu/handler";
 import { getFeishuSettings, getRawFeishuSettings, setFeishuConnectionStatus } from "@/lib/feishu/store";
@@ -59,6 +60,7 @@ export async function ensureFeishuConnection(force = false): Promise<LarkChannel
       domain: Domain.Feishu,
       transport: "websocket",
       loggerLevel: LoggerLevel.warn,
+      logger: safeFeishuLogger,
       handshakeTimeoutMs: 15_000,
       wsConfig: { pingTimeout: 15 },
       includeRawEvent: true,
@@ -122,6 +124,7 @@ export function getChatgptFeishuClient() {
       appSecret,
       domain: Domain.Feishu,
       loggerLevel: LoggerLevel.warn,
+      logger: safeFeishuLogger,
     });
     state.__chatgptFeishuClientSignature = signature;
   }

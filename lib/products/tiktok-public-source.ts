@@ -1,7 +1,8 @@
 import "server-only";
 
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, open, readFile, rename, stat } from "node:fs/promises";
+import { copyFile, mkdir, open, readFile, rename, stat } from "node:fs/promises";
+import { constants } from "node:fs";
 import path from "node:path";
 import { fetchWithProxy } from "@/lib/network";
 import { CatalogError, object, validatePid } from "@/lib/products/catalog-types";
@@ -103,7 +104,7 @@ function descriptionEvidence(value: unknown) {
   };
   visitText(parsed);
   for (const record of records(parsed)) {
-    for (const url of imageUrls(record.image || record)) {
+    for (const url of imageUrls(record.image || record).slice(0, 1)) {
       if (!detailImages.includes(url)) detailImages.push(url);
     }
   }
@@ -121,6 +122,28 @@ function skuName(sku: Record<string, unknown>) {
     .join(" / ");
 }
 
+/** September 2026 PDP component data; never select recommendation/review records. */
+function modernProduct(info: Record<string, unknown>) {
+  return {
+    ...info,
+    name: info.title,
+    description: info.desc_blocks,
+    product_properties: (Array.isArray(info.specifications) ? info.specifications : []).map(value => {
+      const item = object(value);
+      return { property_name: item.name, property_values: [{ property_value_name: item.value }] };
+    }),
+    skus: (Array.isArray(info.skus) ? info.skus : []).map(value => {
+      const sku = object(value);
+      return {
+        ...sku,
+        sku_name: (Array.isArray(sku.sku_sale_props) ? sku.sku_sale_props : [])
+          .map(part => clean(object(part).prop_value)).filter(Boolean).join(" / "),
+        sku_quantity: { available_quantity: sku.stock },
+      };
+    }),
+  };
+}
+
 /**
  * Normalize the exact-PID public router payload into the same source shape used
  * by the hand-card catalog. Main-gallery and SKU images remain metadata only;
@@ -129,12 +152,23 @@ function skuName(sku: Record<string, unknown>) {
 export function parsePublicTikTokProductHtml(html: string, expectedPid: string, sourceUrl = "") {
   const pid = validatePid(expectedPid);
   const routerData = embeddedJson(html, "__MODERN_ROUTER_DATA__");
-  if (!routerData) throw new CatalogError("TikTok 公开商品页没有返回可解析的详情数据");
+  if (!routerData) {
+    if (/<title[^>]*>\s*Security Check\s*<\/title>/i.test(html)) {
+      throw new CatalogError("TikTok 返回安全验证页，未取得商品资料");
+    }
+    throw new CatalogError("TikTok 公开商品页没有返回可解析的详情数据");
+  }
   const all = records(routerData);
   const models = all.flatMap(record => {
     const model = record.product_model;
     return model && typeof model === "object" ? [model as Record<string, unknown>] : [];
   }).filter(model => clean(model.product_id) === pid && clean(model.name));
+  const modern = all.flatMap(record => {
+    const info = object(record.product_info);
+    return info.product_id === pid && typeof info.title === "string" && info.title.trim()
+      && Array.isArray(info.desc_blocks) ? [modernProduct(info)] : [];
+  });
+  models.unshift(...modern);
   const product = models.sort((left, right) => {
     const score = (item: Record<string, unknown>) => ["description", "images", "skus", "product_properties"]
       .filter(key => item[key] != null).length;
@@ -143,9 +177,10 @@ export function parsePublicTikTokProductHtml(html: string, expectedPid: string, 
   if (!product) throw new CatalogError("TikTok 公开商品页没有找到与 PID 完全匹配的商品资料");
 
   const sellerId = clean(product.seller_id);
+  const ownShop = object(product.seller);
   const shop = all.find(record => clean(record.shop_name) && (
     clean(record.seller_id) === sellerId || clean(record.shop_id) === sellerId
-  )) || all.find(record => clean(record.shop_name));
+  ));
   const description = descriptionEvidence(product.description);
   const mainImages = (Array.isArray(product.images) ? product.images : [])
     .flatMap(imageUrls)
@@ -165,11 +200,11 @@ export function parsePublicTikTokProductHtml(html: string, expectedPid: string, 
     const name = skuName(sku);
     const id = clean(sku.sku_id || sku.id);
     const quantity = object(sku.sku_quantity).available_quantity;
-    const price = object(priceBySku[id]);
+    const price = Object.keys(object(sku.price)).length ? object(sku.price) : object(priceBySku[id]);
     return name ? [{
       sku_id: id,
       sku_name: name,
-      available_quantity: Number.isFinite(Number(quantity)) ? Number(quantity) : null,
+      available_quantity: quantity != null && Number.isFinite(Number(quantity)) ? Number(quantity) : null,
       price: clean(price.sale_price_decimal || price.sale_price_format),
       currency: clean(price.currency_name || price.currency_symbol),
       sku_image: imageUrls(sku.sku_image)[0] || "",
@@ -185,7 +220,7 @@ export function parsePublicTikTokProductHtml(html: string, expectedPid: string, 
     product_images: mainImages.map(url => ({ url })),
     product_specifications: specifications,
     product_skus: skus,
-    shop_name: clean(shop?.shop_name),
+    shop_name: clean(ownShop.seller_id === sellerId ? ownShop.name : shop?.shop_name),
     seller_id: sellerId,
     _catalog_source: "tiktok-public",
     _source_url: sourceUrl || tiktokProductUrlFromPid(pid),
@@ -247,10 +282,47 @@ export async function cachedPublicProduct(pid: string) {
   return product;
 }
 
+/** Reparse only a checksummed saved response; never performs an HTTP request. */
+export async function recoverPublicProductFromSavedPage(pid: string, apply = false) {
+  const normalized = validatePid(pid);
+  const directory = publicCatalogDirectory(normalized);
+  const receiptPath = path.join(directory, "receipt.json");
+  const receipt = object(await readJson(receiptPath));
+  if (receipt.pid !== normalized || receipt.source !== "tiktok-public" || receipt.state !== "failed") {
+    throw new CatalogError("没有可恢复的失败商品页面");
+  }
+  const file = path.join(directory, "response.html");
+  if ((await stat(file)).size > MAX_PUBLIC_RESPONSE_BYTES) throw new CatalogError("TikTok 公开商品缓存过大");
+  const body = await readFile(file);
+  if (!receipt.responseSha256 || hash(body) !== receipt.responseSha256) {
+    throw new CatalogError("TikTok 原始商品页面校验失败，已停止恢复");
+  }
+  const product = parsePublicTikTokProductHtml(body.toString("utf8"), normalized,
+    typeof receipt.finalUrl === "string" ? receipt.finalUrl : tiktokProductUrlFromPid(normalized));
+  if (!apply) return product;
+  // Keep the failed receipt and original HTML for audit/recovery. Repeated recovery
+  // after an interrupted write publishes the same checksummed product.
+  await copyFile(receiptPath, path.join(directory, "receipt.before-reparse.json"), constants.COPYFILE_EXCL)
+    .catch(error => { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; });
+  const productBody = JSON.stringify(product);
+  await savePrivate(path.join(directory, "product.json"), productBody);
+  await savePrivate(receiptPath, JSON.stringify({
+    ...receipt, state: "ready", productSha256: hash(productBody),
+    recoveredAt: new Date().toISOString(), recovery: "saved-page-pdp-components-v1",
+  }));
+  return product;
+}
+
 /** One public-page capture per PID. A verified failure is reused by fallback logic. */
 export async function fetchPublicProductOnce(pid: string) {
   const normalized = validatePid(pid);
-  const existing = await cachedPublicProduct(normalized);
+  let existing;
+  try { existing = await cachedPublicProduct(normalized); }
+  catch {
+    // Even failed snapshots can become readable after a parser update. Never
+    // clear the request marker or fall through to another network capture.
+    return recoverPublicProductFromSavedPage(normalized, true);
+  }
   if (existing) return existing;
   const directory = publicCatalogDirectory(normalized);
   await mkdir(directory, { recursive: true, mode: 0o700 });
@@ -266,7 +338,7 @@ export async function fetchPublicProductOnce(pid: string) {
   } finally { await marker.close(); }
 
   const requestedUrl = tiktokProductUrlFromPid(normalized);
-  let response: Response;
+  let response: Response | undefined;
   let body = Buffer.alloc(0);
   try {
     response = await fetchWithProxy(requestedUrl, {
@@ -303,6 +375,8 @@ export async function fetchPublicProductOnce(pid: string) {
       source: "tiktok-public",
       state: "failed",
       requestedUrl,
+      ...(response ? { httpStatus: response.status, finalUrl: response.url } : {}),
+      errorMessage: error instanceof CatalogError ? error.message : "TikTok 公开商品页读取失败",
       fetchedAt: new Date().toISOString(),
       responseBytes: body.length,
       responseSha256: body.length ? hash(body) : "",

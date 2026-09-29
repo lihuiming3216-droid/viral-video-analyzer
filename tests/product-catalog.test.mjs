@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, mkdir, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import ts from "typescript";
@@ -126,8 +127,66 @@ test("public TikTok source verifies exact PID, caches one capture and never retr
   const other = "1732350695360139846";
   globalThis.__catalogFetch = async () => { calls++; return new Response(publicProductHtml(fixturePid), { status: 200 }); };
   await assert.rejects(file.fetchPublicProductOnce(other), /PID/);
-  await assert.rejects(file.fetchPublicProductOnce(other), /不可用/);
+  await assert.rejects(file.fetchPublicProductOnce(other), /PID/);
   assert.equal(calls, 2);
+});
+
+function modernHtml(pid) {
+  return `<script id="__MODERN_ROUTER_DATA__">${JSON.stringify({ loaderData: { page: {
+    product: { product_model: { product_id: pid, seller_id: "seller-1" } },
+    page_config: { components_map: { "3": { component_data: { product_info: {
+      product_id: pid, seller_id: "seller-1", title: "OTG flash drive",
+      images: [{ url_list: ["https://p16.ttcdn-us.com/main.webp"] }],
+      desc_blocks: [
+        { type: "text", text: "No additional app needed." },
+        { type: "ul", content: ["Use File Management.", "Download cloud files first."] },
+        { type: "image", image: { url_list: ["https://p16.ttcdn-us.com/detail.webp", "https://p19.ttcdn-us.com/detail.webp"] } },
+      ],
+      specifications: [{ name: "Material", value: "Metal" }],
+      seller: { seller_id: "seller-1", name: "Exact shop" },
+      skus: [{ sku_id: "sku-1", stock: 0, sku_sale_props: [{ prop_value: "128GB" }],
+        price: { sale_price_decimal: "18.19", currency_name: "USD" } }],
+    } } } } },
+    recommendations: [{ product_id: "99999999", title: "Wrong product", desc_blocks: [] }],
+  } } })}</script>`;
+}
+
+test("component product_info preserves description lists, detail-only images, SKU price and exact seller", async t => {
+  const file = await publicSource(t);
+  const product = file.parsePublicTikTokProductHtml(modernHtml(fixturePid), fixturePid);
+  assert.equal(product.product_name, "OTG flash drive");
+  assert.equal(product.product_description, "No additional app needed.\nUse File Management.\nDownload cloud files first.");
+  assert.equal(product.shop_name, "Exact shop");
+  assert.deepEqual(product.product_specifications, [{ name: "Material", value: "Metal" }]);
+  assert.deepEqual(product.product_detail_images, [{ url: "https://p16.ttcdn-us.com/detail.webp" }]);
+  assert.equal(product.product_skus[0].sku_name, "128GB");
+  assert.equal(product.product_skus[0].available_quantity, 0);
+  assert.equal(product.product_skus[0].price, "18.19");
+  assert.equal(product.product_skus[0].currency, "USD");
+  assert.throws(() => file.parsePublicTikTokProductHtml(modernHtml(fixturePid), "99999999"), /PID/);
+  assert.throws(() => file.parsePublicTikTokProductHtml("<title>Security Check</title>", fixturePid), /安全验证/);
+});
+
+test("failed exact-PID saved pages recover with checksum and no repeated HTTP; corrupted pages stay blocked", async t => {
+  const file = await publicSource(t);
+  const dir = file.publicCatalogDirectory(fixturePid);
+  await mkdir(dir, { recursive: true });
+  const html = modernHtml(fixturePid);
+  const receipt = JSON.stringify({ pid: fixturePid, source: "tiktok-public", state: "failed",
+    responseSha256: createHash("sha256").update(html).digest("hex"), automaticRetries: 0 });
+  await writeFile(path.join(dir, "response.html"), html);
+  await writeFile(path.join(dir, "receipt.json"), receipt);
+  await writeFile(path.join(dir, "request-started.json"), "{}");
+  await file.recoverPublicProductFromSavedPage(fixturePid);
+  assert.equal(await readFile(path.join(dir, "receipt.json"), "utf8"), receipt);
+  assert.equal((await file.fetchPublicProductOnce(fixturePid)).product_name, "OTG flash drive");
+  assert.equal((await file.cachedPublicProduct(fixturePid)).product_id, fixturePid);
+  assert.equal(await readFile(path.join(dir, "receipt.before-reparse.json"), "utf8"), receipt);
+  assert.equal(await readFile(path.join(dir, "request-started.json"), "utf8"), "{}");
+  await writeFile(path.join(dir, "receipt.json"), receipt);
+  await writeFile(path.join(dir, "response.html"), html + "tampered");
+  await assert.rejects(file.fetchPublicProductOnce(fixturePid), /校验/);
+  assert.equal(await readFile(path.join(dir, "receipt.json"), "utf8"), receipt);
 });
 
 test("PID identity is exact, textual and unambiguous; no URL/name guesses", () => {

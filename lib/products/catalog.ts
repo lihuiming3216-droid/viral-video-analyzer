@@ -39,9 +39,9 @@ async function cachedCatalogProduct(pid: string): Promise<Record<string, unknown
 async function fetchCatalogProductOnce(pid: string): Promise<Record<string, unknown>> {
   try {
     return await fetchPublicProductOnce(pid);
-  } catch {
+  } catch (error) {
     if (process.env.CHUHAIJIANG_FALLBACK_ENABLED !== "true") {
-      throw new CatalogError("TikTok公开商品资料不可用；出海匠付费备选当前已停用");
+      throw new CatalogError(`${catalogError(error)}；出海匠付费备选当前已停用`);
     }
     if (!process.env.CHUHAIJIANG_API_KEY?.trim()) {
       throw new CatalogError("TikTok公开商品资料不可用，且未配置出海匠备选接口");

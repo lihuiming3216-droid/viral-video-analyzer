@@ -2,6 +2,7 @@ import "server-only";
 
 import { timingSafeEqual } from "node:crypto";
 import { Client, Domain, LoggerLevel } from "@larksuiteoapi/node-sdk";
+import { safeFeishuLogger } from "@/lib/feishu/safe-logger";
 
 export type ChatgptActionKind = "handcard" | "video";
 
@@ -82,6 +83,7 @@ export function getChatgptFeishuClient() {
       appSecret,
       domain: Domain.Feishu,
       loggerLevel: LoggerLevel.warn,
+      logger: safeFeishuLogger,
     });
     state.__chatgptFeishuClientSignature = signature;
   }

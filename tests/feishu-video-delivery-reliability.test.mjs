@@ -1,183 +1,67 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
-import ts from "typescript";
-
-const databaseSource = await readFile(
-  new URL("../lib/database.ts", import.meta.url),
-  "utf8",
-);
-const automationSource = await readFile(
-  new URL("../lib/feishu/automation.ts", import.meta.url),
-  "utf8",
-);
-const instrumentationSource = await readFile(
-  new URL("../instrumentation.ts", import.meta.url),
-  "utf8",
-);
-
-async function loadDatabaseModule(dataRoot) {
-  let compiled = ts.transpileModule(databaseSource, {
-    compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
-  }).outputText;
-  compiled = compiled
-    .replace('import "server-only";', "")
-    .replace(
-      'const dataRoot = path.join(process.cwd(), ".data");',
-      `const dataRoot = ${JSON.stringify(dataRoot)};`,
-    );
-  return import(`data:text/javascript;base64,${Buffer.from(compiled).toString("base64")}`);
-}
-
-async function loadAutomationModule() {
-  const stubSource = `
-    const hooks = () => globalThis.__feishuVideoDeliveryTestHooks || {};
-    export const claimFeishuProductCardDocument = () => true;
-    export const clearProductDocumentLink = () => false;
-    export const createProduct = () => null;
-    export const createVideo = () => null;
-    export const deleteFeishuAutomationJob = (...args) => hooks().deleteFeishuAutomationJob?.(...args);
-    export const getFeishuAutomationJobs = (...args) => hooks().getFeishuAutomationJobs?.(...args) || [];
-    export const listFeishuAutomationJobVideoIds = (...args) => hooks().listFeishuAutomationJobVideoIds?.(...args) || [];
-    export const getFeishuProductCardMapping = (...args) => hooks().getFeishuProductCardMapping?.(...args) || null;
-    export const getProduct = (...args) => hooks().getProduct?.(...args) || null;
-    export const getProductByPid = () => null;
-    export const mergeVerifiedProductFacts = () => null;
-    export const getVideo = (...args) => hooks().getVideo?.(...args) || null;
-    export const getVideoBySourceUrl = () => null;
-    export const saveFeishuAutomationJob = () => undefined;
-    export const updateProduct = () => null;
-    export const updateVideo = () => null;
-    export const upsertFeishuProductCardMapping = () => null;
-    export const ensureFeishuConnection = (...args) => hooks().ensureFeishuConnection?.(...args) || null;
-    export const getConnectedFeishuChannel = (...args) => hooks().getConnectedFeishuChannel?.(...args) || null;
-    export const ensureProductCardByPid = () => null;
-    export const syncProductCardManagedFields = () => null;
-    export const enqueueVideos = () => undefined;
-    export const extractProductIdFromUrl = () => "";
-    export const isExactTikTokProductSource = () => false;
-    export const parsePublicProductPage = () => null;
-    export const conciseProductDocAnalysis = (...args) => hooks().conciseProductDocAnalysis?.(...args) || "分析摘要";
-    export const isTikTokUrl = () => false;
-  `;
-  const stubUrl = `data:text/javascript;base64,${Buffer.from(stubSource).toString("base64")}`;
-  let compiled = ts.transpileModule(automationSource, {
-    compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
-  }).outputText;
-  compiled = compiled
-    .replace('import "server-only";', "")
-    .replaceAll('"@/lib/database"', JSON.stringify(stubUrl))
-    .replaceAll('"@/lib/feishu/runtime"', JSON.stringify(stubUrl))
-    .replaceAll('"@/lib/feishu/document"', JSON.stringify(stubUrl))
-    .replaceAll('"@/lib/queue"', JSON.stringify(stubUrl))
-    .replaceAll('"@/lib/product-parser"', JSON.stringify(stubUrl))
-    .replaceAll('"@/lib/product-doc-analysis"', JSON.stringify(stubUrl))
-    .replaceAll('"@/lib/tiktok-product"', JSON.stringify(stubUrl));
-  return import(`data:text/javascript;base64,${Buffer.from(compiled).toString("base64")}`);
-}
-
-test("legacy video jobs migrate to per-Base-row deliveries without overwriting", async () => {
-  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "viral-video-deliveries-"));
-  const dataRoot = path.join(temporaryRoot, ".data");
-  await mkdir(dataRoot, { recursive: true });
-  delete globalThis.__viralDb;
-  const database = await loadDatabaseModule(dataRoot);
-  try {
-    const product = database.createProduct({ name: "迁移测试产品" });
-    const video = database.createVideo({
-      productId: product.id,
-      sourceType: "tiktok",
-      sourceUrl: "https://www.tiktok.com/@creator/video/7000000000000000001",
-    });
-    const db = database.getDb();
-    db.exec(`
-      DROP TABLE feishu_automation_jobs;
-      CREATE TABLE feishu_automation_jobs (
-        video_id TEXT PRIMARY KEY REFERENCES videos(id) ON DELETE CASCADE,
-        app_token TEXT NOT NULL,
-        table_id TEXT NOT NULL,
-        record_id TEXT NOT NULL,
-        field_map_json TEXT NOT NULL DEFAULT '{}',
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-    `);
-    db.prepare(`INSERT INTO feishu_automation_jobs(
-      video_id, app_token, table_id, record_id, field_map_json, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?)`)
-      .run(video.id, "app-a", "table-a", "record-a", '{"status":"旧状态"}', "2026-08-01T00:00:00.000Z", "2026-08-01T00:00:00.000Z");
-    db.close();
-    delete globalThis.__viralDb;
-
-    const migrated = database.getFeishuAutomationJobs(video.id);
-    assert.equal(migrated.length, 1);
-    assert.equal(migrated[0].recordId, "record-a");
-    assert.equal(migrated[0].fieldMap.status, "旧状态");
-
-    database.saveFeishuAutomationJob({
-      videoId: video.id,
-      appToken: "app-b",
-      tableId: "table-b",
-      recordId: "record-b",
-      fieldMap: { status: "B状态" },
-    });
-    database.saveFeishuAutomationJob({
-      videoId: video.id,
-      appToken: "app-a",
-      tableId: "table-a",
-      recordId: "record-a",
-      fieldMap: { status: "A新状态", webhookSecret: "must-not-persist" },
-    });
-    const jobs = database.getFeishuAutomationJobs(video.id);
-    assert.equal(jobs.length, 2, "the same video must retain both Base-row deliveries");
-    assert.deepEqual(database.listFeishuAutomationJobVideoIds(), [video.id], "pending video IDs must be distinct");
-    assert.equal(jobs.find((job) => job.recordId === "record-a").fieldMap.status, "A新状态");
-    assert.equal(jobs.find((job) => job.recordId === "record-a").createdAt, "2026-08-01T00:00:00.000Z");
-    assert.doesNotMatch(JSON.stringify(jobs), /must-not-persist|webhookSecret/);
-
-    const primaryKey = database.getDb().prepare("PRAGMA table_info(feishu_automation_jobs)").all()
-      .filter((column) => Number(column.pk) > 0)
-      .sort((left, right) => Number(left.pk) - Number(right.pk))
-      .map((column) => String(column.name));
-    assert.deepEqual(primaryKey, ["video_id", "app_token", "table_id", "record_id"]);
-
-    const newer = database.createVideo({
-      productId: product.id,
-      sourceType: "tiktok",
-      sourceUrl: "https://www.tiktok.com/@creator/video/7000000000000000002",
-    });
-    database.saveFeishuAutomationJob({
-      videoId: newer.id,
-      appToken: "app-a",
-      tableId: "table-a",
-      recordId: "record-a",
-      fieldMap: { status: "最新任务" },
-    });
-    assert.deepEqual(
-      database.getFeishuAutomationJobs(video.id).map((job) => job.recordId),
-      ["record-b"],
-      "a newer click must supersede the older task for the same Base row",
-    );
-    assert.equal(database.getFeishuAutomationJobs(newer.id)[0].fieldMap.status, "最新任务");
-    database.deleteFeishuAutomationJob(database.getFeishuAutomationJobs(newer.id)[0]);
-
-    database.deleteFeishuAutomationJob(jobs.find((job) => job.recordId === "record-a"));
-    const remaining = database.getFeishuAutomationJobs(video.id);
-    assert.deepEqual(remaining.map((job) => job.recordId), ["record-b"], "one success must only delete its own delivery");
-    assert.deepEqual(database.listFeishuAutomationJobVideoIds(), [video.id], "one remaining row keeps the video pending");
-    database.deleteFeishuAutomationJob(remaining[0]);
-    assert.deepEqual(database.listFeishuAutomationJobVideoIds(), []);
-  } finally {
-    try { database.getDb().close(); } catch { /* already closed */ }
-    delete globalThis.__viralDb;
-    await rm(temporaryRoot, { recursive: true, force: true });
-  }
+import { createIsolatedDatabase } from "./helpers/isolated-mysql.mjs";
+import { loadAutomationFixture } from "./helpers/automation-fixture.mjs";
+const instrumentationSource = await readFile(new URL("../instrumentation.ts", import.meta.url), "utf8");
+const automationSource = await readFile(new URL("../lib/feishu/automation.ts", import.meta.url), "utf8");
+test("MySQL per-Base-row deliveries preserve metadata and supersede only the matching row", async (t) => {
+  const { database: db, pool, rows, reapplySchema } = await createIsolatedDatabase(t);
+  const product = await db.createProduct({ name: "delivery fixture" });
+  const video = await db.createVideo({ productId: product.id, sourceType: "tiktok", sourceUrl: "https://example.test/one" });
+  const first = { videoId: video.id, appToken: "app-a", tableId: "table-a", recordId: "record-a" };
+  const second = { ...first, appToken: "app-b", tableId: "table-b", recordId: "record-b" };
+  await db.saveFeishuAutomationJob({ ...first, fieldMap: { status: "旧状态" } });
+  await pool.query("UPDATE feishu_automation_jobs SET created_at='2026-08-01T00:00:00.000Z' WHERE video_id=?", [video.id]);
+  await reapplySchema();
+  assert.equal((await db.getFeishuAutomationJobs(video.id))[0].fieldMap.status, "旧状态");
+  await db.saveFeishuAutomationJob({ ...second, fieldMap: { status: "B状态" } });
+  await db.saveFeishuAutomationJob({ ...first, fieldMap: { status: "A新状态", webhookSecret: "must-not-persist" } });
+  const jobs = await db.getFeishuAutomationJobs(video.id);
+  assert.equal(jobs.length, 2);
+  assert.deepEqual(await db.listFeishuAutomationJobVideoIds(), [video.id]);
+  assert.equal(jobs.find(j => j.recordId === "record-a").fieldMap.status, "A新状态");
+  assert.equal(jobs.find(j => j.recordId === "record-a").createdAt, "2026-08-01T00:00:00.000Z");
+  assert.doesNotMatch(JSON.stringify(jobs), /must-not-persist|webhookSecret/);
+  assert.deepEqual((await rows("SHOW INDEX FROM feishu_automation_jobs")).filter(i => i.Key_name === "PRIMARY").sort((a, b) => a.Seq_in_index - b.Seq_in_index).map(i => i.Column_name), ["video_id", "app_token", "table_id", "record_id"]);
+  const newer = await db.createVideo({ productId: product.id, sourceType: "tiktok", sourceUrl: "https://example.test/two" });
+  await db.saveFeishuAutomationJob({ ...first, videoId: newer.id, fieldMap: { status: "最新任务" } });
+  assert.deepEqual((await db.getFeishuAutomationJobs(video.id)).map(j => j.recordId), ["record-b"]);
+  assert.equal((await db.getFeishuAutomationJobs(newer.id))[0].fieldMap.status, "最新任务");
+  await db.deleteFeishuAutomationJob({ ...first, videoId: newer.id });
+  await db.deleteFeishuAutomationJob(first);
+  assert.deepEqual((await db.getFeishuAutomationJobs(video.id)).map(j => j.recordId), ["record-b"]);
+  await db.deleteFeishuAutomationJob(second);
+  assert.deepEqual(await db.listFeishuAutomationJobVideoIds(), []);
 });
-
-const automation = await loadAutomationModule();
-
+// These cases exercise orchestration with fake Feishu responses. SQL durability
+// and delayed retries are exercised separately against real MySQL above.
+const hooks = new Proxy({}, { get: (_target, name) => {
+    const h = globalThis.__feishuVideoDeliveryTestHooks || {};
+    if (name === "getVideo")
+      return (...args) => { const v = h.getVideo?.(...args); return v ? { transcriptOriginal: "", transcriptSegments: [], attemptCount: 0, analysisMode: v.status === "failed" ? "product_doc" : "full", ...v } : null; };
+    if (name === "getFeishuAutomationJobs")
+      return (...args) => (h.getFeishuAutomationJobs?.(...args) || []).map(job => ({ ...job, attempts: job.attempts || 0, fieldMap: { ...Object.fromEntries(Object.keys(automation.defaultFeishuAutomationFieldMap).map(k => [k, ""])), status: "分析状态", productDocument: "产品手卡", analysis: "视频分析", translation: h.getVideo?.(job.videoId)?.transcriptZh ? "中文翻译" : "", ...job.fieldMap } }));
+    if (name === "getConnectedFeishuChannel")
+      return () => {
+        const channel = h.getConnectedFeishuChannel?.();
+        return channel ? { ...channel, rawClient: { request: async (req) => {
+              if (req.url.endsWith("/fields"))
+                return { code: 0, data: { items: Object.values(automation.defaultFeishuAutomationFieldMap).map(field_name => ({ field_name })) } };
+              if (req.method === "GET")
+                return { code: 0, data: { record: { fields: {} } } };
+              return channel.rawClient.request(req);
+            } } } : null;
+      };
+    if (name === "getFeishuProductCardMapping")
+      return h[name] || (() => null);
+    if (name === "incrementFeishuAutomationJobAttempts")
+      return () => { };
+    if (name === "listVideoStages")
+      return () => [];
+    return h[name];
+  } });
+const automation = await loadAutomationFixture({ after: callback => test.after(callback) }, hooks);
 function delivery(recordId) {
   return {
     videoId: "video-1",
@@ -189,7 +73,6 @@ function delivery(recordId) {
     updatedAt: "2026-08-12T00:00:00.000Z",
   };
 }
-
 test("completion retries each Base delivery and deletes successful rows independently", async () => {
   const pending = new Map([["record-a", delivery("record-a")], ["record-b", delivery("record-b")]]);
   const attempts = new Map();
@@ -210,29 +93,22 @@ test("completion retries each Base delivery and deletes successful rows independ
           const count = (attempts.get(recordId) || 0) + 1;
           attempts.set(recordId, count);
           writes.push({ recordId, fields: data.fields });
-          if (recordId === "record-a" && count < 3) throw new Error("temporary network failure");
+          if (recordId === "record-a" && count < 3)
+            throw new Error("temporary network failure");
           return { code: 0 };
         },
       },
     }),
     deleteFeishuAutomationJob: (job) => pending.delete(job.recordId),
   };
-
   const completed = await automation.completeFeishuAutomation("video-1");
   assert.equal(completed, true);
   assert.equal(attempts.get("record-a"), 3);
   assert.equal(attempts.get("record-b"), 1);
   assert.equal(pending.size, 0);
-  assert.equal(
-    writes.find((write) => write.recordId === "record-a").fields.产品手卡,
-    "https://feishu.cn/docx/record-a",
-  );
-  assert.equal(
-    writes.find((write) => write.recordId === "record-b").fields.产品手卡,
-    "https://feishu.cn/docx/record-b",
-  );
+  assert.equal(writes.find((write) => write.recordId === "record-a").fields.产品手卡, "https://feishu.cn/docx/record-a");
+  assert.equal(writes.find((write) => write.recordId === "record-b").fields.产品手卡, "https://feishu.cn/docx/record-b");
 });
-
 test("a superseded Base-row job is rechecked under the row lock and never written", async () => {
   let reads = 0;
   let writes = 0;
@@ -246,11 +122,9 @@ test("a superseded Base-row job is rechecked under the row lock and never writte
       rawClient: { request: async () => { writes += 1; return { code: 0 }; } },
     }),
   };
-
   assert.equal(await automation.completeFeishuAutomation("video-1"), true);
   assert.equal(writes, 0, "the older completion must not overwrite the newer row generation");
 });
-
 test("the worker redelivers an exhausted terminal job on its later startup pass", async () => {
   const pending = new Map([["record-a", delivery("record-a")], ["record-b", delivery("record-b")]]);
   let allowRecordA = false;
@@ -270,7 +144,8 @@ test("the worker redelivers an exhausted terminal job on its later startup pass"
         request: async ({ url }) => {
           const recordId = url.includes("record-a") ? "record-a" : "record-b";
           attempts.set(recordId, (attempts.get(recordId) || 0) + 1);
-          if (recordId === "record-a" && !allowRecordA) throw new Error("temporary write failure");
+          if (recordId === "record-a" && !allowRecordA)
+            throw new Error("temporary write failure");
           if (recordId === "record-a") {
             reportWorkerWriteStarted();
             await workerWriteGate;
@@ -281,12 +156,10 @@ test("the worker redelivers an exhausted terminal job on its later startup pass"
     }),
     deleteFeishuAutomationJob: (job) => pending.delete(job.recordId),
   };
-
   assert.equal(await automation.completeFeishuAutomation("video-1"), false);
   assert.deepEqual([...pending.keys()], ["record-a"]);
   assert.equal(attempts.get("record-a"), 3, "a failing delivery must have a bounded attempt count");
   assert.equal(attempts.get("record-b"), 1, "later deliveries must still run after an earlier failure");
-
   allowRecordA = true;
   const originalSetTimeout = globalThis.setTimeout;
   const originalSetInterval = globalThis.setInterval;
@@ -304,16 +177,16 @@ test("the worker redelivers an exhausted terminal job on its later startup pass"
   try {
     automation.startFeishuAutomationDeliveryWorker();
     automation.startFeishuAutomationDeliveryWorker();
-  } finally {
+  }
+  finally {
     globalThis.setTimeout = originalSetTimeout;
     globalThis.setInterval = originalSetInterval;
   }
   assert.equal(scheduledTimeouts.length, 1, "worker startup must be a process-wide singleton");
-  assert.equal(scheduledTimeouts[0].delay, 2_500);
+  assert.equal(scheduledTimeouts[0].delay, 2500);
   assert.equal(scheduledIntervals.length, 1);
-  assert.ok(scheduledIntervals[0].delay >= 5_000);
+  assert.ok(scheduledIntervals[0].delay >= 5000);
   assert.equal(unrefCalls, 2, "both worker timers must be unref'd");
-
   const initialPass = scheduledTimeouts[0].callback();
   await workerWriteStarted;
   const overlappingIntervalPass = scheduledIntervals[0].callback();
@@ -325,7 +198,6 @@ test("the worker redelivers an exhausted terminal job on its later startup pass"
   delete globalThis.__feishuAutomationDeliveryTimer;
   delete globalThis.__feishuAutomationDeliveryRunning;
 });
-
 test("a delivery pass scans persisted jobs but skips videos that are not terminal", async () => {
   const calls = [];
   const pending = new Map([
@@ -347,14 +219,12 @@ test("a delivery pass scans persisted jobs but skips videos that are not termina
     }),
     deleteFeishuAutomationJob: (job) => pending.delete(job.recordId),
   };
-
   const result = await automation.runFeishuAutomationDeliveryPass();
   assert.deepEqual(result, { pendingVideos: 3, terminalVideos: 1, deliveredVideos: 1 });
   assert.equal(calls.length, 1);
   assert.equal(pending.has("terminal-row"), false);
   assert.equal(pending.has("active-row"), true, "a processing video must remain pending for a later scan");
 });
-
 test("failed-video delivery redacts credentials before writing to Base", async () => {
   const pending = new Map([["record-a", delivery("record-a")]]);
   let writtenFields;
@@ -374,13 +244,11 @@ test("failed-video delivery redacts credentials before writing to Base", async (
     }),
     deleteFeishuAutomationJob: (job) => pending.delete(job.recordId),
   };
-
   assert.equal(await automation.completeFeishuAutomation("video-1"), true);
   assert.match(writtenFields.视频分析, /已隐藏/);
   assert.doesNotMatch(JSON.stringify(writtenFields), /sk-secret-value|also-secret|Bearer/i);
   assert.equal(pending.size, 0);
 });
-
 test("Node instrumentation starts the durable Feishu delivery worker", () => {
   assert.match(instrumentationSource, /import\("@\/lib\/feishu\/automation"\)/);
   assert.match(instrumentationSource, /startFeishuAutomationDeliveryWorker\(\)/);

@@ -1,8 +1,11 @@
 import "server-only";
 
-import { Client, createLarkChannel, Domain, LoggerLevel, type LarkChannel } from "@larksuiteoapi/node-sdk";
+import { createHash } from "node:crypto";
+import { createLarkChannel, Domain, LoggerLevel, type LarkChannel } from "@larksuiteoapi/node-sdk";
+export { getChatgptFeishuClient } from "@/lib/feishu/chatgpt-app";
 import { decryptSecret } from "@/lib/crypto";
 import { safeFeishuLogger } from "@/lib/feishu/safe-logger";
+import { feishuHttp } from "@/lib/feishu/http";
 import { getMediaRoot } from "@/lib/video-processing";
 import { registerFeishuHandlers } from "@/lib/feishu/handler";
 import { getFeishuSettings, getRawFeishuSettings, setFeishuConnectionStatus } from "@/lib/feishu/store";
@@ -11,8 +14,6 @@ type RuntimeGlobal = typeof globalThis & {
   __feishuChannel?: LarkChannel | null;
   __feishuSignature?: string;
   __feishuConnectPromise?: Promise<LarkChannel | null> | null;
-  __chatgptFeishuClient?: Client;
-  __chatgptFeishuClientSignature?: string;
 };
 
 const state = globalThis as RuntimeGlobal;
@@ -30,7 +31,7 @@ async function credentials() {
 }
 
 function signature(appId: string, appSecret: string) {
-  return `${appId}:${appSecret.slice(-8)}`;
+  return createHash("sha256").update(appId).update("\0").update(appSecret).digest("hex");
 }
 
 async function disconnectCurrent() {
@@ -42,6 +43,12 @@ async function disconnectCurrent() {
 
 export async function ensureFeishuConnection(force = false): Promise<LarkChannel | null> {
   const config = await credentials();
+  if (state.__feishuConnectPromise) {
+    // Even forced restarts share an in-flight connect. Re-read the saved
+    // credentials afterward so a simultaneous settings change is not lost.
+    await state.__feishuConnectPromise.catch(() => undefined);
+    return ensureFeishuConnection(false);
+  }
   if (!config.enabled || !config.appId || !config.appSecret) {
     if (state.__feishuChannel) await disconnectCurrent();
     await setFeishuConnectionStatus("disconnected", "");
@@ -49,7 +56,6 @@ export async function ensureFeishuConnection(force = false): Promise<LarkChannel
   }
   const nextSignature = signature(config.appId, config.appSecret);
   if (!force && state.__feishuChannel && state.__feishuSignature === nextSignature) return state.__feishuChannel;
-  if (!force && state.__feishuConnectPromise) return state.__feishuConnectPromise;
 
   const connectPromise = (async () => {
     await disconnectCurrent();
@@ -61,6 +67,7 @@ export async function ensureFeishuConnection(force = false): Promise<LarkChannel
       transport: "websocket",
       loggerLevel: LoggerLevel.warn,
       logger: safeFeishuLogger,
+      httpInstance: feishuHttp,
       handshakeTimeoutMs: 15_000,
       wsConfig: { pingTimeout: 15 },
       includeRawEvent: true,
@@ -100,7 +107,7 @@ export async function ensureFeishuConnection(force = false): Promise<LarkChannel
   try {
     return await connectPromise;
   } finally {
-    state.__feishuConnectPromise = null;
+    if (state.__feishuConnectPromise === connectPromise) state.__feishuConnectPromise = null;
   }
 }
 
@@ -112,26 +119,8 @@ export function getConnectedFeishuChannel() {
   return state.__feishuChannel || null;
 }
 
-/** Dedicated client for the ChatGPT app's Base action deliveries. */
-export function getChatgptFeishuClient() {
-  const appId = (process.env.FEISHU_CHATGPT_APP_ID || "cli_aabd673313b85be").trim();
-  const appSecret = process.env.FEISHU_CHATGPT_APP_SECRET?.trim() || "";
-  if (!appId || !appSecret) throw new Error("chatgpt 飞书应用尚未配置");
-  const signature = `${appId}:${appSecret.slice(-8)}`;
-  if (!state.__chatgptFeishuClient || state.__chatgptFeishuClientSignature !== signature) {
-    state.__chatgptFeishuClient = new Client({
-      appId,
-      appSecret,
-      domain: Domain.Feishu,
-      loggerLevel: LoggerLevel.warn,
-      logger: safeFeishuLogger,
-    });
-    state.__chatgptFeishuClientSignature = signature;
-  }
-  return state.__chatgptFeishuClient;
-}
-
 export async function stopFeishuConnection() {
+  await state.__feishuConnectPromise?.catch(() => undefined);
   await disconnectCurrent();
   await setFeishuConnectionStatus("disconnected", "");
 }

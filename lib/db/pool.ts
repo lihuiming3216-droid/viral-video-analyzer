@@ -41,7 +41,12 @@ export async function getPool(): Promise<Pool> {
     });
   }
   if (!dbGlobal.__viralSchemaReady) {
-    dbGlobal.__viralSchemaReady = applySchemaOnce();
+    const pending = applySchemaOnce().catch(error => {
+      // A transient startup DB outage must not poison every later request.
+      if (dbGlobal.__viralSchemaReady === pending) dbGlobal.__viralSchemaReady = undefined;
+      throw error;
+    });
+    dbGlobal.__viralSchemaReady = pending;
   }
   await dbGlobal.__viralSchemaReady;
   return dbGlobal.__viralPool;

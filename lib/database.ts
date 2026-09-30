@@ -104,7 +104,13 @@ async function ensureSeeded(db: Queryable) {
 /** The shared MySQL pool, schema-applied and seed-data-populated exactly once per process. */
 export async function getDb() {
   const pool = await getPool();
-  if (!seeded) seeded = ensureSeeded(pool);
+  if (!seeded) {
+    const pending = ensureSeeded(pool).catch(error => {
+      if (seeded === pending) seeded = undefined;
+      throw error;
+    });
+    seeded = pending;
+  }
   await seeded;
   return pool;
 }
@@ -244,31 +250,10 @@ export async function claimFeishuProductCardDocument(
   const documentUrl = document.documentUrl?.trim();
   if (!documentId) throw new Error("缺少待认领的飞书产品手卡文档 ID");
   if (!documentUrl) throw new Error("缺少待认领的飞书产品手卡文档链接");
-  return withTransaction(async (db) => {
-    const current = await row(
-      db,
-      `SELECT document_id FROM feishu_product_card_mappings WHERE app_token=? AND table_id=? AND record_id=?`,
-      [appToken, tableId, recordId],
-    );
-    const timestamp = now();
-    if (current) {
-      await run(
-        db,
-        `UPDATE feishu_product_card_mappings SET document_id=?, document_url=?, updated_at=?
-         WHERE app_token=? AND table_id=? AND record_id=?`,
-        [documentId, documentUrl, timestamp, appToken, tableId, recordId],
-      );
-    } else {
-      await run(
-        db,
-        `INSERT INTO feishu_product_card_mappings(
-          app_token, table_id, record_id, document_id, document_url, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [appToken, tableId, recordId, documentId, documentUrl, timestamp, timestamp],
-      );
-    }
-    return true;
-  });
+  // The composite-key upsert is atomic, including two first-time claims.
+  // A SELECT followed by INSERT races even when wrapped in a transaction.
+  await upsertFeishuProductCardMapping({ appToken, tableId, recordId, documentId, documentUrl });
+  return true;
 }
 
 export interface FeishuAutomationJobKey {
@@ -283,6 +268,7 @@ export interface FeishuAutomationJob extends FeishuAutomationJobKey {
   credentialSource: "primary" | "chatgpt";
   attempts: number;
   blockedReason: string;
+  nextRetryAt?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -314,6 +300,7 @@ function feishuAutomationJobFromRow(source: Row): FeishuAutomationJob {
     credentialSource: source.credential_source === "chatgpt" ? "chatgpt" : "primary",
     attempts: Number(source.attempts ?? 0),
     blockedReason: String(source.blocked_reason || ""),
+    nextRetryAt: String(source.next_retry_at || ""),
     createdAt: String(source.created_at),
     updatedAt: String(source.updated_at),
   };
@@ -326,13 +313,13 @@ export async function saveFeishuAutomationJob(input: {
   recordId: string;
   fieldMap?: Record<string, string>;
   credentialSource?: "primary" | "chatgpt";
-}) {
+}, connection?: PoolConnection) {
   const timestamp = now();
   const videoId = input.videoId.trim();
   const appToken = input.appToken.trim();
   const tableId = input.tableId.trim();
   const recordId = input.recordId.trim();
-  await withTransaction(async (db) => {
+  const write = async (db: Queryable) => {
     // A Base row has exactly one current delivery generation. A later click
     // supersedes every older task for that row, while the same video may still
     // deliver independently to other Base rows.
@@ -362,7 +349,11 @@ export async function saveFeishuAutomationJob(input: {
     }
     await run(db, `DELETE FROM feishu_automation_delivery_blocks
       WHERE video_id=? AND app_token=? AND table_id=? AND record_id=?`, [videoId, appToken, tableId, recordId]);
-  });
+    await run(db, `DELETE FROM feishu_automation_delivery_retries
+      WHERE video_id=? AND app_token=? AND table_id=? AND record_id=?`, [videoId, appToken, tableId, recordId]);
+  };
+  if (connection) await write(connection);
+  else await withTransaction(write);
 }
 
 export async function getFeishuAutomationJob(videoId: string) {
@@ -373,9 +364,10 @@ export async function getFeishuAutomationJobs(videoId: string) {
   const db = await getDb();
   const found = await rows(
     db,
-    `SELECT j.*, b.reason AS blocked_reason, c.credential_source FROM feishu_automation_jobs j
+    `SELECT j.*, b.reason AS blocked_reason, c.credential_source, r.next_retry_at FROM feishu_automation_jobs j
       LEFT JOIN feishu_automation_delivery_blocks b USING (video_id, app_token, table_id, record_id)
       LEFT JOIN feishu_automation_job_clients c USING (video_id, app_token, table_id, record_id)
+      LEFT JOIN feishu_automation_delivery_retries r USING (video_id, app_token, table_id, record_id)
       WHERE j.video_id=? ORDER BY j.created_at, j.app_token, j.table_id, j.record_id`,
     [videoId],
   );
@@ -388,19 +380,31 @@ export async function listFeishuAutomationJobVideoIds() {
     db,
     `SELECT j.video_id, MIN(j.created_at) AS first_created_at FROM feishu_automation_jobs j
       LEFT JOIN feishu_automation_delivery_blocks b USING (video_id, app_token, table_id, record_id)
-      WHERE b.video_id IS NULL GROUP BY j.video_id ORDER BY first_created_at, j.video_id`,
+      LEFT JOIN feishu_automation_delivery_retries r USING (video_id, app_token, table_id, record_id)
+      WHERE b.video_id IS NULL AND (r.next_retry_at IS NULL OR r.next_retry_at<=?) GROUP BY j.video_id ORDER BY first_created_at, j.video_id`, [now()],
   );
   return found.map((item) => String(item.video_id));
 }
 
 export async function incrementFeishuAutomationJobAttempts(key: FeishuAutomationJobKey) {
-  const db = await getDb();
-  await run(
-    db,
-    `UPDATE feishu_automation_jobs SET attempts=attempts+1, updated_at=?
-     WHERE video_id=? AND app_token=? AND table_id=? AND record_id=?`,
-    [now(), key.videoId, key.appToken, key.tableId, key.recordId],
-  );
+  await withTransaction(async db => {
+    const args = [key.videoId, key.appToken, key.tableId, key.recordId];
+    const current = await row(db, "SELECT attempts FROM feishu_automation_jobs WHERE video_id=? AND app_token=? AND table_id=? AND record_id=? FOR UPDATE", args);
+    if (!current) return;
+    const attempts = Number(current.attempts || 0) + 1;
+    const timestamp = now();
+    await run(db, "UPDATE feishu_automation_jobs SET attempts=?,updated_at=? WHERE video_id=? AND app_token=? AND table_id=? AND record_id=?", [attempts, timestamp, ...args]);
+    if (attempts >= 6) {
+      await run(db, `INSERT INTO feishu_automation_delivery_blocks(video_id,app_token,table_id,record_id,reason,message,created_at,updated_at)
+        VALUES (?,?,?,?,'retry_exhausted','写回连续失败已暂停，成功结果保留；请检查权限和目标行后恢复',?,?)
+        ON DUPLICATE KEY UPDATE updated_at=VALUES(updated_at)`, [...args, timestamp, timestamp]);
+    } else {
+      const delays = [30_000, 60_000, 300_000, 900_000, 3_600_000];
+      const next = new Date(Date.now() + delays[attempts - 1]).toISOString();
+      await run(db, `INSERT INTO feishu_automation_delivery_retries(video_id,app_token,table_id,record_id,next_retry_at)
+        VALUES (?,?,?,?,?) ON DUPLICATE KEY UPDATE next_retry_at=VALUES(next_retry_at)`, [...args, next]);
+    }
+  });
 }
 
 export async function blockFeishuAutomationJob(key: FeishuAutomationJobKey, reason: string, message: string) {
@@ -969,19 +973,33 @@ export async function saveProductDocumentVideoRow(input: {
   videoId: string;
 }) {
   const timestamp = now();
-  const db = await getDb();
-  await run(
-    db,
-    `INSERT INTO product_document_video_rows(
-      document_id, link_block_id, product_id, source_url, video_id, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-    ON DUPLICATE KEY UPDATE
-      product_id=VALUES(product_id),
-      source_url=VALUES(source_url),
-      video_id=VALUES(video_id),
-      updated_at=VALUES(updated_at)`,
-    [input.documentId.trim(), input.linkBlockId.trim(), input.productId.trim(), input.sourceUrl.trim(), input.videoId.trim(), timestamp, timestamp],
-  );
+  const documentId = input.documentId.trim();
+  const linkBlockId = input.linkBlockId.trim();
+  const videoId = input.videoId.trim();
+  await withTransaction(async db => {
+    const owner = await row(db,
+      "SELECT document_id, link_block_id FROM product_document_video_rows WHERE video_id=? FOR UPDATE", [videoId]);
+    if (owner && (owner.document_id !== documentId || owner.link_block_id !== linkBlockId)) {
+      throw new Error("视频任务已关联到其他手卡行，请创建独立任务");
+    }
+    await run(db,
+      `INSERT INTO product_document_video_rows(
+        document_id, link_block_id, product_id, source_url, video_id, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON DUPLICATE KEY UPDATE
+        product_id=VALUES(product_id),
+        source_url=VALUES(source_url),
+        video_id=VALUES(video_id),
+        updated_at=VALUES(updated_at)`,
+      [documentId, linkBlockId, input.productId.trim(), input.sourceUrl.trim(), videoId, timestamp, timestamp],
+    );
+    // MySQL's duplicate-key branch can match the unique video_id as well as
+    // the row's primary key. Verify ownership in the same transaction before
+    // committing, including a competing insert for another document row.
+    const bound = await row(db,
+      "SELECT video_id FROM product_document_video_rows WHERE document_id=? AND link_block_id=?", [documentId, linkBlockId]);
+    if (bound?.video_id !== videoId) throw new Error("视频任务已关联到其他手卡行，请创建独立任务");
+  });
   return (await getProductDocumentVideoRow(input.documentId, input.linkBlockId))!;
 }
 
@@ -1041,8 +1059,8 @@ export async function getVideoBySourceUrl(sourceUrl: string, productId?: string)
   return found ? videoFromRow(found) : null;
 }
 
-export async function getVideo(id: string, withScenes = true) {
-  const db = await getDb();
+export async function getVideo(id: string, withScenes = true, connection?: PoolConnection) {
+  const db = connection || await getDb();
   const found = await row(
     db,
     "SELECT v.*, p.name AS product_name FROM videos v JOIN products p ON p.id=v.product_id WHERE v.id=?",
@@ -1065,10 +1083,10 @@ export async function createVideo(input: {
   analysisMode?: "full" | "product_doc" | "transcript_only";
   originalPath?: string | null;
   title?: string;
-}) {
-  const id = randomUUID();
+}, options: { connection?: PoolConnection; id?: string } = {}) {
+  const id = options.id || randomUUID();
   const timestamp = now();
-  const db = await getDb();
+  const db = options.connection || await getDb();
   await run(
     db,
     `INSERT INTO videos(
@@ -1088,7 +1106,7 @@ export async function createVideo(input: {
       timestamp,
     ],
   );
-  return (await getVideo(id))!;
+  return (await getVideo(id, false, options.connection))!;
 }
 
 export async function updateVideo(id: string, values: Record<string, unknown>) {
@@ -1113,6 +1131,26 @@ export async function updateVideo(id: string, values: Record<string, unknown>) {
   return getVideo(id);
 }
 
+export type VideoStageName = "download" | "transcript" | "translation" | "analysis";
+export async function recordVideoStage(videoId: string, attemptNumber: number, stage: VideoStageName,
+  state: "running" | "completed" | "failed" | "skipped", errorMessage = "") {
+  const db = await getDb();
+  // A late result from an older execution cannot change the current stage.
+  await run(db, `INSERT INTO video_stage_results(video_id,attempt_number,stage,state,error_message,updated_at)
+    SELECT id,attempt_count,?,?,?,? FROM videos WHERE id=? AND attempt_count=?
+    ON DUPLICATE KEY UPDATE
+      error_message=IF(video_stage_results.state='completed' AND VALUES(state)='failed',video_stage_results.error_message,VALUES(error_message)),
+      updated_at=IF(video_stage_results.state='completed' AND VALUES(state)='failed',video_stage_results.updated_at,VALUES(updated_at)),
+      state=IF(video_stage_results.state='completed' AND VALUES(state)='failed',video_stage_results.state,VALUES(state))`,
+  [stage, state, Array.from(errorMessage).slice(0, 500).join(""), now(), videoId, attemptNumber]);
+}
+
+export async function listVideoStages(videoId: string, attemptNumber: number) {
+  const db = await getDb();
+  const found = await rows(db, "SELECT stage,state,error_message,updated_at FROM video_stage_results WHERE video_id=? AND attempt_number=? ORDER BY stage", [videoId, attemptNumber]);
+  return found.map(item => ({ stage: String(item.stage), state: String(item.state), error: String(item.error_message || ""), updatedAt: String(item.updated_at) }));
+}
+
 export async function deleteVideoRecord(id: string) {
   const db = await getDb();
   const result = await run(db, "DELETE FROM videos WHERE id=?", [id]);
@@ -1120,26 +1158,27 @@ export async function deleteVideoRecord(id: string) {
 }
 
 export async function replaceScenes(videoId: string, scenes: Array<Omit<SceneRecord, "id" | "videoId">>) {
-  const db = await getDb();
-  await run(db, "DELETE FROM scenes WHERE video_id=?", [videoId]);
-  for (const scene of scenes) {
-    await run(
-      db,
-      `INSERT INTO scenes(
-        id, video_id, shot_index, start_seconds, end_seconds, screenshot_path, clip_path, role,
-        visual_description, audio_description, transcript_original, translation_zh, strengths, weaknesses,
-        importance, score_traffic, score_conversion, score_clarity, score_aesthetic, score_lighting,
-        score_product, tags_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        randomUUID(), videoId, scene.shotIndex, scene.startSeconds, scene.endSeconds,
-        scene.screenshotPath, scene.clipPath, scene.role, scene.visualDescription, scene.audioDescription,
-        scene.transcriptOriginal, scene.translationZh, scene.strengths, scene.weaknesses, scene.importance,
-        scene.scoreTraffic, scene.scoreConversion, scene.scoreClarity, scene.scoreAesthetic,
-        scene.scoreLighting, scene.scoreProduct, JSON.stringify(scene.tags),
-      ],
-    );
-  }
+  await withTransaction(async db => {
+    await run(db, "DELETE FROM scenes WHERE video_id=?", [videoId]);
+    for (const scene of scenes) {
+      await run(
+        db,
+        `INSERT INTO scenes(
+          id, video_id, shot_index, start_seconds, end_seconds, screenshot_path, clip_path, role,
+          visual_description, audio_description, transcript_original, translation_zh, strengths, weaknesses,
+          importance, score_traffic, score_conversion, score_clarity, score_aesthetic, score_lighting,
+          score_product, tags_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          randomUUID(), videoId, scene.shotIndex, scene.startSeconds, scene.endSeconds,
+          scene.screenshotPath, scene.clipPath, scene.role, scene.visualDescription, scene.audioDescription,
+          scene.transcriptOriginal, scene.translationZh, scene.strengths, scene.weaknesses, scene.importance,
+          scene.scoreTraffic, scene.scoreConversion, scene.scoreClarity, scene.scoreAesthetic,
+          scene.scoreLighting, scene.scoreProduct, JSON.stringify(scene.tags),
+        ],
+      );
+    }
+  });
   return getVideo(videoId);
 }
 
@@ -1206,13 +1245,35 @@ export async function getDashboard(filters: Parameters<typeof listVideos>[0] = {
   };
 }
 
-export async function getPendingVideoIds() {
+export async function getPendingVideoIds(inboxOnly = false) {
   const db = await getDb();
   const found = await rows(
     db,
-    `SELECT id FROM videos WHERE status IN ('queued','downloading','transcribing','extracting','analyzing') ORDER BY created_at`,
+    `SELECT id FROM videos WHERE (status IN ('queued','downloading','transcribing','extracting','analyzing')
+      OR processing_started_at IS NOT NULL)
+      ${inboxOnly ? "AND EXISTS (SELECT 1 FROM feishu_inbox_tasks i WHERE i.video_id=videos.id AND i.state='completed')" : ""}
+      ORDER BY created_at`,
   );
   return found.map((item) => String(item.id));
+}
+
+/** A wake-up never resets an active task. Only an explicit user action may
+ * requeue a terminal task, after the previous worker has settled its attempt. */
+export async function prepareVideoForQueue(videoId: string, restart = false) {
+  const allowed = restart ? "'waiting','queued','completed','failed','stopped'" : "'waiting','queued'";
+  return withTransaction(async db => {
+    const result = await run(db,
+      `UPDATE videos SET status='queued',stage='已加入队列',progress=2,error_message=NULL,updated_at=?
+       WHERE id=? AND processing_started_at IS NULL AND status IN (${allowed})`, [now(), videoId]);
+    if (result.affectedRows && restart) {
+      // Explicit new attempts resume delivery, without resetting any previous
+      // attempt's paid-subtitle request budget or success cache.
+      await run(db, "DELETE FROM feishu_automation_delivery_blocks WHERE video_id=?", [videoId]);
+      await run(db, "DELETE FROM feishu_automation_delivery_retries WHERE video_id=?", [videoId]);
+      await run(db, "UPDATE feishu_automation_jobs SET attempts=0,updated_at=? WHERE video_id=?", [now(), videoId]);
+    }
+    return result.affectedRows > 0;
+  });
 }
 
 export const VIDEO_ATTEMPT_DIAGNOSTICS_MAX_BYTES = 16 * 1024;
@@ -1359,7 +1420,7 @@ export async function startVideoAttempt(videoId: string) {
   const timestamp = now();
   const attemptId = randomUUID();
   return withTransaction(async (db) => {
-    const found = await row(db, "SELECT attempt_count FROM videos WHERE id=?", [videoId]);
+    const found = await row(db, "SELECT attempt_count FROM videos WHERE id=? FOR UPDATE", [videoId]);
     if (!found) throw new Error("视频不存在");
     const attemptNumber = Number(found.attempt_count || 0) + 1;
     await run(
@@ -1414,7 +1475,7 @@ export async function finishVideoAttempt(
   });
 }
 
-export async function finishOpenVideoAttempts(videoId: string, status: "failed" | "stopped", errorMessage: string) {
+export async function finishOpenVideoAttempts(videoId: string, status: "completed" | "failed" | "stopped", errorMessage: string) {
   const timestamp = now();
   const db = await getDb();
   await run(
@@ -1423,19 +1484,6 @@ export async function finishOpenVideoAttempts(videoId: string, status: "failed" 
      WHERE video_id=? AND status='running' AND finished_at IS NULL`,
     [status, errorMessage, timestamp, videoId],
   );
-}
-
-export async function getStaleProcessingVideoIds(cutoffIso: string) {
-  const db = await getDb();
-  const found = await rows(
-    db,
-    `SELECT id FROM videos
-     WHERE status IN ('downloading','transcribing','extracting','analyzing')
-       AND COALESCE(NULLIF(processing_started_at, ''), updated_at) < ?
-     ORDER BY COALESCE(NULLIF(processing_started_at, ''), updated_at)`,
-    [cutoffIso],
-  );
-  return found.map((item) => String(item.id));
 }
 
 // ---- 运维后台专用查询（只读，供 app/admin/* 页面使用） ----

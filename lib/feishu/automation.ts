@@ -9,7 +9,7 @@ import {
   deleteFeishuAutomationJob, getFeishuAutomationJobs,
   getFeishuFieldMapping, getFeishuProductCardMapping, getProduct, getProductByPid, getVideo,
   incrementFeishuAutomationJobAttempts,
-  listFeishuAutomationJobVideoIds, saveFeishuAutomationJob, updateProduct,
+  listFeishuAutomationJobVideoIds, listVideoStages, saveFeishuAutomationJob, updateProduct,
   upsertFeishuProductCardMapping,
   type FeishuAutomationJob,
 } from "@/lib/database";
@@ -139,6 +139,7 @@ function pidText(value: unknown): string {
 }
 
 function field(fields: Record<string, unknown>, name: string, aliases: string[] = [], read = text) {
+  if (!name) return "";
   for (const key of [name, ...aliases]) {
     if (key in fields) return read(fields[key]);
   }
@@ -146,6 +147,7 @@ function field(fields: Record<string, unknown>, name: string, aliases: string[] 
 }
 
 function urlField(fields: Record<string, unknown>, name: string, aliases: string[] = []) {
+  if (!name) return "";
   for (const key of [name, ...aliases]) {
     if (key in fields) return urlText(fields[key]);
   }
@@ -158,11 +160,6 @@ function cleanUrl(value: string) {
 
 function apiError(response: { code?: number; msg?: string } | null | undefined, fallback: string) {
   if (response?.code && response.code !== 0) throw new Error(response.msg || fallback);
-}
-
-function isBaseRolePermissionError(error: unknown) {
-  const message = error instanceof Error ? error.message : String(error || "");
-  return /RolePermNotAllow|role has no permissions|1254302|没有权限|无权限/i.test(message);
 }
 
 export type FeishuAutomationFieldAliases = Partial<Record<keyof FeishuAutomationFieldMap, string[]>>;
@@ -187,7 +184,7 @@ export function resolveAutomationFields(
     suppliedPid,
     productName: field(fields, map.productName, ["商品名称", "产品名", "productName", "product_name", ...(extraAliases.productName || [])]),
     productDocument: urlField(fields, documentField, [map.productDocument, "产品手卡", "产品文档", ...(extraAliases.productDocument || [])]),
-    videoUrl: cleanUrl(field(fields, map.videoUrl, ["样片链接", "视频链接", ...(extraAliases.videoUrl || [])])),
+    videoUrl: urlField(fields, map.videoUrl, ["样片链接", "视频链接", ...(extraAliases.videoUrl || [])]),
     analysis: field(fields, map.analysis),
     translation: field(fields, map.translation),
     status: field(fields, map.status),
@@ -259,6 +256,7 @@ export async function listBitableTableFieldNames(
   if (!client) throw new Error("飞书未连接，请先在“飞书设置”里完成连接");
   const names: string[] = [];
   let pageToken: string | undefined;
+  const seen = new Set<string>();
   for (let guard = 0; guard < 20; guard += 1) {
     const response = await client.request<{
       code?: number; msg?: string;
@@ -272,10 +270,13 @@ export async function listBitableTableFieldNames(
     for (const item of response.data?.items || []) {
       if (item.field_name) names.push(item.field_name);
     }
-    if (!response.data?.has_more || !response.data.page_token) break;
-    pageToken = response.data.page_token;
+    if (!response.data?.has_more) return names;
+    const next = response.data.page_token?.trim();
+    if (!next || seen.has(next)) throw new Error("飞书字段分页异常，未取得完整字段，已停止写回");
+    seen.add(next);
+    pageToken = next;
   }
-  return names;
+  throw new Error("飞书字段分页超过安全上限，未取得完整字段，已停止写回");
 }
 
 const automationFieldCandidates: Record<keyof FeishuAutomationFieldMap, string[]> = {
@@ -309,6 +310,10 @@ export async function fitAutomationFieldMapToTable(
   const names = new Set(await listBitableTableFieldNames(input, client));
   const result = {} as FeishuAutomationFieldMap;
   for (const key of Object.keys(defaultFeishuAutomationFieldMap) as Array<keyof FeishuAutomationFieldMap>) {
+    if (input.fieldMap?.[key] === "") {
+      result[key] = "";
+      continue;
+    }
     const explicit = input.fieldMap?.[key]?.trim();
     if (explicit) {
       if (!names.has(explicit)) throw new Error(`多维表格中找不到字段“${explicit}”`);
@@ -328,11 +333,8 @@ async function automationJobClient(job: FeishuAutomationJob) {
   return channel.rawClient;
 }
 
-// ~5 delivery passes (default 30s interval) before giving up on the
-// subtitle fields for one row. Generous enough to ride out a couple of bad
-// Qwen segmentations without letting a persistently-misaligned video burn a
-// fresh Qwen call every single pass forever.
-const SUBTITLE_RETRY_GIVE_UP_AFTER = 5;
+// Two failed subtitle passes; actual paid requests also have a durable budget.
+const SUBTITLE_RETRY_GIVE_UP_AFTER = 2;
 
 export async function patchBaseRecord(
   client: Client,
@@ -359,23 +361,31 @@ export async function getBaseRecordFields(
   return response.data?.record?.fields || {};
 }
 
-async function currentDeliveryRow(client: Client, job: FeishuAutomationJob, sourceUrl: string | null, map: FeishuAutomationFieldMap) {
+async function deliveryAttemptStillCurrent(videoId: string, attemptNumber?: number) {
+  if (attemptNumber === undefined) return true;
+  const current = await getVideo(videoId, false);
+  return current?.attemptCount === attemptNumber && !["queued", "waiting"].includes(current.status);
+}
+
+async function currentDeliveryRow(client: Client, job: FeishuAutomationJob, sourceUrl: string | null, map: FeishuAutomationFieldMap, attemptNumber?: number) {
   const pending = (await getFeishuAutomationJobs(job.videoId)).find(candidate => (
     candidate.appToken === job.appToken && candidate.tableId === job.tableId && candidate.recordId === job.recordId
   ));
   if (!pending || pending.blockedReason) return null;
+  if (!await deliveryAttemptStillCurrent(job.videoId, attemptNumber)) return null;
   const latest = await getBaseRecordFields(client, job);
   if (sourceUrl && map.videoUrl) assertDeliverySource(sourceUrl, latest[map.videoUrl]);
   return latest;
 }
 
 async function patchEmptyDeliveryFields(client: Client, job: FeishuAutomationJob, sourceUrl: string | null,
-  map: FeishuAutomationFieldMap, proposed: Record<string, unknown>) {
+  map: FeishuAutomationFieldMap, proposed: Record<string, unknown>, attemptNumber?: number) {
   // Re-read after uploads/provider waits as well as on each network retry.
   // This preserves manual text and attachments, subject to Feishu's existing
   // non-atomic GET/PUT window; no claim of transactional external writes.
-  const latest = await currentDeliveryRow(client, job, sourceUrl, map);
+  const latest = await currentDeliveryRow(client, job, sourceUrl, map, attemptNumber);
   if (!latest) return false;
+  if (!await deliveryAttemptStillCurrent(job.videoId, attemptNumber)) return false;
   const fields = emptyFieldPatch(latest, proposed);
   if (Object.keys(fields).length) await patchBaseRecord(client, { ...job, fields });
   return true;
@@ -559,6 +569,7 @@ export async function deliverEarlyTranscript(videoId: string) {
   if (!jobs.length) return;
   const video = await getVideo(videoId);
   if (!video?.transcriptOriginal?.trim()) return;
+  const attemptNumber = video.attemptCount;
   try {
     for (const job of jobs) {
       if (job.blockedReason) continue;
@@ -569,7 +580,7 @@ export async function deliverEarlyTranscript(videoId: string) {
       if (!Object.keys(fields).length) continue;
       try {
         const client = await automationJobClient(job);
-        await withProductCardRecordLock(job, () => patchEmptyDeliveryFields(client, job, video.sourceUrl, map, fields));
+        await withProductCardRecordLock(job, () => patchEmptyDeliveryFields(client, job, video.sourceUrl, map, fields, attemptNumber));
       } catch (error) {
         if (await pausePermanentDelivery(job, error)) continue;
         console.warn(`[feishu-automation] 提前写回口播失败 video=${videoId} record=${job.recordId}: ${safeAutomationFailure(feishuApiErrorDetail(error))}`);
@@ -585,11 +596,12 @@ export async function completeFeishuAutomation(videoId: string) {
   const jobs = await getFeishuAutomationJobs(videoId);
   const video = await getVideo(videoId);
   if (!jobs.length || !video || !["completed", "failed", "stopped"].includes(video.status)) return false;
+  const attemptNumber = video.attemptCount;
   const product = await getProduct(video.productId);
   try {
     let allDelivered = true;
     for (const job of jobs) {
-      if (job.blockedReason) { allDelivered = false; continue; }
+      if (job.blockedReason || (job.nextRetryAt && job.nextRetryAt > new Date().toISOString())) { allDelivered = false; continue; }
       try {
         const client = await automationJobClient(job);
         const delivered = await withProductCardRecordLock(job, async () => {
@@ -602,23 +614,24 @@ export async function completeFeishuAutomation(videoId: string) {
             && candidate.recordId === job.recordId
           ));
           if (!current) return true;
-          if (current.blockedReason) return false;
+          if (current.blockedReason || (current.nextRetryAt && current.nextRetryAt > new Date().toISOString())) return false;
           const productCardMapping = await getFeishuProductCardMapping({
             appToken: current.appToken,
             tableId: current.tableId,
             recordId: current.recordId,
           });
           const map = { ...defaultFeishuAutomationFieldMap, ...current.fieldMap };
-          const latest = await currentDeliveryRow(client, current, video.sourceUrl, map);
+          const latest = await currentDeliveryRow(client, current, video.sourceUrl, map, attemptNumber);
           if (!latest) return true;
           // Validate real columns before an upload or subtitle-model request.
           // Input-only/card-button fields are deliberately outside this list.
           const outputNames = [map.status, map.translation, map.transcript, map.videoFile,
             map.productDocument, map.linkedSubtitle, map.timestampedTranscript, map.timestampedTranslation,
-            ...(video.analysisMode === "product_doc" || video.status !== "completed" ? [map.analysis] : [])];
+            ...(video.analysisMode === "product_doc" ? [map.analysis] : [])];
           assertDeliveryFields(await listBitableTableFieldNames(current, client), outputNames);
           const fields: Record<string, unknown> = {};
           let filePending = false;
+          let subtitlePending = false;
           // File delivery is independent of analysis/subtitles. Never replace
           // an attachment already present, and never re-analyze a cached file.
           if (video.originalPath && map.videoFile && !fieldHasContent(latest[map.videoFile])) {
@@ -626,7 +639,7 @@ export async function completeFeishuAutomation(videoId: string) {
               const attachment = await uploadBaseAttachment(client, {
                 appToken: current.appToken, absolutePath: resolveMediaPath(video.originalPath), fileName: `${video.id}.mp4`,
               });
-              if (!await patchEmptyDeliveryFields(client, current, video.sourceUrl, map, { [map.videoFile]: attachment })) return true;
+              if (!await patchEmptyDeliveryFields(client, current, video.sourceUrl, map, { [map.videoFile]: attachment }, attemptNumber)) return true;
             } catch (error) {
               if (await pausePermanentDelivery(current, error)) return false;
               filePending = true;
@@ -646,7 +659,7 @@ export async function completeFeishuAutomation(videoId: string) {
             if (video.analysisMode === "product_doc") {
               setMappedField(fields, map.analysis, conciseProductDocAnalysis(video));
             }
-            setMappedField(fields, map.translation, video.transcriptZh || "暂无中文翻译");
+            if (video.transcriptZh) setMappedField(fields, map.translation, video.transcriptZh);
             setMappedField(fields, map.transcript, video.transcriptOriginal || "");
             const mappedDocumentUrl = productCardMapping?.documentUrl || product?.documentUrl;
             if (mappedDocumentUrl) setMappedField(fields, map.productDocument, mappedDocumentUrl);
@@ -659,15 +672,18 @@ export async function completeFeishuAutomation(videoId: string) {
             // after a few tries; the cheap text/status fields below still
             // retry while delivery remains active. Permanent row/field errors
             // are paused separately before any further provider calls.
-            if (current.attempts === SUBTITLE_RETRY_GIVE_UP_AFTER && wantsSubtitleFields) {
-              console.warn(`[feishu-automation] 双语字幕已重试 ${current.attempts} 次仍失败，放弃生成 video=${videoId}（其余字段仍会继续重试写回）`);
-            }
+            subtitlePending = video.transcriptSegments.length > 0 && wantsSubtitleFields;
             if (video.transcriptSegments.length && wantsSubtitleFields
               && current.attempts < SUBTITLE_RETRY_GIVE_UP_AFTER) {
               let subtitleFile: Awaited<ReturnType<typeof generateBilingualSubtitleFile>> = null;
               try {
-                subtitleFile = await generateBilingualSubtitleFile(video.transcriptSegments as TranscriptSegment[]);
+                subtitleFile = await generateBilingualSubtitleFile(
+                  video.transcriptSegments as TranscriptSegment[], `${videoId}:attempt:${video.attemptCount || 0}`,
+                );
+                subtitlePending = false;
                 if (subtitleFile) {
+                  setMappedField(fields, map.timestampedTranscript, buildTimestampedText(subtitleFile.segments, subtitleFile.segments.map((s) => s.text)));
+                  setMappedField(fields, map.timestampedTranslation, buildTimestampedText(subtitleFile.segments, subtitleFile.translations));
                   // 用户最终确认：只写"链接字幕"（视频链接提取 TokScript 时间戳这条
                   // 原生流程对应的字段），不再写"音频字幕"。
                   if (map.linkedSubtitle && !fieldHasContent(latest[map.linkedSubtitle])) {
@@ -678,30 +694,44 @@ export async function completeFeishuAutomation(videoId: string) {
                     });
                     fields[map.linkedSubtitle] = attachment;
                   }
-                  setMappedField(fields, map.timestampedTranscript, buildTimestampedText(subtitleFile.segments, subtitleFile.segments.map((s) => s.text)));
-                  setMappedField(fields, map.timestampedTranslation, buildTimestampedText(subtitleFile.segments, subtitleFile.translations));
                 }
               } catch (error) {
+                subtitlePending = true;
                 console.warn(`[feishu-automation] 双语字幕生成失败 video=${videoId}: ${safeAutomationFailure(feishuApiErrorDetail(error))}`);
               } finally {
                 await subtitleFile?.cleanup();
               }
             }
-          } else if (video.errorMessage) {
+          } else if (video.errorMessage && video.analysisMode === "product_doc") {
             setMappedField(fields, map.analysis, `处理失败：${safeAutomationFailure(video.errorMessage)}`);
           }
           for (let attempt = 1; attempt <= 3; attempt += 1) {
             try {
-              if (!await patchEmptyDeliveryFields(client, current, video.sourceUrl, map, fields)) return true;
-              if (filePending) {
+              if (!await patchEmptyDeliveryFields(client, current, video.sourceUrl, map, fields, attemptNumber)) return true;
+              if (filePending || subtitlePending) {
+                const nextAttempts = current.attempts + 1;
                 await incrementFeishuAutomationJobAttempts(current);
+                if (subtitlePending && !filePending && nextAttempts >= SUBTITLE_RETRY_GIVE_UP_AFTER) {
+                  await blockFeishuAutomationJob(current, "subtitle_failed", "字幕生成或回填达到重试上限；视频和口播已单独处理，请检查后人工重试");
+                }
+                return false;
+              }
+              const transcriptPending = map.transcript && !fieldHasContent(latest[map.transcript]) && !video.transcriptOriginal?.trim();
+              const translationPending = map.translation && !fieldHasContent(latest[map.translation]) && !video.transcriptZh?.trim();
+              if (transcriptPending || translationPending) {
+                const stages = await listVideoStages(video.id, video.attemptCount || 0);
+                const waitingFor = [transcriptPending ? "transcript" : "", translationPending ? "translation" : ""];
+                if (stages.some(stage => waitingFor.includes(stage.stage) && stage.state === "running"
+                  && Date.now() - Date.parse(stage.updatedAt) < 30 * 60 * 1_000)) return false;
+                await blockFeishuAutomationJob(current, transcriptPending ? "transcript_failed" : "translation_failed",
+                  "口播或翻译未完成；视频文件及其他成功结果保留，请核查对应环节后恢复");
                 return false;
               }
               await deleteFeishuAutomationJob(current);
               return true;
             } catch (error) {
               if (await pausePermanentDelivery(current, error)) return false;
-              if (isBaseRolePermissionError(error) || attempt === 3) {
+              if (attempt === 3 || /429|rate.?limit|too many requests/i.test(String(error))) {
                 // Feishu's own {code,msg} validation body is not a secret — it
                 // describes what our request got wrong, not a credential — and
                 // is the only way to diagnose a real write-back failure without
@@ -721,7 +751,7 @@ export async function completeFeishuAutomation(videoId: string) {
           continue;
         }
       } catch (error) {
-        await pausePermanentDelivery(job, error);
+        if (!await pausePermanentDelivery(job, error)) await incrementFeishuAutomationJobAttempts(job);
         // A single Base row must never prevent the remaining deliveries. The
         // untouched job is the durable retry marker for a later completion run.
         allDelivered = false;
@@ -796,6 +826,13 @@ type FeishuAutomationInput = {
   writeBack?: boolean;
 };
 
+export class HandcardSourceChangedError extends Error {
+  constructor() {
+    super("该行商品 PID 已变化，已停止旧手卡任务回填");
+    this.name = "HandcardSourceChangedError";
+  }
+}
+
 export async function handleFeishuAutomation(input: FeishuAutomationInput) {
   return withProductCardRecordLock(input, () => handleFeishuAutomationUnlocked(input));
 }
@@ -803,7 +840,7 @@ export async function handleFeishuAutomation(input: FeishuAutomationInput) {
 async function handleFeishuAutomationUnlocked(input: FeishuAutomationInput) {
   // 运维后台"字段映射"页面按 appToken:tableId 存的覆盖配置——不存在时完全不影响现有硬编码默认值。
   const scopeKey = `${input.appToken}:${input.tableId}`;
-  const storedMapping = await getFeishuFieldMapping(scopeKey).catch(() => null);
+  const storedMapping = await getFeishuFieldMapping(scopeKey);
   const mergedFieldMap = { ...storedMapping?.fieldMap, ...input.fieldMap };
   const resolved = resolveAutomationFields(input.fields, mergedFieldMap, storedMapping?.aliases);
   const patch: Record<string, unknown> = {};
@@ -818,6 +855,13 @@ async function handleFeishuAutomationUnlocked(input: FeishuAutomationInput) {
   let catalogMetadata: CatalogSourceMetadata | null = null;
   let product = null as Awaited<ReturnType<typeof getProductByPid>>;
 
+  const assertCurrentPid = async () => {
+    if (!writeBack) return;
+    const latest = await getBaseRecordFields(input.client, input);
+    const pid = resolveAutomationFields(latest, mergedFieldMap, storedMapping?.aliases).pid;
+    if (pid !== resolved.pid) throw new HandcardSourceChangedError();
+  };
+
   const queuePatch = (fields: Record<string, unknown>) => {
     Object.assign(patch, fields);
     Object.assign(pendingPatch, fields);
@@ -830,6 +874,7 @@ async function handleFeishuAutomationUnlocked(input: FeishuAutomationInput) {
     const snapshot = Object.entries(pendingPatch);
     for (const [key, value] of snapshot) {
       try {
+        await assertCurrentPid();
         await patchBaseRecord(input.client, {
           appToken: input.appToken,
           tableId: input.tableId,
@@ -839,6 +884,7 @@ async function handleFeishuAutomationUnlocked(input: FeishuAutomationInput) {
         if (pendingPatch[key] === value) delete pendingPatch[key];
         writeBackFailures.delete(key);
       } catch (error) {
+        if (error instanceof HandcardSourceChangedError) throw error;
         writeBackFailures.set(key, safeAutomationFailure(error));
       }
     }
@@ -857,6 +903,7 @@ async function handleFeishuAutomationUnlocked(input: FeishuAutomationInput) {
   let effectiveName = resolved.productName.trim();
   if (!effectivePid) throw new Error("缺少商品 PID，无法按“产品名称_PID”命名手卡");
   if (!/^\d{6,30}$/.test(effectivePid)) throw new Error("商品 PID 格式不正确，必须为 6–30 位数字");
+  await assertCurrentPid();
   if (!effectiveName) {
     try {
       const { getProductNameByPid } = await import("@/lib/products/catalog");
@@ -864,23 +911,16 @@ async function handleFeishuAutomationUnlocked(input: FeishuAutomationInput) {
     } catch (error) {
       throw new Error(`无法自动获取产品名称：${catalogError(error)}；可在表格补填产品名称后再点击`);
     }
+    await assertCurrentPid();
   }
   // This optional display link is never crawled or used to establish identity.
   const effectiveProductUrl = resolved.productUrl || `https://shop.tiktok.com/us/pdp/${effectivePid}?source=anchor`;
-  // Testing convenience: a product name containing "测试" always gets a fresh
-  // card, bypassing the existing-by-PID reuse — lets a real PID be reused
-  // across repeated test clicks to check the field-fill behavior without
-  // "已有手卡不碰" silently skipping every run after the first.
-  // Supplier text must not accidentally opt into the manual test-only bypass.
-  const isTestRequest = resolved.productName.trim().includes("测试");
-
   // Only an explicit Feishu button click reaches this handler. The product
   // folder and exact `_PID` title suffix are authoritative; row fields and
   // cached mappings never select or create a document.
   const shell = await ensureProductCardByPid(input.client, {
     name: effectiveName,
     pid: effectivePid,
-    forceNew: isTestRequest,
   });
   documentUrl = shell.documentUrl;
   // Deliver the card before any paid/slow operation. A failed analysis must
@@ -915,29 +955,38 @@ async function handleFeishuAutomationUnlocked(input: FeishuAutomationInput) {
       productUrl: effectiveProductUrl, pid: effectivePid,
       expectedValues: preflight.currentValues, protectRevision: true,
     });
-    const { getProductCatalog, getProductMetadataByPid } = await import("@/lib/products/catalog");
-    const catalog = await getProductCatalog(effectivePid);
-    catalogMetadata = await getProductMetadataByPid(effectivePid);
-    const fieldText = (key: keyof typeof catalogFields) => catalog.fields[key].text;
-    const synced = await syncProductCardManagedFields(input.client, {
-      documentId: shell.documentId, mode: "verified-basic", derivedOnly: true,
-      sku: fieldText("sku"), coreFunctions: [fieldText("coreFunctions")],
-      productParameters: fieldText("productParameters"), usageMethod: fieldText("usageMethod"),
-      audience: fieldText("audience"), scenes: fieldText("scenes"),
-      shopName: catalogMetadata?.shopName || "",
-      mainImageUrl: catalogMetadata?.mainImageUrls[0] || "",
-      expectedValues: preflight.currentValues, preserveExistingOnMissing: true, protectRevision: true,
-    });
-    const missing = Object.entries(catalog.fields).filter(([, fact]) => fact.basis === "missing")
-      .map(([key]) => catalogFields[key as keyof typeof catalogFields]);
-    productCardWarning = [productCardWarning, ...catalog.warnings,
-      missing.length ? `资料未提供：${missing.join("、")}；已有内容保留` : "",
-      synced.skippedLabels.length ? `填写期间被修改，已保留：${synced.skippedLabels.join("、")}` : "",
-      synced.missingLabels.length ? `无法定位字段：${synced.missingLabels.join("、")}` : "",
-    ].filter(Boolean).join("；");
-    productCardStatus = "手卡商品资料已整理";
+    const emptyLabels = Object.values(catalogFields).filter(label =>
+      !preflight.missingLabels.includes(label) && !preflight.currentValues[label]?.trim());
+    if (!emptyLabels.length) {
+      productCardStatus = "手卡已就绪，已有基础资料已保留；需要替换请使用刷新基础资料";
+    } else {
+      const { getProductCatalog, getProductMetadataByPid } = await import("@/lib/products/catalog");
+      await assertCurrentPid();
+      const catalog = await getProductCatalog(effectivePid);
+      catalogMetadata = await getProductMetadataByPid(effectivePid);
+      const fieldText = (key: keyof typeof catalogFields) => catalog.fields[key].text;
+      const synced = await syncProductCardManagedFields(input.client, {
+        documentId: shell.documentId, mode: "verified-basic", derivedOnly: true, fillEmptyOnly: true,
+        sku: fieldText("sku"), coreFunctions: [fieldText("coreFunctions")],
+        productParameters: fieldText("productParameters"), usageMethod: fieldText("usageMethod"),
+        audience: fieldText("audience"), scenes: fieldText("scenes"),
+        shopName: catalogMetadata?.shopName || "",
+        mainImageUrl: catalogMetadata?.mainImageUrls[0] || "",
+        expectedValues: preflight.currentValues, preserveExistingOnMissing: true, protectRevision: true,
+      });
+      const missing = Object.entries(catalog.fields).filter(([key, fact]) => fact.basis === "missing"
+        && emptyLabels.includes(catalogFields[key as keyof typeof catalogFields]))
+        .map(([key]) => catalogFields[key as keyof typeof catalogFields]);
+      productCardWarning = [productCardWarning, ...catalog.warnings,
+        missing.length ? `资料未提供：${missing.join("、")}；已有内容保留` : "",
+        synced.skippedLabels.length ? `填写期间被修改，已保留：${synced.skippedLabels.join("、")}` : "",
+        synced.missingLabels.length ? `无法定位字段：${synced.missingLabels.join("、")}` : "",
+      ].filter(Boolean).join("；");
+      productCardStatus = "手卡空白基础资料已补录，已有内容保留";
+    }
   } catch (error) {
     // Do not expose provider bodies, signed URLs or credentials in logs/status.
+    if (error instanceof HandcardSourceChangedError) throw error;
     productRefreshError = error instanceof Error && /^(模板|手卡正文|产品手卡模板|飞书没有返回)/.test(error.message)
       ? error.message.slice(0, 300) : catalogError(error);
     productCardStatus = `手卡已就绪，商品资料未完成：${productRefreshError}`;
@@ -970,6 +1019,7 @@ async function handleFeishuAutomationUnlocked(input: FeishuAutomationInput) {
   });
   if (!product) throw new Error("创建产品档案失败");
 
+  await assertCurrentPid();
   await upsertFeishuProductCardMapping({
     ...mappingKey,
     productId: product.id,

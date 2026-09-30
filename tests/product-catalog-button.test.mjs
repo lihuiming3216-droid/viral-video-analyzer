@@ -14,7 +14,7 @@ async function fixture(t) {
   const pid = "1732350695360139845";
   const events = [];
   const catalog = { pid, fields: Object.fromEntries(Object.keys(types.catalogFields).map(key => [key, { text: key, basis: "direct", evidence: ["product-text"] }])), warnings: [] };
-  const currentValues = { 商品名称: "旧名称", 产品链接: "", 商品ID: pid, ...Object.fromEntries(Object.values(types.catalogFields).map(label => [label, "人工原值"])) };
+  const currentValues = { 商品名称: "旧名称", 产品链接: "", 商品ID: pid, ...Object.fromEntries(Object.values(types.catalogFields).map(label => [label, ""])) };
   const hooks = {
     getFeishuFieldMapping: async () => null,
     ensureProductCardByPid: async (_client, input) => { events.push(["shell", input]); return { documentId: "card", documentUrl: "https://feishu.cn/docx/card", reused: true }; },
@@ -44,7 +44,10 @@ async function fixture(t) {
   }
   code = code.replaceAll('"@/lib/products/catalog"', JSON.stringify(url(["getProductCatalog", "getProductNameByPid", "getProductMetadataByPid"].map(name => `export const ${name} = (...a) => globalThis[${JSON.stringify(key)}].${name}(...a);`).join("\n"))));
   const automation = await import(url(code));
-  const client = { request: async request => { events.push(["write", request.data.fields]); return { code: 0 }; } };
+  const client = { request: async request => {
+    if (request.method === "GET") return { code: 0, data: { record: { fields: hooks.latestFields || input.fields } } };
+    events.push(["write", request.data.fields]); return { code: 0 };
+  } };
   const input = { client, appToken: "app", tableId: "table", recordId: "row", fields: { 产品名称: "分装瓶", PID: pid }, writeBack: true };
   return { hooks, events, catalog, currentValues, input, automation, run: () => automation.handleFeishuAutomation(input) };
 }
@@ -53,7 +56,7 @@ test("PID and name alone deliver a reused card link before catalog processing an
   const f = await fixture(t);
   const out = await f.run();
   assert.equal(out.productRefreshError, "");
-  assert.equal(out.productCardStatus, "手卡商品资料已整理");
+  assert.equal(out.productCardStatus, "手卡空白基础资料已补录，已有内容保留");
   assert.equal(f.events.some(([kind]) => kind === "name"), false, "manual names do not cause a source lookup");
   const linkIndex = f.events.findIndex(([kind, input]) => kind === "write" && input.产品手卡);
   const catalogIndex = f.events.findIndex(([kind]) => kind === "catalog");
@@ -61,6 +64,7 @@ test("PID and name alone deliver a reused card link before catalog processing an
   const derived = f.events.find(([kind, input]) => kind === "sync" && input.derivedOnly)[1];
   assert.equal(derived.preserveExistingOnMissing, true);
   assert.equal(derived.protectRevision, true);
+  assert.equal(derived.fillEmptyOnly, true);
   assert.deepEqual(derived.expectedValues, f.currentValues);
   assert.equal(derived.shopName, "Fixture Shop");
   assert.match(derived.mainImageUrl, /main\.webp$/);
@@ -69,6 +73,16 @@ test("PID and name alone deliver a reused card link before catalog processing an
   assert.equal(productUpdate.sourceDescription, "Use after washing.");
   assert.deepEqual(productUpdate.sourceImageUrls, ["https://p16-oec-general-useast5.ttcdn-us.com/main.webp"]);
   for (const key of Object.keys(types.catalogFields)) assert.ok(derived[key]);
+});
+
+test("an already populated handcard returns its link without a catalog/model call", async t => {
+  const f = await fixture(t);
+  for (const label of Object.values(types.catalogFields)) f.currentValues[label] = "人工资料";
+  f.hooks.getProductCatalog = async () => { throw Error("must not charge"); };
+  const out = await f.run();
+  assert.match(out.productCardStatus, /已有基础资料已保留/);
+  assert.equal(f.events.some(([kind, value]) => kind === "sync" && value.derivedOnly), false);
+  assert.ok(f.events.some(([kind, value]) => kind === "write" && value.产品手卡));
 });
 
 test("provider failure leaves the delivered card available and publishes a safe error", async t => {
@@ -101,11 +115,11 @@ test("one unavailable field is written as missing with preservation enabled; oth
   assert.match(out.productCardWarning, /使用方法/);
 });
 
-test("test-name creates a new shell but still uses only the PID for shared data", async t => {
+test("manual test-device names cannot bypass PID document reuse", async t => {
   const f = await fixture(t);
   f.input.fields.产品名称 = "分装瓶测试";
   await f.run();
-  assert.equal(f.events.find(([kind]) => kind === "shell")[1].forceNew, true);
+  assert.notEqual(f.events.find(([kind]) => kind === "shell")[1].forceNew, true);
   assert.equal(f.events.find(([kind]) => kind === "catalog")[1], f.input.fields.PID);
 });
 
@@ -143,7 +157,7 @@ test("supplier names containing 测试 never force a duplicate card", async t =>
   f.input.fields.产品名称 = "  ";
   f.hooks.getProductNameByPid = async () => "水质测试仪";
   await f.run();
-  assert.equal(f.events.find(([kind]) => kind === "shell")[1].forceNew, false);
+  assert.notEqual(f.events.find(([kind]) => kind === "shell")[1].forceNew, true);
 });
 
 test("missing supplier name stops without a placeholder document and preserves the manual-fill instruction", async t => {
@@ -195,4 +209,43 @@ test("a table without a product-name column can disable its mapping and use PID 
   assert.equal(out.productName, "Supplier bottle");
   assert.equal(Object.hasOwn(out.patch, ""), false);
   assert.equal(Object.hasOwn(out.patch, "产品名称"), false);
+});
+
+test("a PID changed while waiting stops before any document creation or paid request", async t => {
+  const f = await fixture(t);
+  f.hooks.latestFields = { PID: "1731886355135304543" };
+  await assert.rejects(f.run(), { name: "HandcardSourceChangedError" });
+  assert.equal(f.events.length, 0);
+});
+
+test("a PID changed during organization prevents stale terminal row writes and mapping updates", async t => {
+  const f = await fixture(t);
+  f.hooks.getProductCatalog = async () => {
+    f.hooks.latestFields = { PID: "1731886355135304543" };
+    f.events.length = 0;
+    return f.catalog;
+  };
+  let mappings = 0;
+  f.hooks.upsertFeishuProductCardMapping = async () => { mappings++; };
+  await assert.rejects(f.run(), { name: "HandcardSourceChangedError" });
+  assert.equal(mappings, 0);
+  assert.equal(f.events.some(([kind]) => kind === "write"), false);
+});
+
+test("a PID changed during name lookup stops before creating a stale card", async t => {
+  const f = await fixture(t);
+  delete f.input.fields.产品名称;
+  f.hooks.getProductNameByPid = async () => {
+    f.hooks.latestFields = { PID: "1731886355135304543" };
+    return "Old product name";
+  };
+  await assert.rejects(f.run(), { name: "HandcardSourceChangedError" });
+  assert.equal(f.events.length, 0);
+});
+
+test("unreadable saved mappings fail closed instead of using default columns", async t => {
+  const f = await fixture(t);
+  f.hooks.getFeishuFieldMapping = async () => { throw Error("database unavailable"); };
+  await assert.rejects(f.run(), /database unavailable/);
+  assert.equal(f.events.length, 0);
 });

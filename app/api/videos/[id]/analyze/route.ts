@@ -7,6 +7,6 @@ export const runtime = "nodejs";
 export async function POST(_request: NextRequest, context: { params: Promise<{ id: string }> }) {
   const { id } = await context.params;
   if (!(await getVideo(id, false))) return NextResponse.json({ error: "视频不存在" }, { status: 404 });
-  await enqueueVideos([id]);
+  await enqueueVideos([id], { restart: true });
   return NextResponse.json({ ok: true });
 }

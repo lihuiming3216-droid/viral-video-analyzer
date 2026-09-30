@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { readFile, stat } from "node:fs/promises";
 import test from "node:test";
+import { createIsolatedDatabase, moduleUrl, loadTestModule } from "./helpers/isolated-mysql.mjs";
+import { NextRequest } from "next/server.js";
 
 const root = new URL("../", import.meta.url);
 
@@ -22,11 +24,11 @@ test("ships the finished product shell and branded preview", async () => {
 });
 
 test("database schema covers archive, scenes, providers, learning, Feishu and search indexes", async () => {
-  const database = await readFile(new URL("lib/database.ts", root), "utf8");
+  const database = await readFile(new URL("lib/db/schema.sql", root), "utf8");
   for (const table of ["products", "videos", "scenes", "provider_settings", "learning_memories", "learning_profiles", "feishu_settings", "feishu_targets", "feishu_batches", "feishu_deliveries", "feishu_documents", "feishu_events"]) {
     assert.match(database, new RegExp(`CREATE TABLE IF NOT EXISTS ${table}`));
   }
-  for (const index of ["idx_videos_product_created", "idx_videos_account_created", "idx_videos_status", "idx_scenes_video_shot", "idx_learning_memories_product"]) {
+  for (const index of ["idx_videos_product_created", "idx_videos_account_created", "idx_videos_status", "uq_scenes_video_shot", "idx_learning_memories_product"]) {
     assert.match(database, new RegExp(index));
   }
 });
@@ -64,7 +66,7 @@ test("product documents auto-sync in lightweight mode and keep the manual prop a
   assert.match(sync, /getVideoBySourceUrl/);
   assert.match(sync, /中文翻译\|原口播文案/);
   assert.match(sync, /setTimeout\(resolve, 380\)/);
-  assert.match(analysis, /analysisMode === "product_doc" \? 2_000 : 4_500/);
+  assert.match(analysis, /qwenMaxTokens = analysisMode === "product_doc"\s*\? 2_000\s*: Math\.min\(16_000, 2_500 \+ assets\.scenes\.length \* 700\)/);
   assert.match(analysis, /learningContext = analysisMode === "product_doc" \? null/);
   assert.match(analysis, /includeCover: analysisMode !== "product_doc"/);
   assert.match(analysis, /中文翻译由 TokScript 独立链路处理/);
@@ -78,11 +80,13 @@ test("product documents auto-sync in lightweight mode and keep the manual prop a
   assert.match(qwen, /modalities: \["text"\]/);
   assert.match(qwen, /stream: true/);
   assert.doesNotMatch(qwen, /MAX_ANALYSIS_FRAMES/);
-  assert.match(analysis, /Qwen Omni：完整 MP4 画面与原始音轨分析/);
+  assert.match(analysis, /：完整 MP4 画面与原始音轨分析/);
   assert.doesNotMatch(analysis, /完整原文：\$\{input\.transcript\}/);
   assert.match(processing, /prepareLocalVideoForQwen/);
   assert.match(processing, /"-c:a", "aac"/);
-  assert.doesNotMatch(qwen, /input_audio/);
+  const fullVideoAnalyzer = qwen.slice(qwen.indexOf("export async function analyzeVideoWithQwen"), qwen.indexOf("// DashScope's Qwen-Omni"));
+  assert.ok(fullVideoAnalyzer.length > 100);
+  assert.doesNotMatch(fullVideoAnalyzer, /input_audio/);
   assert.doesNotMatch(analysis, /transcribeAudioWithQwen|splitAudioForQwenAsr/);
   assert.doesNotMatch(processing, /segment_time", "270/);
   assert.match(tokscript, /options\.includeCover !== false/);
@@ -98,7 +102,8 @@ test("product documents auto-sync in lightweight mode and keep the manual prop a
   assert.match(analysis, /withOneNetworkRetry/);
   assert.match(analysis, /原视频下载较慢，正在自动重试/);
   assert.doesNotMatch(analysis, /assets\.audioPath|正在识别英语或西语口播/);
-  assert.match(analysis, /transcript_original: transcript \|\| analysis\.scenes/);
+  assert.match(analysis, /transcript_original: transcript,/);
+  assert.doesNotMatch(analysis, /transcript_original: transcript \|\| analysis\.scenes/);
   assert.match(analysis, /storedTokScriptFailure/);
   assert.match(analysis, /tokScriptTranscriptFailure\(transcript\)/);
   assert.match(analysis, /!relativeVideoPath \|\| !transcript\.trim\(\) \|\| storedTokScriptFailure/);
@@ -141,8 +146,11 @@ test("source tree contains no pasted API keys", async () => {
   assert.doesNotMatch(text, /sk_[a-f0-9]{32,}/i);
 });
 
-test("owner-approved no-login deployment retains independent Feishu callback authentication", async () => {
-  await assert.rejects(readFile(new URL("proxy.ts", root)), { code: "ENOENT" });
+test("admin login retains independent Feishu callback authentication", async () => {
+  const proxy = await readFile(new URL("proxy.ts", root), "utf8");
+  assert.match(proxy, /checkAdminAuthorization/);
+  assert.match(proxy, /publicMachineRoute/);
+  assert.match(proxy, /status:.*401/);
   const [auth, compose] = await Promise.all([
     readFile(new URL("lib/feishu/webhook-shared.ts", root), "utf8"),
     readFile(new URL("docker-compose.yml", root), "utf8"),
@@ -168,14 +176,20 @@ test("TikTok inputs require HTTPS TikTok hosts and PID links do not invent a pro
   assert.match(links, /www\.tiktok\.com\/view\/product/);
   assert.doesNotMatch(links, /zhenmi-cordless-blender/);
   assert.match(importRoute, /isTikTokUrl/);
-  assert.match(parseRoute, /const productUrl = String\(body\.productUrl \|\| ""\)\.trim\(\)/);
-  assert.match(parseRoute, /isExactTikTokProductSource\(productUrl, expectedPid\)/);
-  assert.doesNotMatch(parseRoute, /canonicalTikTokProductUrl/);
+  assert.match(parseRoute, /PRODUCT_LINK_ANALYSIS_RETIRED/);
+  assert.match(parseRoute, /status: 410/);
+  assert.doesNotMatch(parseRoute, /@\/lib\/product-parser|request\.json|canonicalTikTokProductUrl/);
 });
 
-test("local dashboard API exposes business data without leaking provider secrets", async () => {
-  const baseUrl = process.env.TEST_BASE_URL || "http://localhost:3000";
-  const response = await fetch(`${baseUrl}/api/dashboard`);
+test("dashboard handler returns real MySQL business data without exposing provider secrets", async t => {
+  const f = await createIsolatedDatabase(t);
+  const product = await f.database.createProduct({ name: "dashboard fixture", pid: "1731000000000000001" });
+  await f.database.saveProviderSetting({ provider: "qwen", encryptedApiKey: "fixture-secret-never-return", baseUrl: "https://provider.invalid", enabled: true });
+  const noBackground = moduleUrl("export const ensureFeishuConnection=async()=>null; export const resumePendingVideos=async()=>{};");
+  const { exports: route } = await f.load("app/api/dashboard/route.ts", {
+    "next/server": import.meta.resolve("next/server.js"), "@/lib/feishu/runtime": noBackground, "@/lib/queue": noBackground,
+  });
+  const response = await route.GET(new NextRequest("http://localhost/api/dashboard"));
   assert.equal(response.status, 200);
   const payload = await response.json();
   assert.ok(Array.isArray(payload.products));
@@ -183,6 +197,8 @@ test("local dashboard API exposes business data without leaking provider secrets
   assert.ok(Array.isArray(payload.providers));
   assert.ok(payload.products.every((product) => typeof product.pid === "string"));
   assert.ok(payload.providers.every((provider) => !("encryptedApiKey" in provider) && !("apiKey" in provider)));
+  assert.ok(payload.products.some(item => item.id === product.id));
+  assert.doesNotMatch(JSON.stringify(payload), /fixture-secret-never-return/);
 });
 
 test("Qwen uses bounded requests and outbound dependencies can use the macOS proxy", async () => {
@@ -228,50 +244,53 @@ test("finished videos can be deleted with their archived media", async () => {
 test("analysis page can quickly create a product with an optional PID", async () => {
   const [app, database, types] = await Promise.all([
     readFile(new URL("app/ViralAnalyzerApp.tsx", root), "utf8"),
-    readFile(new URL("lib/database.ts", root), "utf8"),
+    readFile(new URL("lib/db/schema.sql", root), "utf8"),
     readFile(new URL("lib/types.ts", root), "utf8"),
   ]);
   assert.match(app, /新增产品档案/);
   assert.match(app, /PID（选填）/);
   assert.match(app, /创建并选中/);
-  assert.match(database, /ALTER TABLE products ADD COLUMN pid/);
+  assert.match(database, /pid VARCHAR\(191\) NOT NULL DEFAULT ''/);
   assert.match(database, /idx_products_pid/);
   assert.match(types, /pid: string/);
 });
 
 test("Feishu automation supports direct Base write-back", async () => {
-  const [automation, route] = await Promise.all([
+  const [automation, route, inbox] = await Promise.all([
     readFile(new URL("lib/feishu/automation.ts", root), "utf8"),
     readFile(new URL("app/api/feishu/automation/route.ts", root), "utf8"),
+    readFile(new URL("lib/feishu/inbox.ts", root), "utf8"),
   ]);
   assert.match(automation, /writeBack\s*=\s*input\.writeBack === true/);
   assert.match(automation, /const flushPatch = async \(\) =>/);
   assert.match(automation, /await flushPatch\(\)/);
-  assert.match(route, /writeBack: true/);
+  assert.match(route, /await claimFeishuRequest/);
+  assert.match(route, /after\(\(\) => runFeishuInboxPass\(\)\)/);
+  assert.match(inbox, /await handleFeishuAutomation\(\{ client, \.\.\.input, fields, writeBack: true \}\)/);
   assert.match(route, /code: 0/);
   assert.match(route, /msg: "success"/);
 });
 
-test("Feishu button creates a manual template card in the background without product-link analysis", async () => {
+test("Feishu button durably queues PID-based template creation without the legacy product-link analyzer", async () => {
   const [automation, route] = await Promise.all([
     readFile(new URL("lib/feishu/automation.ts", root), "utf8"),
     readFile(new URL("app/api/feishu/automation/route.ts", root), "utf8"),
   ]);
-  assert.match(route, /after\(async \(\) =>/);
-  assert.match(route, /writeBack: true/);
+  assert.match(route, /await claimFeishuRequest/);
+  assert.match(route, /after\(\(\) => runFeishuInboxPass\(\)\)/);
   assert.doesNotMatch(route, /\{ status: 202 \}/);
   assert.match(route, /code: 0/);
   assert.match(route, /msg: "success"/);
   assert.doesNotMatch(route, /productDocument: ""/);
   assert.doesNotMatch(route, /activeProductJobs/);
-  assert.match(route, /Every accepted click schedules one refresh/);
+  assert.match(route, /kind: "handcard"/);
   assert.match(automation, /product-card-record:/);
   assert.doesNotMatch(automation, /canRelinkExistingDocument|cachedFallbackEligible|hasVerifiedCache/);
   assert.match(automation, /ensureProductCardByPid/);
-  assert.match(automation, /Product-link analysis is intentionally disabled/);
+  assert.match(automation, /Product-link analysis is disabled/);
   assert.match(automation, /exact `_PID` title suffix/);
   assert.doesNotMatch(automation, /parsePublicProductPage/);
-  assert.match(automation, /\[resolved\.map\.productDocument\]: shell\.documentUrl/);
+  assert.match(automation, /queueMappedPatch\(resolved\.map\.productDocument, shell\.documentUrl\)/);
 });
 
 test("generated Feishu documents grant company editors collaborator management", async () => {
@@ -288,9 +307,7 @@ test("generated Feishu documents grant company editors collaborator management",
 });
 
 test("product cards are created only by the Feishu button and identified by exact PID titles", async () => {
-  const [parser, openaiAnalyzer, automation, document, database, ensureDocument, tiktokProduct] = await Promise.all([
-    readFile(new URL("lib/product-parser.ts", root), "utf8"),
-    readFile(new URL("lib/openai-product-analyzer.ts", root), "utf8"),
+  const [automation, document, database, ensureDocument, tiktokProduct] = await Promise.all([
     readFile(new URL("lib/feishu/automation.ts", root), "utf8"),
     readFile(new URL("lib/feishu/document.ts", root), "utf8"),
     readFile(new URL("lib/database.ts", root), "utf8"),
@@ -300,57 +317,16 @@ test("product cards are created only by the Feishu button and identified by exac
   assert.match(tiktokProduct, /https:\/\/www\.tiktok\.com\/view\/product\/\$\{normalized\}/);
   assert.doesNotMatch(tiktokProduct, /TIKTOK_SHOP_SLUG/);
   assert.match(tiktokProduct, /shop\.tiktokw\.us/);
-  assert.match(parser, /__MODERN_ROUTER_DATA__/);
-  assert.match(parser, /product_model/);
-  assert.match(parser, /clean\(model\.product_id\) !== productId/);
-  assert.match(parser, /tools: \[\{ type: "web_search" \}\]/);
-  assert.match(parser, /enable_thinking: false/);
-  assert.match(parser, /hasUsableProductInfo/);
-  assert.match(parser, /needsCompletenessRetry/);
-  assert.match(parser, /explicitBundleCount/);
-  assert.match(parser, /enumeratedBundleFeatures/);
-  assert.match(parser, /qwenTranslateBundleFeatures/);
-  assert.match(parser, /productParameters: mergeAtomicText\(current\.productParameters, candidate\.productParameters\)/);
-  assert.match(parser, /numericSpecificationCount/);
-  assert.match(parser, /coreFunctions 必须恰好返回 \$\{bundleOutputCount\} 条/);
-  assert.match(parser, /temperature: 0/);
-  assert.match(parser, /产品主要功能/);
-  assert.match(parser, /JSON 键名必须严格使用/);
-  assert.match(parser, /SKU 不得填写 PID 或商品ID/);
-  assert.match(parser, /SKU is copied only from the exact-PID router model/);
-  assert.match(parser, /sku: base\.sku/);
-  assert.match(parser, /analyzeProductCaptureWithOpenAI/);
-  assert.match(parser, /parsedProductInfoFromOpenAICapture/);
-  assert.match(parser, /MAX_PRODUCT_IMAGES = 20/);
-  assert.match(parser, /playwright-core/);
-  assert.match(parser, /PRODUCT_DETAIL_CONTROL_LABELS/);
-  assert.match(parser, /"详细内容"/);
-  assert.match(parser, /requiredStableRounds/);
-  assert.match(parser, /all_product_images_unavailable/);
-  assert.match(parser, /scoped-dom-details/);
-  assert.match(parser, /max_pixels: MAX_IMAGE_PIXELS/);
-  assert.match(parser, /visualEvidence/);
-  assert.match(parser, /hasReliableVisualEvidence/);
-  assert.doesNotMatch(parser, /categoryFallbackPrompt/);
-  assert.match(parser, /不得使用常识补齐/);
-  assert.match(parser, /exactSourceMatched/);
-  assert.match(parser, /sellingPoints: ""/);
-  assert.match(parser, /sourceImageUrls: \[\]/);
-  assert.match(openaiAnalyzer, /gpt-5\.6-terra/);
-  assert.match(openaiAnalyzer, /type: "json_schema"/);
-  assert.match(openaiAnalyzer, /strict: true/);
-  assert.match(openaiAnalyzer, /（AI推断）/);
-  assert.match(openaiAnalyzer, /CONTROLLED_INFERENCE_TEMPLATES/);
-  assert.match(openaiAnalyzer, /titleHasAccessorySubject/);
-  assert.match(openaiAnalyzer, /role: "developer"/);
   assert.match(automation, /const productUrl = urlField/);
   assert.match(automation, /pid: suppliedPid/);
   assert.doesNotMatch(automation, /extractProductIdFromUrl/);
   assert.match(automation, /ensureProductCardByPid\(input\.client/);
   assert.match(automation, /pid: effectivePid/);
-  assert.match(automation, /手卡已就绪，请手动填写/);
+  assert.match(automation, /手卡空白基础资料已补录，已有内容保留/);
   assert.doesNotMatch(automation, /parsePublicProductPage/);
-  assert.doesNotMatch(automation, /syncProductCardManagedFields/);
+  assert.match(automation, /syncProductCardManagedFields/);
+  assert.match(automation, /fillEmptyOnly: true/);
+  assert.match(automation, /getProductCatalog\(effectivePid\)/);
   assert.doesNotMatch(automation, /productUrlFromPid\(pid\)/);
   assert.doesNotMatch(automation, /patch\[resolved\.map\.productUrl\]/);
   assert.doesNotMatch(automation, /hyperlinkFieldValue/);
@@ -366,13 +342,15 @@ test("product cards are created only by the Feishu button and identified by exac
   assert.match(document, /ensureProductCardShell/);
   assert.match(document, /ensureProductCardByPid/);
   assert.match(document, /findProductDocumentByPid/);
-  assert.match(document, /发现重复 PID 文档/);
+  assert.match(document, /已自动选择最近编辑的一份/);
+  assert.match(document, /return matches\[0\] \|\| null/);
   assert.match(document, /syncProductCardManagedFields/);
   assert.match(document, /PRODUCT_CARD_IDENTITY_LABELS/);
   assert.match(document, /PRODUCT_CARD_DERIVED_LABELS/);
   assert.match(document, /syncProductFieldText/);
   assert.match(document, /\["产品卖点", "", true\]/);
-  assert.match(document, /text_element_style: \{ link: \{ url: productUrl \} \}/);
+  assert.match(document, /text_element_style: \{ link: \{ url: linkUrl \} \}/);
+  assert.match(document, /styledProductFieldElements\(next, currentProduct\.productUrl\)/);
   assert.match(document, /核心功能A: ""/);
   assert.match(document, /核心功能E: ""/);
   assert.match(document, /核心功能: functions\.join\("；"\)/);
@@ -400,12 +378,21 @@ test("long-term learning is visible and used by future analysis", async () => {
   assert.match(app, /学习中心/);
 });
 
-test("learning API backfills completed reports", async () => {
-  const baseUrl = process.env.TEST_BASE_URL || "http://localhost:3000";
-  const response = await fetch(`${baseUrl}/api/learning`);
+test("learning handler backfills completed reports in an isolated real MySQL", async t => {
+  const f = await createIsolatedDatabase(t);
+  const product = await f.database.createProduct({ name: "learning fixture" });
+  const video = await f.database.createVideo({ productId: product.id, sourceType: "tiktok", sourceUrl: "https://example.test/video" });
+  await f.database.updateVideo(video.id, { status: "completed", analysis_json: { title: "fixture",
+    hook: { type: "question", description: "problem", whyItWorks: "clear" }, structureFormula: "problem-solution",
+    strengths: ["clear"], weaknesses: [], scenes: [], summary: "fixture", scores: {traffic:80,conversion:70,visual:70,product:80,audio:60,rhythm:70} } });
+  const query = await loadTestModule("lib/db/query.ts");
+  const learning = await f.load("lib/learning.ts", { "@/lib/db/query": query.url });
+  const { exports: route } = await f.load("app/api/learning/route.ts", { "next/server": import.meta.resolve("next/server.js"), "@/lib/learning": learning.url });
+  const response = await route.GET();
   assert.equal(response.status, 200);
   const payload = await response.json();
-  assert.ok(Number.isInteger(payload.learnedVideos));
+  assert.equal(payload.learnedVideos, 1);
   assert.ok(Array.isArray(payload.profiles));
   assert.ok(Array.isArray(payload.recentMemories));
+  assert.equal(payload.recentMemories[0].videoId, video.id);
 });

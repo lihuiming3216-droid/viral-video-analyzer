@@ -1,6 +1,7 @@
 import "server-only";
 
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { formatTime } from "@/lib/json-utils";
@@ -58,10 +59,61 @@ export function buildTimestampedText(segments: TranscriptSegment[], texts: strin
  * Also returns the per-segment translations so the caller can reuse them for
  * the plain-text timestamped fields without a second Qwen call.
  */
-export async function generateBilingualSubtitleFile(segments: TranscriptSegment[]) {
+const subtitleWork = new Map<string, Promise<string[]>>();
+
+async function cachedTranslations(segments: TranscriptSegment[], cacheKey?: string) {
+  if (!cacheKey) return translateSegmentsWithQwen({ segments });
+  // Scope by task, not source URL: the same video in another handcard remains
+  // an independent task. Only successful translations survive delivery retries.
+  const key = createHash("sha256").update(JSON.stringify([cacheKey, segments])).digest("hex");
+  const existing = subtitleWork.get(key);
+  if (existing) return existing;
+  const work = (async () => {
+    const directory = path.join(process.cwd(), ".data", "subtitle-cache");
+    await mkdir(directory, { recursive: true });
+    const target = path.join(directory, `${key}.json`);
+    const budgetTarget = path.join(directory, createHash("sha256").update(cacheKey).digest("hex"));
+    try {
+      const cached: unknown = JSON.parse(await readFile(target, "utf8"));
+      if (Array.isArray(cached) && cached.length === segments.length
+        && cached.every(value => typeof value === "string" && value.trim())) return cached as string[];
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
+    }
+    const beforeRequest = async () => {
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          // Reserve before the network call. A crash/timeout is uncertain,
+          // never permission to charge again beyond the two-request budget.
+          await writeFile(`${budgetTarget}.request-${attempt}`, JSON.stringify({ requestedAt: new Date().toISOString() }), { mode: 0o600, flag: "wx" });
+          return;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        }
+      }
+      throw new Error("字幕翻译已达到本次任务两次请求上限；其他结果保留");
+    };
+    const translations = await translateSegmentsWithQwen({ segments, beforeRequest });
+    if (translations.length !== segments.length || translations.some(value => !value?.trim())) {
+      throw new Error("字幕翻译不完整，未缓存结果");
+    }
+    const temporary = `${target}.${randomUUID()}.tmp`;
+    try {
+      await writeFile(temporary, JSON.stringify(translations), { mode: 0o600 });
+      await rename(temporary, target);
+    } finally {
+      await rm(temporary, { force: true });
+    }
+    return translations;
+  })();
+  subtitleWork.set(key, work);
+  try { return await work; } finally { subtitleWork.delete(key); }
+}
+
+export async function generateBilingualSubtitleFile(segments: TranscriptSegment[], cacheKey?: string) {
   const usable = segments.filter((segment) => segment.text.trim());
   if (!usable.length) return null;
-  const translations = await translateSegmentsWithQwen({ segments: usable });
+  const translations = await cachedTranslations(usable, cacheKey);
   const srt = buildBilingualSrt(usable, translations);
   const dir = await mkdtemp(path.join(tmpdir(), "viral-subtitle-"));
   const filePath = path.join(dir, "subtitle.srt");

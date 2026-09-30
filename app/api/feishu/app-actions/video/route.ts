@@ -1,16 +1,16 @@
 import { after, NextRequest, NextResponse } from "next/server";
-import { createVideo, getFeishuFieldMapping, saveFeishuAutomationJob } from "@/lib/database";
+import { getFeishuFieldMapping } from "@/lib/database";
 import { assertChatgptActionRequest, getChatgptFeishuClient } from "@/lib/feishu/chatgpt-app";
 import {
   fitAutomationFieldMapToTable,
   getBaseRecordFields,
-  patchBaseRecord,
   resolveAutomationFields,
 } from "@/lib/feishu/automation";
-import { findOrCreateProduct } from "@/lib/feishu/product-lookup";
 import { payloadFieldMap, safeBackgroundError } from "@/lib/feishu/webhook-shared";
-import { enqueueVideos } from "@/lib/queue";
 import { isTikTokUrl } from "@/lib/tiktok-product";
+import { claimFeishuRequest, feishuRequestReplay, FeishuRequestIdentityError } from "@/lib/feishu/request-dedup";
+
+import { runFeishuInboxPass } from "@/lib/feishu/inbox";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -36,7 +36,7 @@ export async function POST(request: NextRequest) {
     });
 
     const client = getChatgptFeishuClient();
-    const stored = await getFeishuFieldMapping(`${appToken}:${tableId}`).catch(() => null);
+    const stored = await getFeishuFieldMapping(`${appToken}:${tableId}`);
     const requested = payloadFieldMap(body.fieldMap || body.field_map);
     const fieldMap = await fitAutomationFieldMapToTable(client, {
       appToken,
@@ -52,43 +52,16 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ code: 400, msg: "这张表没有视频文件、原口播或中文翻译字段" }, { status: 400 });
     }
 
-    after(async () => {
-      try {
-        const product = await findOrCreateProduct(resolved.productName || "飞书任务表待命名", resolved.pid);
-        const video = await createVideo({
-          productId: product.id,
-          sourceType: "tiktok",
-          sourceUrl: resolved.videoUrl,
-          title: resolved.productName || "任务表视频",
-          analysisMode: "transcript_only",
-        });
-        await saveFeishuAutomationJob({
-          videoId: video.id,
-          appToken,
-          tableId,
-          recordId,
-          fieldMap: { ...fieldMap },
-          credentialSource: "chatgpt",
-        });
-        await enqueueVideos([video.id]);
-        if (fieldMap.status) {
-          await patchBaseRecord(client, {
-            appToken,
-            tableId,
-            recordId,
-            fields: { [fieldMap.status]: "排队中" },
-          });
-        }
-        console.info("[feishu-chatgpt-video] queued", { recordId, videoId: video.id, pid: product.pid });
-      } catch (error) {
-        console.error("[feishu-chatgpt-video] failed", { recordId, error: safeBackgroundError(error) });
-      }
-    });
-
-    return NextResponse.json({ code: 0, msg: "已接收，正在处理视频", accepted: true });
+    const receipt = await claimFeishuRequest(request.headers, body, ["video-app", appToken, tableId, recordId], { fieldMap: requested },
+      { kind: "video", credentialSource: "chatgpt", appToken, tableId, recordId, fields: fields, fieldMap: resolved.map });
+    if (receipt?.duplicate) return NextResponse.json(feishuRequestReplay(receipt));
+    after(() => runFeishuInboxPass());
+    return NextResponse.json({ code: 0, msg: "已接收，正在处理视频", accepted: true, jobId: receipt?.id,
+      deduplication: receipt?.identified ? "invocation" : "request_id_missing" });
   } catch (error) {
     const message = safeBackgroundError(error);
     const unauthorized = /身份|授权/.test(message);
-    return NextResponse.json({ code: unauthorized ? 401 : 500, msg: message }, { status: unauthorized ? 401 : 500 });
+    const status = error instanceof FeishuRequestIdentityError ? error.status : unauthorized ? 401 : 500;
+    return NextResponse.json({ code: status, msg: message }, { status });
   }
 }

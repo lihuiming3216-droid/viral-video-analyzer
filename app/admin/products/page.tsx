@@ -4,6 +4,7 @@ import { Pagination } from "../Pagination";
 import { randomUUID } from "node:crypto";
 import { requireAdmin } from "@/lib/require-admin";
 import { ReorganizeForm } from "./ReorganizeForm";
+import { RefreshCardForm } from "./RefreshCardForm";
 import { readCatalogStatuses } from "@/lib/products/catalog-store";
 
 export const dynamic = "force-dynamic";
@@ -91,9 +92,12 @@ export default async function AdminProductsPage({ searchParams }: { searchParams
                   <td style={{ color: "var(--text-muted)" }}>{product.category || "—"}</td>
                   <td>
                     {product.documentUrl ? (
-                      <a href={product.documentUrl} target="_blank" rel="noreferrer" style={{ fontSize: 11.5 }}>
-                        {product.name}_{product.pid} ↗
-                      </a>
+                      <>
+                        <a href={product.documentUrl} target="_blank" rel="noreferrer" style={{ fontSize: 11.5 }}>
+                          {product.name}_{product.pid} ↗
+                        </a>
+                        {product.pid && product.documentId && <RefreshCardForm productId={product.id} name={product.name} />}
+                      </>
                     ) : (
                       <span className="admin-badge" style={{ background: "var(--warning-soft)", color: "var(--warning)" }}>待补录</span>
                     )}

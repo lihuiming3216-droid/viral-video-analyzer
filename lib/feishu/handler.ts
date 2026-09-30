@@ -8,6 +8,7 @@ import { parseFeishuSubmission } from "@/lib/feishu/parser";
 import { applyFeishuCardAction } from "@/lib/feishu/notifications";
 import { findOrCreateProduct } from "@/lib/feishu/product-lookup";
 import { setVideoProgressHandler } from "@/lib/video-events";
+import { safeSdkLogValues } from "@/lib/feishu/safe-logger";
 import {
   createFeishuBatch, createFeishuDelivery, recordFeishuEvent, updateFeishuBatch,
   updateFeishuDelivery, upsertFeishuTarget,
@@ -103,14 +104,20 @@ export function registerFeishuHandlers(channel: LarkChannel) {
       }));
     }
 
-    const sent = await channel.send(message.chatId, { card: buildProgressCard({
-      productName: product.name,
-      pid: product.pid,
-      senderOpenId: message.senderId,
-      items: videos,
-    }) }, replyOptions(message.messageId, chatType));
-    await updateFeishuBatch(batch.id, { progressMessageId: sent.messageId, status: "processing" });
-    if (deliveries.length === 1) await updateFeishuDelivery(deliveries[0].id, { cardMessageId: sent.messageId });
+    try {
+      const sent = await channel.send(message.chatId, { card: buildProgressCard({
+        productName: product.name,
+        pid: product.pid,
+        senderOpenId: message.senderId,
+        items: videos,
+      }) }, replyOptions(message.messageId, chatType));
+      await updateFeishuBatch(batch.id, { progressMessageId: sent.messageId, status: "processing" });
+      if (deliveries.length === 1) await updateFeishuDelivery(deliveries[0].id, { cardMessageId: sent.messageId });
+    } catch (error) {
+      // A progress notification is not a prerequisite for processing. The
+      // independent durable deliveries still own the eventual report.
+      console.warn("[feishu-handler] progress-card delivery failed", { batchId: batch.id }, ...safeSdkLogValues([error]));
+    }
 
     if (enqueueIds.size) await enqueueVideos([...enqueueIds]);
   });

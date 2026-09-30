@@ -9,6 +9,7 @@ import {
   savePromptDebugCapture,
   updateVideo,
   updateVideoAttemptDiagnostics,
+  recordVideoStage,
 } from "@/lib/database";
 import { clampScore, formatTime } from "@/lib/json-utils";
 import { getLearningContext, learnFromVideo } from "@/lib/learning";
@@ -348,7 +349,9 @@ async function ownsVideoAttempt(videoId: string, expectedAttemptNumber?: number)
 
 async function assertVideoAttempt(videoId: string, signal?: AbortSignal, expectedAttemptNumber?: number) {
   signal?.throwIfAborted();
-  if (!(await ownsVideoAttempt(videoId, expectedAttemptNumber))) throw new Error("分析任务已被新的执行替代");
+  const video = await getVideo(videoId, false);
+  if (!video || video.status === "stopped") throw new Error("视频任务已停止");
+  if (expectedAttemptNumber !== undefined && video.attemptCount !== expectedAttemptNumber) throw new Error("分析任务已被新的执行替代");
 }
 
 function qwenDiagnosticPhase(diagnostic: QwenRequestDiagnostic): VideoAttemptCallDiagnostic["phase"] {
@@ -389,6 +392,10 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
   const product = await getProduct(initial.productId);
   if (!product) throw new Error("产品档案不存在");
   const analysisMode = initial.analysisMode;
+  const stageAttempt = expectedAttemptNumber ?? initial.attemptCount ?? 0;
+  const recordStage = (stage: Parameters<typeof recordVideoStage>[2], state: Parameters<typeof recordVideoStage>[3], error = "") =>
+    recordVideoStage(videoId, stageAttempt, stage, state, error);
+  let activeStage: "download" | "analysis" = "download";
   const trace: string[] = [];
   let transcript = initial.transcriptOriginal;
   let transcriptZh = String(initial.transcriptZh || "");
@@ -406,26 +413,31 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
     // task; an explicit stop, hard timeout or newer execution does.
     translationTask = (async () => {
       await assertVideoAttempt(videoId, signal, expectedAttemptNumber);
+      await recordStage("translation", "running");
       const translated = await translateTranscriptWithQwen({ transcript: transcriptForTranslation, signal });
       await assertVideoAttempt(videoId, signal, expectedAttemptNumber);
       const latest = await getVideo(videoId, false);
-      if (!translated.trim() || !latest || latest.status === "stopped") return;
+      if (!translated.trim()) throw new Error("未返回有效中文翻译");
+      if (!latest || latest.status === "stopped") return;
       transcriptZh = String(latest.transcriptZh || "").trim() || translated.trim();
       if (!latest.transcriptZh?.trim()) await updateVideo(videoId, { transcript_zh: transcriptZh });
+      await recordStage("translation", "completed");
       emitVideoProgress(videoId);
       void deliverProductDocument();
       void import("@/lib/feishu/automation")
         .then(({ deliverEarlyTranscript }) => deliverEarlyTranscript(videoId))
         .catch(() => undefined);
-    })().catch(() => {
-      // Translation failure must not change the video-analysis result.
+    })().catch(async () => {
+      // Keep the failure durable without changing the video-analysis result or
+      // copying an untrusted provider response into user-visible diagnostics.
+      await recordStage("translation", "failed", signal?.aborted ? "翻译已停止，其他已完成结果保留" : "中文翻译失败，原口播及其他结果保留").catch(() => undefined);
     });
     return translationTask;
   };
   try {
     await assertVideoAttempt(videoId, signal, expectedAttemptNumber);
     let relativeVideoPath = initial.originalPath;
-    let transcriptSegments: Array<{ start: number; end: number; text: string }> = [];
+    let transcriptSegments = initial.transcriptSegments || [];
 
     const storedTokScriptFailure = initial.sourceType === "tiktok"
       && tokScriptTranscriptFailure(transcript);
@@ -434,10 +446,15 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
     if (needsTokScriptRefresh) {
       await setStage(videoId, "downloading", "正在通过 TokScript 获取视频和公开数据", 12);
       const tokOptions = {
+        allowPartial: true,
+        includeTranscript: !transcript.trim() || Boolean(storedTokScriptFailure),
+        includeDownload: !relativeVideoPath,
         includeCover: analysisMode !== "product_doc",
         // One bad/expired document link must never block every later row.
         timeoutMs: analysisMode === "product_doc" ? 90_000 : 180_000,
       };
+      await recordStage("transcript", tokOptions.includeTranscript ? "running" : "completed");
+      await recordStage("download", relativeVideoPath ? "completed" : "running");
       const tok = await withOneNetworkRetry(
         () => fetchTikTok(initial.sourceUrl || "", signal, tokOptions),
         () => { void setStage(videoId, "downloading", "获取视频信息较慢，正在自动重试", 14); },
@@ -446,9 +463,10 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
       await assertVideoAttempt(videoId, signal, expectedAttemptNumber);
       // File acquisition may fall back independently of the saved transcript.
       const remoteVideoUrl = tok.downloadUrl || "";
-      transcript = tok.transcript;
+      transcript = tok.transcript || (storedTokScriptFailure ? "" : transcript);
       transcriptZh = tok.transcriptZh || transcriptZh;
-      transcriptSegments = tok.segments;
+      if (tok.transcript) transcriptSegments = tok.segments;
+      await recordStage("transcript", transcript.trim() ? "completed" : "failed", tok.transcriptError || (transcript.trim() ? "" : "TokScript 未返回有效口播"));
       // Persist metadata before downloading the media. If the CDN is slow, a
       // retry keeps the already-fetched transcript and diagnostics instead of
       // losing the whole TokScript result.
@@ -507,9 +525,12 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
         }) : null;
         await assertVideoAttempt(videoId, signal, expectedAttemptNumber);
         await updateVideo(videoId, { original_path: relativeVideoPath, cover_path: coverPath });
+        await recordStage("download", "completed");
       }
     } else if (initial.sourceType === "tiktok") {
       trace.push("本地缓存：复用已保存的 TikTok 原片和文案");
+      await recordStage("transcript", "completed");
+      await recordStage("download", "completed");
     }
 
     // 原口播（and 中文翻译, if available) is ready long before the multi-minute
@@ -534,9 +555,12 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
     void deliverProductDocument();
 
     if (!relativeVideoPath) throw new Error("没有可分析的视频文件");
+    if (transcriptZh.trim()) await recordStage("translation", "completed");
+    else if (!transcript.trim()) await recordStage("translation", "skipped", "尚无可翻译的有效口播，不将提取失败当作无口播");
 
     let finalTranslation = "";
     if (analysisMode === "transcript_only") {
+      await recordStage("analysis", "skipped");
       // 任务安排表只需要 文件/原口播/中文翻译/链接字幕/时间戳原口播/时间戳中文——全部
       // 来自 TokScript 本身（或下面这一次轻量文本翻译），不依赖场景拆解或 Qwen 完整
       // 视频分析。那三步（识别镜头/Qwen视频分析/生成报告）只是为 full/product_doc
@@ -548,7 +572,7 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
       if (finalTranslation) transcriptZh = finalTranslation;
       await updateVideo(videoId, {
         status: "completed",
-        stage: "分析完成",
+        stage: transcript.trim() && transcriptZh.trim() ? "处理完成" : "部分完成，请查看各环节结果",
         progress: 100,
         processing_started_at: null,
         transcript_original: transcript,
@@ -556,6 +580,8 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
         error_message: null,
       });
     } else {
+    activeStage = "analysis";
+    await recordStage("analysis", "running");
     await setStage(videoId, "extracting", "正在识别镜头并提取关键画面", 36);
     const assets = await extractVideoAssets(videoId, relativeVideoPath, signal, {
       light: analysisMode === "product_doc",
@@ -732,11 +758,12 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
       score_rhythm: analysis.scores.rhythm,
       summary: analysis.summary,
       hook_summary: analysis.hook.description,
-      transcript_original: transcript || analysis.scenes.map((scene) => scene.originalText).filter(Boolean).join(" "),
+      transcript_original: transcript,
       ...(finalTranslation ? { transcript_zh: finalTranslation } : {}),
       analysis_json: JSON.stringify(analysis),
       error_message: null,
     });
+    await recordStage("analysis", "completed");
     }
     // Push the finished result into the matching row immediately. The periodic
     // document scan remains only a safety net and is not the normal delivery
@@ -756,6 +783,13 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
     }
   } catch (error) {
     const abortReason = signal?.aborted && signal.reason instanceof Error ? signal.reason : null;
+    // Recovery alone publishes the interruption after an execution lock is lost.
+    if (abortReason?.name === "VideoExecutionLostError") throw error;
+    await recordStage(activeStage, "failed", signal?.aborted ? "该环节已停止" : activeStage === "download" ? "视频获取未完成，已取得的口播和翻译保留" : "视频分析失败，文件和口播翻译保留").catch(() => undefined);
+    if (activeStage === "download" && !transcript.trim()) {
+      await recordStage("transcript", "failed", "口播提取未完成，不应判定为无口播").catch(() => undefined);
+      await recordStage("translation", "skipped", "尚无可翻译的有效口播").catch(() => undefined);
+    }
     const timedOut = abortReason?.name === "VideoTaskTimeoutError";
     // The queue owns hard-timeout finalization. Keeping that path in one place
     // prevents analyzeVideo and the queue fallback from both publishing the

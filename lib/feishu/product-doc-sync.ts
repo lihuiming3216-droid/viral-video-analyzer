@@ -522,7 +522,7 @@ async function syncProductDocumentUnlocked(
             && currentVideo.productDocFailureDelivered
             && currentVideo.attemptCount === expectedAttemptNumber) {
             await updateVideo(video.id, { product_doc_failure_delivered: 0, error_message: null });
-            await enqueueVideos([video.id]);
+            await enqueueVideos([video.id], { restart: true });
             result.queued += 1;
             continue;
           }
@@ -619,7 +619,8 @@ export async function syncAllProductDocuments() {
   });
   if (!documents.length) return { documents: 0, found: 0, queued: 0, completed: 0, failed: 0 };
 
-  const batchSize = Math.max(1, Math.min(20, Number(process.env.PRODUCT_DOC_SYNC_BATCH_SIZE || 12)));
+  const configuredBatch = Number(process.env.PRODUCT_DOC_SYNC_BATCH_SIZE || 12);
+  const batchSize = Number.isFinite(configuredBatch) ? Math.max(1, Math.min(20, Math.floor(configuredBatch))) : 12;
   const start = workerState.__productDocSyncCursor! % documents.length;
   const selected = Array.from({ length: Math.min(batchSize, documents.length) }, (_, index) => documents[(start + index) % documents.length]);
   workerState.__productDocSyncCursor = (start + selected.length) % documents.length;
@@ -646,7 +647,8 @@ export async function syncAllProductDocuments() {
 
 export function startProductDocumentSyncWorker() {
   if (workerState.__productDocSyncTimer) return;
-  const interval = Math.max(5_000, Number(process.env.PRODUCT_DOC_SYNC_INTERVAL_MS || 20_000));
+  const configuredInterval = Number(process.env.PRODUCT_DOC_SYNC_INTERVAL_MS || 20_000);
+  const interval = Number.isFinite(configuredInterval) ? Math.max(5_000, configuredInterval) : 20_000;
   const run = async () => {
     if (workerState.__productDocSyncRunning) return;
     workerState.__productDocSyncRunning = true;

@@ -61,6 +61,14 @@ test("both release paths require the download-fallback regression tests", () => 
   }
 });
 
+test("both release paths include the reliability audit and provider transcript regressions", () => {
+  for (const text of [workflow, read(".github/workflows/deploy.yml")]) {
+    for (const file of ["reliability-audit", "tokscript-transcript-source", "feishu-docx-video-preview", "feishu-request-dedup", "feishu-inbox", "video-execution", "product-link-retirement"]) {
+      assert.ok(text.includes(`tests/${file}.test.mjs`));
+    }
+  }
+});
+
 test("delivery protection and real MySQL persistence are checked before release", () => {
   for (const text of [workflow, read(".github/workflows/deploy.yml")]) {
     assert.match(text, /tests\/feishu-delivery-guard\.test\.mjs/);
@@ -68,4 +76,5 @@ test("delivery protection and real MySQL persistence are checked before release"
   assert.match(read("deploy/smoke-test.sh"), /FEISHU_DELIVERY_MYSQL_TEST=isolated-test-only/);
   assert.match(read("deploy/smoke-test.sh"), /tests\/feishu-delivery-mysql\.test\.mjs/);
   assert.match(read("deploy/check-runtime.cjs"), /SELECT 1 FROM feishu_automation_delivery_blocks LIMIT 1/);
+  assert.match(read("deploy/check-runtime.cjs"), /SELECT 1 FROM feishu_request_receipts LIMIT 1/);
 });

@@ -152,7 +152,7 @@ export async function notifyFeishuVideoProgress(videoId: string) {
         items: [video],
       })).catch(() => undefined);
     }
-    if (video.status === "completed") void deliverCompletedVideo(delivery.id, channel);
+    if (video.status === "completed") void deliverCompletedVideo(delivery.id, channel).catch(() => undefined);
     if (["failed", "stopped"].includes(video.status)) await failDelivery(channel, delivery, video);
   }
 }
@@ -185,6 +185,7 @@ export async function applyFeishuCardAction(channel: LarkChannel, input: {
   }
 
   if (action === "reanalyze") {
+    if (!["completed", "failed", "stopped"].includes(video.status)) return;
     let delivery = await getFeishuDeliveryByCardMessage(input.messageId, videoId);
     if (!delivery) {
       const target = await getFeishuTarget(input.chatId);
@@ -196,13 +197,12 @@ export async function applyFeishuCardAction(channel: LarkChannel, input: {
       });
     }
     await updateFeishuDelivery(delivery.id, { cardMessageId: input.messageId, status: "queued", errorMessage: "" });
-    await updateVideo(videoId, { status: "queued", stage: "已重新加入队列", progress: 2, error_message: null });
+    await enqueueVideos([videoId], { restart: true });
     const product = await getProduct(video.productId);
     const refreshed = (await getVideo(videoId, false))!;
     await channel.updateCard(input.messageId, buildProgressCard({
       productName: product?.name || video.productName, pid: product?.pid || "", senderOpenId: input.operatorOpenId,
       items: [refreshed],
     }));
-    await enqueueVideos([videoId]);
   }
 }

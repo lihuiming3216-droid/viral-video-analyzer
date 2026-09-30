@@ -1,12 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import { readFile } from "node:fs/promises";
+import {createIsolatedDatabase} from "./helpers/isolated-mysql.mjs";
 import test from "node:test";
 import ts from "typescript";
 
-const databaseSource = await readFile(new URL("../lib/database.ts", import.meta.url), "utf8");
 const queueSource = await readFile(new URL("../lib/queue.ts", import.meta.url), "utf8");
 
 test("explicit submissions always create a fresh task for a repeated link", async () => {
@@ -23,66 +20,25 @@ test("explicit submissions always create a fresh task for a repeated link", asyn
   assert.match(automation, /createVideo/);
 });
 
-async function loadDatabase(dataRoot, nonce) {
-  let compiled = ts.transpileModule(databaseSource, {
-    compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
-  }).outputText;
-  compiled = compiled
-    .replace('import "server-only";', "")
-    .replace('const dataRoot = path.join(process.cwd(), ".data");', `const dataRoot = ${JSON.stringify(dataRoot)};`);
-  return import(`data:text/javascript;base64,${Buffer.from(`${compiled}\n// ${nonce}`).toString("base64")}`);
-}
-
-test("legacy unique source URLs migrate and repeated links create independent tasks", async () => {
-  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "viral-repeated-links-"));
-  const dataRoot = path.join(temporaryRoot, ".data");
-  await mkdir(dataRoot, { recursive: true });
-  delete globalThis.__viralDb;
-  const first = await loadDatabase(dataRoot, "first");
-  const product = first.createProduct({ name: "重复链接产品" });
-  const url = "https://www.tiktok.com/t/repeat-link/";
-  const original = first.createVideo({ productId: product.id, sourceType: "tiktok", sourceUrl: url });
-  first.saveFeishuAutomationJob({
-    videoId: original.id,
-    appToken: "app",
-    tableId: "table",
-    recordId: "record",
-    fieldMap: {},
-  });
-  first.getDb().close();
-  delete globalThis.__viralDb;
-
-  const raw = new DatabaseSync(path.join(dataRoot, "viral-video-analyzer.sqlite"));
-  raw.exec("CREATE UNIQUE INDEX legacy_unique_source_url ON videos(source_url)");
-  raw.close();
-
-  const migrated = await loadDatabase(dataRoot, "migrated");
-  try {
-    const repeated = migrated.createVideo({ productId: product.id, sourceType: "tiktok", sourceUrl: url });
-    assert.notEqual(repeated.id, original.id);
-    assert.equal(migrated.getVideoBySourceUrl(url).id, repeated.id, "document lookup uses the newest independent task");
-    const uniqueSourceIndexes = migrated.getDb().prepare("PRAGMA index_list(videos)").all()
-      .filter((index) => Number(index.unique))
-      .filter((index) => {
-        const columns = migrated.getDb().prepare(`PRAGMA index_info(${JSON.stringify(String(index.name))})`).all();
-        return columns.some((column) => String(column.name) === "source_url");
-      });
-    assert.equal(uniqueSourceIndexes.length, 0);
-    assert.equal(migrated.getDb().prepare("PRAGMA foreign_key_check").all().length, 0);
-    assert.equal(migrated.getFeishuAutomationJobs(original.id).length, 1, "dependent delivery rows survive the rebuild");
-    const attempt = migrated.startVideoAttempt(repeated.id);
-    migrated.updateVideo(repeated.id, { status: "failed", error_message: "Qwen 返回字段不完整" });
-    migrated.finishVideoAttempt(attempt.attemptId, repeated.id, "failed", "Qwen 返回字段不完整");
-    const recorded = migrated.getDb().prepare("SELECT * FROM video_attempts WHERE video_id=?").get(repeated.id);
-    assert.equal(recorded.status, "failed");
-    assert.equal(recorded.error_message, "Qwen 返回字段不完整");
-    assert.ok(recorded.started_at);
-    assert.ok(recorded.finished_at);
-  } finally {
-    migrated.getDb().close();
-    delete globalThis.__viralDb;
-    await rm(temporaryRoot, { recursive: true, force: true });
-  }
+test("MySQL permits independent repeated links and preserves attempts and per-row deliveries", async t => {
+  const {database:db, rows, pool, reapplySchema}=await createIsolatedDatabase(t);
+  const product=await db.createProduct({name:"重复链接产品"});
+  const url="https://www.tiktok.com/t/repeat-link/";
+  const original=await db.createVideo({productId:product.id,sourceType:"tiktok",sourceUrl:url});
+  await db.saveFeishuAutomationJob({videoId:original.id,appToken:"app",tableId:"table",recordId:"record",fieldMap:{}});
+  await pool.query("UPDATE videos SET created_at='2026-08-01T00:00:00.000Z' WHERE id=?",[original.id]);
+  await reapplySchema();
+  const repeated=await db.createVideo({productId:product.id,sourceType:"tiktok",sourceUrl:url});
+  assert.notEqual(repeated.id,original.id);
+  assert.equal((await db.getVideoBySourceUrl(url)).id,repeated.id);
+  assert.equal((await rows("SHOW INDEX FROM videos")).filter(index=>index.Non_unique===0&&index.Column_name==="source_url").length,0);
+  assert.equal((await db.getFeishuAutomationJobs(original.id)).length,1);
+  const attempt=await db.startVideoAttempt(repeated.id);
+  await db.updateVideo(repeated.id,{status:"failed",error_message:"Qwen 返回字段不完整"});
+  await db.finishVideoAttempt(attempt.attemptId,repeated.id,"failed","Qwen 返回字段不完整");
+  const [recorded]=await rows("SELECT * FROM video_attempts WHERE video_id=?",[repeated.id]);
+  assert.equal(recorded.status,"failed");assert.equal(recorded.error_message,"Qwen 返回字段不完整");
+  assert.ok(recorded.started_at);assert.ok(recorded.finished_at);
 });
 
 async function loadQueue(hooks, timeoutMs = 5_000) {
@@ -92,7 +48,12 @@ async function loadQueue(hooks, timeoutMs = 5_000) {
     export const finishOpenVideoAttempts = (...args) => hooks().finishOpenVideoAttempts?.(...args);
     export const finishVideoAttempt = (...args) => hooks().finishVideoAttempt?.(...args);
     export const getPendingVideoIds = (...args) => hooks().getPendingVideoIds?.(...args) || [];
-    export const getStaleProcessingVideoIds = (...args) => hooks().getStaleProcessingVideoIds?.(...args) || [];
+    export const prepareVideoForQueue = async (id, restart) => {
+      const video = hooks().getVideo(id);
+      if (!video || video.processingStartedAt || !["queued", "waiting", ...(restart ? ["completed", "failed", "stopped"] : [])].includes(video.status)) return false;
+      hooks().updateVideo(id, {status:"queued", error_message:null}); return true;
+    };
+    export const tryAcquireVideoExecution = async () => ({valid:()=>true,release:async()=>{}});
     export const getVideo = (...args) => hooks().getVideo?.(...args) || null;
     export const replaceScenes = (...args) => hooks().replaceScenes?.(...args);
     export const startVideoAttempt = (...args) => hooks().startVideoAttempt?.(...args);
@@ -111,11 +72,14 @@ async function loadQueue(hooks, timeoutMs = 5_000) {
     .replaceAll('"@/lib/analysis"', JSON.stringify(stubUrl))
     .replaceAll('"@/lib/video-events"', JSON.stringify(stubUrl))
     .replaceAll('"@/lib/video-processing"', JSON.stringify(stubUrl))
+    .replaceAll('"@/lib/video-execution"', JSON.stringify(stubUrl))
     .replace("30 * 60 * 1_000", String(timeoutMs));
   delete globalThis.__viralQueue;
   delete globalThis.__viralQueueScheduling;
   delete globalThis.__viralQueueActiveIds;
   delete globalThis.__viralQueueControllers;
+  delete globalThis.__viralQueueRecovering;
+  delete globalThis.__viralQueueDeferred;
   return import(`data:text/javascript;base64,${Buffer.from(`${compiled}\n// ${Math.random()}`).toString("base64")}`);
 }
 
@@ -227,11 +191,10 @@ test("a completed analysis is never erased if timeout fires during final deliver
 });
 
 test("startup stops stale processing tasks but preserves an uploaded original", async () => {
-  const video = { id: "legacy", status: "analyzing", sourceType: "upload", originalPath: "legacy/original.mov", errorMessage: null };
+  const video = { id: "legacy", status: "analyzing", sourceType: "upload", originalPath: "legacy/original.mov", errorMessage: null, processingStartedAt:"2020-01-01T00:00:00.000Z" };
   const cleaned = [];
   const queue = await loadQueue({
-    getStaleProcessingVideoIds: () => [video.id],
-    getPendingVideoIds: () => [],
+    getPendingVideoIds: () => [video.id],
     getVideo: () => video,
     updateVideo: (_id, patch) => Object.assign(video, {
       status: patch.status || video.status,
@@ -241,7 +204,8 @@ test("startup stops stale processing tasks but preserves an uploaded original", 
     finishOpenVideoAttempts: () => {},
     deleteVideoAttemptCache: (...args) => cleaned.push(args),
   });
-  queue.resumePendingVideos();
+  await queue.resumePendingVideos();
+  await waitFor(() => video.status === "stopped");
   assert.equal(video.status, "stopped");
   assert.match(video.errorMessage, /超过30分钟/);
   assert.deepEqual(cleaned, [[video.id, video.originalPath]]);

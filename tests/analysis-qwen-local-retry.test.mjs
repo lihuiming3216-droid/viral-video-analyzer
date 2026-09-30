@@ -21,6 +21,7 @@ async function loadAnalysis(hooks) {
     export const getVideo = (...args) => hooks().getVideo(...args);
     export const replaceScenes = (...args) => hooks().replaceScenes?.(...args);
     export const updateVideo = (...args) => hooks().updateVideo?.(...args);
+    export const recordVideoStage = async (...args) => hooks().recordVideoStage?.(...args);
     export const updateVideoAttemptDiagnostics = async (...args) => hooks().updateVideoAttemptDiagnostics?.(...args);
     export const getPromptTemplate = async (_slug, _label, template) => ({ template });
     export const savePromptDebugCapture = async () => {};
@@ -636,4 +637,37 @@ test("overlong provider metadata fits MySQL without truncating the original payl
   assert.equal(downloads, 1);
   assert.equal(p.video.status, "completed");
   assert.equal(p.video.transcriptZh, "已有中文");
+});
+
+test("TokScript speech failure still delivers a video and records separate stage failures", async () => {
+  for (const mode of ["product_doc","transcript_only"]) {
+    const stages = []; let analyses = 0, translations = 0;
+    const p = await pipeline({
+      recordVideoStage: (...args) => stages.push(args),
+      fetchTikTok: async (_url,_signal,options) => {
+        assert.equal(options.allowPartial,true);
+        return {downloadUrl:"https://cdn.test/video.mp4",transcript:"",transcriptZh:"",transcriptError:"口播提取失败",segments:[],stats:{},raw:{}};
+      },
+      downloadTikTokVideoWithFallback: async () => ({relativePath:"pipeline-test/original.mp4",source:"TokScript",failures:[]}),
+      analyzeVideoWithQwen: async () => { analyses++; return {summary:"真实视频结论",hook:{description:"完整视频演示"}}; },
+      translateTranscriptWithQwen: async () => { translations++; return "不应该调用"; },
+    });
+    p.video.originalPath = ""; p.video.transcriptOriginal = ""; p.video.analysisMode = mode;
+    await p.run();
+    assert.equal(p.video.status,"completed"); assert.equal(p.video.originalPath,"pipeline-test/original.mp4");
+    assert.equal(p.video.transcriptZh,""); assert.equal(translations,0);
+    assert.equal(analyses,mode === "product_doc" ? 1 : 0);
+    assert.ok(stages.some(([, ,stage,state])=>stage === "download" && state === "completed"));
+    assert.ok(stages.some(([, ,stage,state])=>stage === "transcript" && state === "failed"));
+    assert.ok(stages.some(([, ,stage,state])=>stage === "translation" && state === "skipped"));
+  }
+});
+
+test("a translation error is durable and cannot replace the successful video result", async () => {
+  const stages = [];
+  const p = await pipeline({ recordVideoStage:(...args)=>stages.push(args), translateTranscriptWithQwen:async()=>{throw Error("secret provider body");} });
+  await p.run();
+  await waitFor(()=>stages.some(([, ,stage,state])=>stage === "translation" && state === "failed"));
+  assert.equal(p.video.status,"completed"); assert.equal(p.video.transcriptZh,"");
+  assert.doesNotMatch(JSON.stringify(stages),/secret provider body/);
 });

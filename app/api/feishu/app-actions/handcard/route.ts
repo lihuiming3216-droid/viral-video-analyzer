@@ -4,10 +4,11 @@ import { assertChatgptActionRequest, getChatgptFeishuClient } from "@/lib/feishu
 import {
   fitAutomationFieldMapToTable,
   getBaseRecordFields,
-  handleFeishuAutomation,
-  updateProductCardStatus,
 } from "@/lib/feishu/automation";
 import { payloadFieldMap, safeBackgroundError } from "@/lib/feishu/webhook-shared";
+import { claimFeishuRequest, feishuRequestReplay, FeishuRequestIdentityError } from "@/lib/feishu/request-dedup";
+
+import { runFeishuInboxPass } from "@/lib/feishu/inbox";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -17,9 +18,8 @@ function coordinate(body: Record<string, unknown>, camel: string, snake: string)
 }
 
 export async function POST(request: NextRequest) {
-  let body: Record<string, unknown> = {};
   try {
-    body = await request.json() as Record<string, unknown>;
+    const body = await request.json() as Record<string, unknown>;
     const appToken = coordinate(body, "appToken", "app_token");
     const tableId = coordinate(body, "tableId", "table_id");
     const recordId = coordinate(body, "recordId", "record_id");
@@ -34,7 +34,7 @@ export async function POST(request: NextRequest) {
     });
 
     const client = getChatgptFeishuClient();
-    const stored = await getFeishuFieldMapping(`${appToken}:${tableId}`).catch(() => null);
+    const stored = await getFeishuFieldMapping(`${appToken}:${tableId}`);
     const requested = payloadFieldMap(body.fieldMap || body.field_map);
     const fieldMap = await fitAutomationFieldMapToTable(client, {
       appToken,
@@ -52,56 +52,16 @@ export async function POST(request: NextRequest) {
       if (name) delete productFields[name];
     }
 
-    after(async () => {
-      const startedAt = Date.now();
-      try {
-        const result = await handleFeishuAutomation({
-          client,
-          appToken,
-          tableId,
-          recordId,
-          fields: productFields,
-          fieldMap,
-          writeBack: true,
-        });
-        console.info("[feishu-chatgpt-handcard] completed", {
-          recordId,
-          pid: result.pid,
-          documentReady: result.documentReady,
-          durationMs: Date.now() - startedAt,
-          writeBackError: result.writeBackError,
-        });
-      } catch (error) {
-        const message = safeBackgroundError(error);
-        try {
-          if (fieldMap.productCardStatus) {
-            await updateProductCardStatus({
-              client,
-              appToken,
-              tableId,
-              recordId,
-              status: `失败：${message}`,
-              fieldName: fieldMap.productCardStatus,
-            });
-          }
-        } catch (writeError) {
-          console.error("[feishu-chatgpt-handcard] status write-back failed", {
-            recordId,
-            error: safeBackgroundError(writeError),
-          });
-        }
-        console.error("[feishu-chatgpt-handcard] failed", {
-          recordId,
-          durationMs: Date.now() - startedAt,
-          error: message,
-        });
-      }
-    });
-
-    return NextResponse.json({ code: 0, msg: "已接收，正在补录手卡", accepted: true });
+    const receipt = await claimFeishuRequest(request.headers, body, ["handcard-app", appToken, tableId, recordId], { fieldMap: requested },
+      { kind: "handcard", credentialSource: "chatgpt", appToken, tableId, recordId, fields: productFields, fieldMap: { ...fieldMap, videoUrl: "" } });
+    if (receipt?.duplicate) return NextResponse.json(feishuRequestReplay(receipt));
+    after(() => runFeishuInboxPass());
+    return NextResponse.json({ code: 0, msg: "已接收，正在补录手卡", accepted: true, jobId: receipt?.id,
+      deduplication: receipt?.identified ? "invocation" : "request_id_missing" });
   } catch (error) {
     const message = safeBackgroundError(error);
     const unauthorized = /身份|授权/.test(message);
-    return NextResponse.json({ code: unauthorized ? 401 : 500, msg: message }, { status: unauthorized ? 401 : 500 });
+    const status = error instanceof FeishuRequestIdentityError ? error.status : unauthorized ? 401 : 500;
+    return NextResponse.json({ code: status, msg: message }, { status });
   }
 }

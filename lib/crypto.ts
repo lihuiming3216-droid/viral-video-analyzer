@@ -10,7 +10,13 @@ const keyPath = path.join(dataRoot, "secret.key");
 function getMasterKey() {
   mkdirSync(dataRoot, { recursive: true });
   if (!existsSync(keyPath)) {
-    writeFileSync(keyPath, randomBytes(32), { mode: 0o600 });
+    try {
+      writeFileSync(keyPath, randomBytes(32), { mode: 0o600, flag: "wx" });
+    } catch (error) {
+      // A second process may have initialized the key after our existence
+      // check. Never overwrite a key that may already protect saved secrets.
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
   }
   chmodSync(keyPath, 0o600);
   const key = readFileSync(keyPath);

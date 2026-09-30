@@ -561,8 +561,19 @@ async function getProductDocumentOwner(
   return ownerId;
 }
 
+function nextProductFolderPage(data: { has_more?: boolean; next_page_token?: string } | undefined, seen: Set<string>) {
+  if (!data?.has_more) return undefined;
+  const next = data.next_page_token?.trim();
+  if (!next || seen.has(next) || seen.size >= 1_000) {
+    throw new Error("读取产品文件夹未完成：飞书分页缺失、重复或超过安全上限，已停止创建文档");
+  }
+  seen.add(next);
+  return next;
+}
+
 async function isProductDocumentInFolder(client: Client, documentToken: string, folderToken: string) {
   let pageToken: string | undefined;
+  const seen = new Set<string>();
   do {
     let response: Awaited<ReturnType<typeof client.drive.v1.file.list>>;
     try {
@@ -576,14 +587,14 @@ async function isProductDocumentInFolder(client: Client, documentToken: string, 
     productDocumentApiError(response, "检查产品文档所在文件夹失败");
     if (response.data?.files?.some((file) => file.token === documentToken && file.type === "docx")) return true;
     if (!response.data?.has_more) return false;
-    pageToken = response.data.next_page_token?.trim();
-    if (!pageToken) throw new Error("检查产品文档所在文件夹失败：飞书分页结果缺少下一页 Token");
+    pageToken = nextProductFolderPage(response.data, seen);
   } while (pageToken);
   return false;
 }
 
 async function findProductDocumentByTitle(client: Client, folderToken: string, title: string) {
   let pageToken: string | undefined;
+  const seen = new Set<string>();
   do {
     let response: Awaited<ReturnType<typeof client.drive.v1.file.list>>;
     try {
@@ -610,14 +621,14 @@ async function findProductDocumentByTitle(client: Client, folderToken: string, t
       };
     }
     if (!response.data?.has_more) return null;
-    pageToken = response.data.next_page_token?.trim();
-    if (!pageToken) throw new Error("查找已有同名产品文档失败：飞书分页结果缺少下一页 Token");
+    pageToken = nextProductFolderPage(response.data, seen);
   } while (pageToken);
   return null;
 }
 
 async function findProductDocumentByTitleSuffix(client: Client, folderToken: string, titleSuffix: string) {
   let pageToken: string | undefined;
+  const seen = new Set<string>();
   do {
     let response: Awaited<ReturnType<typeof client.drive.v1.file.list>>;
     try {
@@ -648,8 +659,7 @@ async function findProductDocumentByTitleSuffix(client: Client, folderToken: str
       };
     }
     if (!response.data?.has_more) return null;
-    pageToken = response.data.next_page_token?.trim();
-    if (!pageToken) throw new Error("按记录稳定键查找产品手卡失败：飞书分页结果缺少下一页 Token");
+    pageToken = nextProductFolderPage(response.data, seen);
   } while (pageToken);
   return null;
 }
@@ -664,6 +674,7 @@ async function findProductDocumentByPid(
   const suffix = `_${normalizedPid}`;
   const matches: Array<{ documentId: string; documentUrl: string; title: string; type: string }> = [];
   let pageToken: string | undefined;
+  const seen = new Set<string>();
   do {
     let response: Awaited<ReturnType<typeof client.drive.v1.file.list>>;
     try {
@@ -691,8 +702,7 @@ async function findProductDocumentByPid(
       });
     }
     if (!response.data?.has_more) break;
-    pageToken = response.data.next_page_token?.trim();
-    if (!pageToken) throw new Error("按 PID 查找产品手卡失败：飞书分页结果缺少下一页 Token");
+    pageToken = nextProductFolderPage(response.data, seen);
   } while (pageToken);
   if (matches.length > 1) {
     // 负责人已确认：同一 PID 出现多份文档时自动选最新一份，不再停止报错。
@@ -1321,6 +1331,8 @@ export type ProductCardManagedFieldsInput = {
   preflightOnly?: boolean;
   /** Missing provider facts must not erase existing manual values. */
   preserveExistingOnMissing?: boolean;
+  /** Ordinary backfill never replaces any populated basic fact. */
+  fillEmptyOnly?: boolean;
   /** Snapshot before the slow provider call; skip values edited since then. */
   expectedValues?: Partial<Record<ProductCardManagedLabel, string>>;
   /** Recheck each target at a specific document revision before patching. */
@@ -1394,6 +1406,8 @@ export function syncProductCardManagedBlockText(
   if (!matched) return content;
   const values = productCardManagedValues(input);
   if (!values.has(matched.label)) return content;
+  if (input.fillEmptyOnly && PRODUCT_CARD_DERIVED_LABELS.includes(matched.label as typeof PRODUCT_CARD_DERIVED_LABELS[number])
+    && matched.value.trim()) return content;
   if (input.expectedValues && hasOwn(input.expectedValues, matched.label)
     && input.expectedValues[matched.label] !== matched.value.trim()) return content;
   if (PRODUCT_CARD_METADATA_LABELS.includes(matched.label as typeof PRODUCT_CARD_METADATA_LABELS[number])

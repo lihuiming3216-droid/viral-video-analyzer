@@ -25,7 +25,13 @@ async function loadQueue(hooks, timeoutMs = 25) {
     export const finishOpenVideoAttempts = (...args) => hooks().finishOpenVideoAttempts?.(...args);
     export const finishVideoAttempt = (...args) => hooks().finishVideoAttempt?.(...args);
     export const getPendingVideoIds = (...args) => hooks().getPendingVideoIds?.(...args) || [];
-    export const getStaleProcessingVideoIds = (...args) => hooks().getStaleProcessingVideoIds?.(...args) || [];
+    export const prepareVideoForQueue = async (id, restart) => {
+      if (hooks().prepareVideoForQueue) return hooks().prepareVideoForQueue(id, restart);
+      const video = hooks().getVideo(id);
+      if (!video || video.processingStartedAt || !["queued", "waiting", ...(restart ? ["completed", "failed", "stopped"] : [])].includes(video.status)) return false;
+      hooks().updateVideo(id, {status:"queued", error_message:null}); return true;
+    };
+    export const tryAcquireVideoExecution = async (...args) => hooks().tryAcquireVideoExecution ? hooks().tryAcquireVideoExecution(...args) : {valid:()=>true,release:async()=>{}};
     export const getVideo = (...args) => hooks().getVideo?.(...args) || null;
     export const replaceScenes = (...args) => hooks().replaceScenes?.(...args);
     export const startVideoAttempt = (...args) => hooks().startVideoAttempt?.(...args);
@@ -44,11 +50,14 @@ async function loadQueue(hooks, timeoutMs = 25) {
     .replaceAll('"@/lib/analysis"', JSON.stringify(stubUrl))
     .replaceAll('"@/lib/video-events"', JSON.stringify(stubUrl))
     .replaceAll('"@/lib/video-processing"', JSON.stringify(stubUrl))
+    .replaceAll('"@/lib/video-execution"', JSON.stringify(stubUrl))
     .replace("30 * 60 * 1_000", String(timeoutMs));
   delete globalThis.__viralQueue;
   delete globalThis.__viralQueueScheduling;
   delete globalThis.__viralQueueActiveIds;
   delete globalThis.__viralQueueControllers;
+  delete globalThis.__viralQueueRecovering;
+  delete globalThis.__viralQueueDeferred;
   return import(`data:text/javascript;base64,${Buffer.from(`${compiled}\n// ${Math.random()}`).toString("base64")}`);
 }
 
@@ -202,6 +211,7 @@ async function loadAnalysis(hooks) {
     export const replaceScenes = (...args) => hooks().replaceScenes?.(...args);
     export const updateVideo = (...args) => hooks().updateVideo?.(...args);
     export const updateVideoAttemptDiagnostics = (...args) => hooks().updateVideoAttemptDiagnostics?.(...args);
+    export const recordVideoStage = async (...args) => hooks().recordVideoStage?.(...args);
     export const clampScore = (value) => Number(value) || 0;
     export const formatTime = (value) => String(value);
     export const getLearningContext = () => null;
@@ -305,4 +315,42 @@ test("analysis leaves hard-timeout terminal publishing to the queue", async () =
   await pending;
   assert.equal(patches.some((patch) => ["completed", "failed", "stopped"].includes(patch.status)), false);
   assert.equal(emitted.length, emittedBeforeTimeout, "analysis must not publish a second terminal event");
+});
+
+test("a task claimed by another process neither starts nor changes its stored state", async () => {
+  const videos = queueState(["remote"]); let started = 0;
+  const queue = await loadQueue({
+    getVideo:id=>videos.get(id), getPendingVideoIds:()=>["remote"], tryAcquireVideoExecution:async()=>null,
+    startVideoAttempt:()=>{started++;}, updateVideo:()=>{throw Error("must not alter a remote owner");},
+  });
+  await queue.resumePendingVideos();
+  await waitFor(()=>globalThis.__viralQueueActiveIds.size===0);
+  assert.equal(started,0); assert.equal(videos.get("remote").status,"queued");
+});
+
+test("crash recovery pauses an already-started provider request without automatic repayment", async () => {
+  const videos = queueState(["orphan"]), video = videos.get("orphan");
+  video.status = "analyzing"; video.processingStartedAt = new Date().toISOString();
+  let starts = 0, cleanup = 0;
+  const queue = await loadQueue({
+    getVideo:id=>videos.get(id), getPendingVideoIds:()=>["orphan"],
+    updateVideo:(id,patch)=>applyPatch(videos.get(id),patch),
+    startVideoAttempt:()=>{starts++;}, deleteVideoAttemptCache:()=>{cleanup++;}, finishOpenVideoAttempts:()=>{},
+  },5_000);
+  await queue.resumePendingVideos();
+  await waitFor(()=>video.status === "stopped" && globalThis.__viralQueueActiveIds.size === 0);
+  assert.equal(starts,0); assert.equal(cleanup,0); assert.match(video.errorMessage,/核查/);
+});
+
+test("a normal wake-up never requeues a completed task; an explicit retry may", async () => {
+  const videos = queueState(["done"]), video = videos.get("done"); video.status = "completed";
+  let starts = 0;
+  const queue = await loadQueue({
+    getVideo:id=>videos.get(id), updateVideo:(id,patch)=>applyPatch(videos.get(id),patch),
+    startVideoAttempt:()=>({attemptId:"new-attempt",attemptNumber:2}),
+    analyzeVideo:async()=>{starts++;video.status="completed";}, finishVideoAttempt:()=>{},
+  });
+  await queue.enqueueVideos(["done"]); assert.equal(starts,0);
+  await queue.enqueueVideos(["done"],{restart:true});
+  await waitFor(()=>starts===1 && globalThis.__viralQueueActiveIds.size===0);
 });

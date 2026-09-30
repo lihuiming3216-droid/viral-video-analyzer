@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { access, mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -28,6 +29,40 @@ compiled = compiled
   .replaceAll('"ffprobe-static"', JSON.stringify(ffprobeStub))
   .replaceAll('"@/lib/network"', JSON.stringify(networkStub));
 const processing = await import(moduleUrl(compiled));
+
+test("chunked cover downloads enforce their streamed size limit and preserve an existing file", async t => {
+  const videoId = `audit-${randomUUID()}`;
+  const target = processing.resolveMediaPath(`${videoId}/cover.jpg`);
+  await mkdir(path.dirname(target), { recursive: true });
+  await writeFile(target, "prior valid cover");
+  const oldFetch = globalThis.fetch;
+  t.after(async () => { globalThis.fetch = oldFetch; await rm(path.dirname(target), { recursive: true, force: true }); });
+  let chunks = 0;
+  globalThis.fetch = async () => new Response(new ReadableStream({
+    pull(controller) { if (chunks++ < 13) controller.enqueue(new Uint8Array(1024 * 1024)); else controller.close(); },
+  }), { headers: { "content-type": "image/jpeg" } });
+  await assert.rejects(processing.downloadMedia(videoId, "https://fixture.invalid/cover.jpg", "cover"), /超过 12MB/);
+  assert.equal(await readFile(target, "utf8"), "prior valid cover");
+  assert.deepEqual(await readdir(path.dirname(target)), ["cover.jpg"], "partial downloads are cleaned, prior files are retained");
+});
+
+test("successful scene detection reads FFmpeg stderr and retains real transitions", async t => {
+  const videoId = `audit-${randomUUID()}`;
+  const target = processing.resolveMediaPath(`${videoId}/original.mp4`);
+  await mkdir(path.dirname(target), { recursive: true });
+  t.after(() => rm(path.dirname(target), { recursive: true, force: true }));
+  await runFile(ffmpegInstaller.path, [
+    "-hide_banner", "-loglevel", "error", "-y",
+    "-f", "lavfi", "-i", "color=black:s=160x90:r=10:d=2",
+    "-f", "lavfi", "-i", "color=white:s=160x90:r=10:d=2",
+    "-f", "lavfi", "-i", "color=black:s=160x90:r=10:d=2",
+    "-filter_complex", "[0:v][1:v][2:v]concat=n=3:v=1:a=0[v]", "-map", "[v]",
+    "-c:v", "libx264", "-pix_fmt", "yuv420p", target,
+  ]);
+  const assets = await processing.extractVideoAssets(videoId, `${videoId}/original.mp4`);
+  assert.ok(assets.scenes.some(scene => scene.startSeconds === 2));
+  assert.ok(assets.scenes.some(scene => scene.startSeconds === 4));
+});
 
 async function makeFixture(directory, name, includeAudio, audioSource = "sine=frequency=440:sample_rate=16000") {
   const output = path.join(directory, name);

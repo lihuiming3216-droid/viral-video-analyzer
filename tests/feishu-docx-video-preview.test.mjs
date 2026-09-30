@@ -6,9 +6,14 @@ import test from "node:test";
 import ts from "typescript";
 
 const source = await readFile(new URL("../lib/feishu/docx-file.ts", import.meta.url), "utf8");
-const compiled = ts.transpileModule(source.replace('import "server-only";', ""), {
+const uploadSource = await readFile(new URL("../lib/feishu/media-upload.ts", import.meta.url), "utf8");
+const uploadCode = ts.transpileModule(uploadSource.replace('import "server-only";', ""), {
   compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
 }).outputText;
+const uploadUrl = `data:text/javascript;base64,${Buffer.from(uploadCode).toString("base64")}`;
+const compiled = ts.transpileModule(source.replace('import "server-only";', ""), {
+  compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
+}).outputText.replaceAll('"@/lib/feishu/media-upload"', JSON.stringify(uploadUrl));
 const preview = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString("base64")}`);
 
 function clientHarness(events, options = {}) {
@@ -17,6 +22,7 @@ function clientHarness(events, options = {}) {
     drive: { v1: { media: {
       uploadAll: async ({ data }) => {
         events.push(["upload", data.file_name, data.parent_node, data.size]);
+        for await (const _chunk of data.file) { /* consume like the real upload transport */ }
         return { file_token: "file-token" };
       },
       uploadPrepare: async () => ({ data: {

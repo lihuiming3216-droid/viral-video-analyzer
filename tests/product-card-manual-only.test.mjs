@@ -8,7 +8,8 @@ test("the Base product-card button uses the shared PID catalog, never product-pa
   assert.match(source, /getProductCatalog\(effectivePid\)/);
   assert.match(source, /preserveExistingOnMissing: true/);
   assert.match(source, /ensureProductCardByPid\(input\.client/);
-  assert.match(source, /手卡商品资料已整理/);
+  assert.match(source, /fillEmptyOnly: true/);
+  assert.match(source, /手卡空白基础资料已补录，已有内容保留/);
 });
 
 test("product-card identity accepts the Base PID without requiring a product URL", async () => {

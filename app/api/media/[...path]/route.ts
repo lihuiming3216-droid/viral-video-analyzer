@@ -2,6 +2,7 @@ import { createReadStream, statSync } from "node:fs";
 import { Readable } from "node:stream";
 import { NextRequest } from "next/server";
 import { contentTypeForMedia, resolveMediaPath } from "@/lib/video-processing";
+import { parseMediaRange } from "@/lib/media-range";
 
 export const runtime = "nodejs";
 
@@ -11,11 +12,12 @@ export async function GET(request: NextRequest, context: { params: Promise<{ pat
     const relative = parts.join("/");
     const absolute = resolveMediaPath(relative);
     const stat = statSync(absolute);
+    if (!stat.isFile()) return new Response("Not found", { status: 404 });
     const range = request.headers.get("range");
     if (range) {
-      const match = /bytes=(\d+)-(\d*)/.exec(range);
-      const start = match ? Number(match[1]) : 0;
-      const end = match?.[2] ? Math.min(Number(match[2]), stat.size - 1) : stat.size - 1;
+      const parsed = parseMediaRange(range, stat.size);
+      if (!parsed) return new Response(null, { status: 416, headers: { "Content-Range": `bytes */${stat.size}` } });
+      const { start, end } = parsed;
       const stream = Readable.toWeb(createReadStream(absolute, { start, end })) as ReadableStream;
       return new Response(stream, {
         status: 206,

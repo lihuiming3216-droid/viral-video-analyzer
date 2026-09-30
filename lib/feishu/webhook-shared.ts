@@ -47,7 +47,7 @@ export function payloadFields(body: Record<string, unknown>) {
       if (fields && typeof fields === "object" && !Array.isArray(fields)) return fields as Record<string, unknown>;
     }
   }
-  const controlKeys = new Set(["appToken", "app_token", "tableId", "table_id", "recordId", "record_id", "secret", "fieldMap", "field_map"]);
+  const controlKeys = new Set(["appToken", "app_token", "tableId", "table_id", "recordId", "record_id", "secret", "fieldMap", "field_map", "requestId", "request_id"]);
   const directFields = Object.fromEntries(Object.entries(body).filter(([key]) => !controlKeys.has(key)));
   return directFields;
 }
@@ -70,7 +70,9 @@ export function safeBackgroundError(error: unknown) {
   return message
     .replace(/\bauthorization\s*:\s*(?:bearer|basic)?\s*\S+/gi, "[已隐藏]")
     .replace(/\bbearer\s+\S+/gi, "[已隐藏]")
-    .replace(/(?:api[_ -]?key|app[_ -]?secret|webhook[_ -]?secret)\s*[:=]?\s*\S+/gi, "[已隐藏]")
+    .replace(/(?:api[_ -]?key|app[_ -]?secret|webhook[_ -]?secret|(?:access[_ -]?|refresh[_ -]?)?token|secret|password|credential)\s*[:=]\s*\S+/gi, "[已隐藏]")
+    .replace(/https?:\/\/[^\s]+/gi, "[链接已隐藏]")
+    .replace(/\bsk[-_][A-Za-z0-9_-]{12,}/g, "[已隐藏]")
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 360) || "飞书自动化处理失败";

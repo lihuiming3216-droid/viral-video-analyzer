@@ -6,7 +6,7 @@ import ts from "typescript";
 import { chromium } from "playwright-core";
 
 const parserSource = await readFile(
-  new URL("../lib/product-parser.ts", import.meta.url),
+  new URL("../../lib/product-parser.ts", import.meta.url),
   "utf8",
 );
 

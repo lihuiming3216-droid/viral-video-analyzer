@@ -11,7 +11,9 @@ export function setVideoProgressHandler(handler: (videoId: string) => Promise<vo
 
 export function emitVideoProgress(videoId: string) {
   try {
-    void state.__videoProgressHandler?.(videoId);
+    // try/catch only handles synchronous throws. Async notification failures
+    // must also be observed so a DB/Feishu outage cannot crash video workers.
+    void Promise.resolve(state.__videoProgressHandler?.(videoId)).catch(() => undefined);
   } catch {
     // 消息通知失败不能影响本地视频分析。
   }

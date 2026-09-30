@@ -11,6 +11,9 @@ export function permanentDeliveryFailure(error: unknown) {
   const message = error instanceof Error ? error.message : String(error || "");
   if (/RecordIdNotFound/i.test(message)) return new FeishuDeliveryBlockedError("record_missing", "目标行不存在，已暂停写回");
   if (/FieldNameNotFound/i.test(message)) return new FeishuDeliveryBlockedError("field_missing", "目标字段不存在，请修正字段对应后恢复写回");
+  if (/RolePermNotAllow|role has no permissions|1254302|没有权限|无权限|permission denied|forbidden|HTTP 403\b/i.test(message)) {
+    return new FeishuDeliveryBlockedError("permission_required", "应用没有目标行或字段权限，已暂停写回；请授权后恢复");
+  }
   return null;
 }
 

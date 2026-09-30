@@ -59,6 +59,16 @@ test("source shop and main-image metadata fill empty template rows but never rep
   assert.equal(documentModule.syncProductCardManagedBlockText("商品主图：https://manual.invalid/image", input), "商品主图：https://manual.invalid/image");
 });
 
+test("ordinary fill-only mode preserves all populated basic fields, including placeholders and manual zero values", () => {
+  const input = { mode: "verified-basic", fillEmptyOnly: true, usageMethod: "新步骤", coreFunctions: ["新功能"] };
+  for (const value of ["人工步骤", "未找到", "暂无", "无", "0"]) {
+    assert.equal(documentModule.syncProductCardManagedBlockText(`使用方法：${value}`, input), `使用方法：${value}`);
+  }
+  assert.equal(documentModule.syncProductCardManagedBlockText("使用方法：  ", input), "使用方法：  新步骤");
+  assert.equal(documentModule.syncProductCardManagedBlockText("视频分析：人工内容", input), "视频分析：人工内容");
+  assert.equal(documentModule.syncProductCardManagedBlockText("使用方法：人工步骤", { ...input, fillEmptyOnly: false }), "使用方法：新步骤");
+});
+
 test("catalog writes re-read target at a revision and skip a concurrent manual change", async () => {
   const block = textBlock("usage", "使用方法：旧步骤");
   const patches = [];
@@ -536,6 +546,16 @@ test("duplicate documents with the same complete PID choose the newest edited ma
   const result = await documentModule.ensureProductCardByPid(client, { name: "产品A", pid, ownerOpenId: "ou_owner" });
   assert.equal(result.documentId, "first");
   assert.equal(result.reused, true);
+});
+
+test("repeated folder pagination aborts PID lookup without copying a duplicate handcard", async () => {
+  globalThis.__productCardDocumentTestHooks = { getFeishuSettings: () => ({ productFolderToken: "folder-token" }) };
+  const { client, state } = shellClient();
+  let pages = 0;
+  client.drive.v1.file.list = async () => { pages++; return { code: 0, data: { has_more: true, next_page_token: "repeat", files: [] } }; };
+  await assert.rejects(documentModule.ensureProductCardByPid(client, { name: "产品", pid: "1731234567890123456" }), /分页/);
+  assert.equal(pages, 2);
+  assert.equal(state.copyCount, 0);
 });
 
 test("an owner repair failure cannot hide an already-created shell", async () => {

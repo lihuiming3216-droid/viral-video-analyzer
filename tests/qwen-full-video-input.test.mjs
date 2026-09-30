@@ -78,6 +78,21 @@ async function waitUntil(predicate, message) {
   throw new Error(message);
 }
 
+test("translation prompt preview sends the edited draft rather than the saved production prompt", async () => {
+  let prompt;
+  const result = await withMockedFetch(async (_url, init) => {
+    prompt = JSON.parse(init.body).messages[0].content[0].text;
+    return successfulStream({ result: { translationZh: "你好" } });
+  }, () => qwen.translateTranscriptWithQwen({ transcript: "hello", promptTemplate: "DRAFT ONLY {{TRANSCRIPT_JSON}}" }));
+  assert.equal(prompt, 'DRAFT ONLY "hello"');
+  assert.equal(result, "你好");
+});
+
+test("blank segment translations are rejected instead of producing incomplete subtitles", async () => {
+  await withMockedFetch(async () => successfulStream({ result: { translations: [""] } }), () =>
+    assert.rejects(qwen.translateSegmentsWithQwen({ segments: [{ start: 0, end: 1, text: "hello" }] }), /中文翻译失败/));
+});
+
 test("Qwen always sends the local complete MP4 and ignores a residual remote URL", async () => {
   const remoteVideoUrl = "https://cdn.example/remote-video-that-must-not-be-used.mp4?token=secret";
   let requestBody;
@@ -215,6 +230,20 @@ test("translation authentication failures are not retried or leaked", async t =>
       assert.match(error.message, /HTTP 401/); assert.doesNotMatch(error.message, /private|secret/); return true;
     }));
   assert.equal(calls, 1);
+});
+
+test("subtitle budget is checked before each actual request, including configured inner retries", async t => {
+  globalThis.__aiRuntime = { provider: "qwen", apiKey: "fixture", baseUrl: "https://qwen.test/v1", model: "qwen-plus", retries: 1 };
+  t.after(() => { delete globalThis.__aiRuntime; });
+  let reservations=0,calls=0;
+  const beforeRequest=async()=>{if(reservations>=2)throw Error("durable budget exhausted");reservations++;};
+  const input={segments:[{start:0,end:1,text:"hello"}],beforeRequest};
+  await withMockedFetch(async()=>{calls++;return new Response("unavailable",{status:503});},async()=>{
+    await assert.rejects(qwen.translateSegmentsWithQwen(input), /中文翻译失败/);
+    await assert.rejects(qwen.translateSegmentsWithQwen(input), /durable budget exhausted/);
+  });
+  assert.equal(calls,2);
+  assert.equal(reservations,2);
 });
 
 test("video requests share a two-slot Qwen limit and jump ahead of queued translations", async () => {

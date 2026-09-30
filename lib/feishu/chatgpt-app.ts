@@ -1,8 +1,9 @@
 import "server-only";
 
-import { timingSafeEqual } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { Client, Domain, LoggerLevel } from "@larksuiteoapi/node-sdk";
 import { safeFeishuLogger } from "@/lib/feishu/safe-logger";
+import { feishuHttp } from "@/lib/feishu/http";
 
 export type ChatgptActionKind = "handcard" | "video";
 
@@ -45,6 +46,8 @@ async function currentTenantAccessToken(appId: string, appSecret: string) {
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ app_id: appId, app_secret: appSecret }),
     cache: "no-store",
+    redirect: "error",
+    signal: AbortSignal.timeout(15_000),
   });
   const result = await response.json() as { code?: number; msg?: string; tenant_access_token?: string };
   if (!response.ok || result.code || !result.tenant_access_token) {
@@ -76,7 +79,7 @@ export async function assertChatgptActionRequest(input: {
 
 export function getChatgptFeishuClient() {
   const { appId, appSecret } = credentials();
-  const signature = `${appId}:${appSecret.slice(-8)}`;
+  const signature = createHash("sha256").update(appId).update("\0").update(appSecret).digest("hex");
   if (!state.__chatgptFeishuClient || state.__chatgptFeishuClientSignature !== signature) {
     state.__chatgptFeishuClient = new Client({
       appId,
@@ -84,6 +87,7 @@ export function getChatgptFeishuClient() {
       domain: Domain.Feishu,
       loggerLevel: LoggerLevel.warn,
       logger: safeFeishuLogger,
+      httpInstance: feishuHttp,
     });
     state.__chatgptFeishuClientSignature = signature;
   }

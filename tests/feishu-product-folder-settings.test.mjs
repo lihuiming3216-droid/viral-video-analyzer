@@ -27,18 +27,18 @@ test("product folder settings parse a complete Feishu folder URL and reject unre
 });
 
 test("saving a product folder preserves the separate report root folder", async () => {
-  const [database, store] = await Promise.all([
-    readFile(new URL("lib/database.ts", root), "utf8"),
+  const [schema, store] = await Promise.all([
+    readFile(new URL("lib/db/schema.sql", root), "utf8"),
     readFile(new URL("lib/feishu/store.ts", root), "utf8"),
   ]);
 
-  assert.match(database, /product_folder_token TEXT NOT NULL DEFAULT ''/);
-  assert.match(database, /ALTER TABLE feishu_settings ADD COLUMN/);
+  assert.match(schema, /product_folder_token VARCHAR\(191\) NOT NULL DEFAULT ''/);
+  assert.match(schema, /CREATE TABLE IF NOT EXISTS feishu_settings/);
   assert.match(store, /const previousRoot = text\(current\.root_folder_token\)/);
   assert.match(store, /const nextRoot = input\.rootFolderToken\?\.trim\(\) \?\? previousRoot/);
   assert.match(store, /const nextProductFolder = input\.productFolderToken\?\.trim\(\) \?\? text\(current\.product_folder_token\)/);
   assert.match(store, /root_folder_token=\?, root_folder_url=\?,[\s\S]*?product_folder_token=\?, product_folder_url=\?/);
-  assert.match(store, /if \(previousRoot !== nextRoot && options\.clearReportFolderCache !== false\) clearFeishuFolderCache\(\)/);
+  assert.match(store, /if \(previousRoot !== nextRoot && options\.clearReportFolderCache !== false\) await clearFeishuFolderCache\(\)/);
 });
 
 test("saving an enabled product folder validates app access after reconnecting", async () => {
@@ -55,7 +55,7 @@ test("a rejected product folder is rolled back and cannot remain in saved settin
     readFile(new URL("lib/feishu/store.ts", root), "utf8"),
   ]);
 
-  assert.match(route, /const previous = getRawFeishuSettings\(\)/);
+  assert.match(route, /const previous = await getRawFeishuSettings\(\)/);
   assert.match(route, /saveFeishuSettings\([\s\S]*?\{ clearReportFolderCache: false \}\)/);
   assert.match(route, /catch \(error\) \{[\s\S]*?await restorePreviousSettings\(previous\)/);
   assert.match(route, /productFolderToken: rawText\(previous, "product_folder_token"\)/);

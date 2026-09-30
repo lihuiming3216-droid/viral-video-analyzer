@@ -3,12 +3,13 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import mysql from "mysql2/promise";
 import ts from "typescript";
+import { isolatedMysqlConfig } from "./helpers/isolated-mysql.mjs";
 
 test("real MySQL catalog claims are atomic, migration is additive and failure survives reconnection", {
-  skip: process.env.FEISHU_DELIVERY_MYSQL_TEST !== "isolated-test-only",
+  skip: process.env.FEISHU_DELIVERY_MYSQL_TEST !== "isolated-test-only" && !process.env.PID_AUDIT_MYSQL_SOCKET,
 }, async t => {
   // Never accept production MYSQL_* configuration; only the disposable CI service.
-  const config = { host: "delivery-test-mysql", user: "root", password: "isolated-ci-only", connectTimeout: 5000 };
+  const config = await isolatedMysqlConfig();
   const admin = await mysql.createConnection(config);
   let pool, created = false;
   t.after(async () => {

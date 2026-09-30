@@ -29,6 +29,8 @@ type TokScriptToolErrorCategory =
 
 export interface TokScriptResult {
   transcript: string;
+  transcriptError?: string;
+  downloadError?: string;
   /** Chinese translation returned by TokScript when the account/tool provides it. */
   transcriptZh: string;
   language: string;
@@ -267,7 +269,7 @@ async function callTokScriptToolWithOneRetry<T>(input: {
         throw new TokScriptToolCallError(input.stage, "timeout", attempt);
       }
       const failure = tokScriptToolCallError(input.stage, error, attempt);
-      if (attempt === 2) throw failure;
+      if (attempt === 2 || ["permission", "invalid_input", "not_found"].includes(failure.category)) throw failure;
       attempt += 1;
     }
   }
@@ -398,18 +400,31 @@ function normalizeSegments(root: unknown) {
       const start = Number(row.start ?? row.start_time ?? row.startTime ?? 0);
       const end = Number(row.end ?? row.end_time ?? row.endTime ?? start);
       const text = String(row.text ?? row.caption ?? row.content ?? "").trim();
-      return text ? { start, end, text } : null;
+      return text && Number.isFinite(start) && Number.isFinite(end) && start >= 0 && end >= start
+        ? { start, end, text } : null;
     })
     .filter(Boolean) as Array<{ start: number; end: number; text: string }>;
 }
 
+function transcriptLevelValue(root: unknown, keys: string[], depth = 0): unknown {
+  if (!root || typeof root !== "object" || Array.isArray(root) || depth > 10) return undefined;
+  const record = root as Record<string, unknown>;
+  for (const key of keys) if (typeof record[key] === "string" && record[key].trim()) return record[key];
+  for (const [key, value] of Object.entries(record)) {
+    if (/^(?:segments|transcript_segments|transcriptSegments)$/.test(key)) continue;
+    const found = transcriptLevelValue(value, keys, depth + 1);
+    if (found !== undefined) return found;
+  }
+  return undefined;
+}
+
 function explicitTranscript(root: unknown) {
-  const value = findValue(root, ["transcript", "full_transcript", "fullTranscript"]);
+  const value = transcriptLevelValue(root, ["transcript", "full_transcript", "fullTranscript"]);
   return typeof value === "string" ? value.trim() : "";
 }
 
 function explicitTranscriptZh(root: unknown) {
-  const value = findValue(root, [
+  const value = transcriptLevelValue(root, [
     "transcript_zh", "transcriptZh", "translation_zh", "translationZh",
     "translated_transcript", "translatedTranscript", "chinese_translation", "chineseTranslation",
     "zh_transcript", "zhTranscript",
@@ -418,14 +433,14 @@ function explicitTranscriptZh(root: unknown) {
   // A few TokScript accounts use a generic `translation` key. Accept it only
   // when it visibly contains Chinese, so metadata such as a language label is
   // never mistaken for the transcript translation.
-  const generic = findValue(root, ["translation", "translated"]);
+  const generic = transcriptLevelValue(root, ["translation", "translated"]);
   return typeof generic === "string" && /[\u3400-\u9fff]/.test(generic) ? generic.trim() : "";
 }
 
 function translatedSegments(root: unknown) {
   const candidate = findValue(root, ["segments", "transcript_segments", "transcriptSegments"]);
   if (!Array.isArray(candidate)) return "";
-  return candidate
+  const translated = candidate
     .map((item) => {
       if (!item || typeof item !== "object") return "";
       const row = item as Record<string, unknown>;
@@ -433,55 +448,15 @@ function translatedSegments(root: unknown) {
         row.translationZh ?? row.translation_zh ?? row.translatedText
           ?? row.translated_text ?? row.translation ?? row.chinese ?? row.zh ?? "",
       ).trim();
-    })
-    .filter(Boolean)
-    .join(" ");
+    });
+  return translated.length && translated.every(Boolean) ? translated.join(" ") : "";
 }
 
-function audioTrackName(root: unknown) {
-  const seen = new Set<unknown>();
-  const visit = (value: unknown): string => {
-    if (!value || typeof value !== "object" || seen.has(value)) return "";
-    seen.add(value);
-    for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
-      if (/^(?:audio|music|sound)(?:_info|Info|_track|Track)?$/i.test(key) && child && typeof child === "object") {
-        const row = child as Record<string, unknown>;
-        const name = row.name ?? row.title ?? row.audio_name ?? row.music_name;
-        if (typeof name === "string" && name.trim()) return name.trim();
-      }
-    }
-    for (const child of Object.values(value as Record<string, unknown>)) {
-      const found = Array.isArray(child)
-        ? child.map(visit).find(Boolean) || ""
-        : visit(child);
-      if (found) return found;
-    }
-    return "";
-  };
-  return visit(root);
-}
-
-function speechTokens(value: string) {
-  return value.normalize("NFKC").toLowerCase().match(/[\p{L}\p{N}']+/gu) || [];
-}
-
-export function tokScriptTranscriptIsNoProductVoiceover(transcript: string, audioName = "") {
+export function tokScriptTranscriptIsNoProductVoiceover(transcript: string) {
   const normalized = String(transcript || "").normalize("NFKC").trim().replace(/\s+/g, " ");
-  if (tokScriptExplicitNoSpeech(normalized)) {
-    return true;
-  }
-  const tokens = speechTokens(normalized);
-  if (tokens.length <= 1) return true;
-  const unique = new Set(tokens);
-  if (tokens.length >= 4 && unique.size <= 2) return true;
-
-  const audioTokens = [...new Set(speechTokens(audioName).filter((token) => !/^(?:original|sound|music|audio|sped|up)$/.test(token)))];
-  if (audioTokens.length >= 3) {
-    const transcriptSet = new Set(tokens);
-    const overlap = audioTokens.filter((token) => transcriptSet.has(token)).length;
-    if (overlap >= 3 && overlap / audioTokens.length >= 0.6) return true;
-  }
-  return false;
+  // Word counts, repetition and a matching soundtrack title cannot prove
+  // silence. Preserve the provider's words, including short/non-space speech.
+  return tokScriptExplicitNoSpeech(normalized);
 }
 
 function tokScriptExplicitNoSpeech(value: string) {
@@ -620,14 +595,14 @@ export async function resolveTokScriptVideoUrl(
 /** Plain-text provider diagnostics must never be treated as spoken words. */
 export function tokScriptTranscriptFailure(value: string) {
   const normalized = String(value || "").normalize("NFKC").trim().replace(/\s+/g, " ");
-  return /^(?:error|failed|failure|unable|could not|cannot|service unavailable|rate limit(?:ed)?|too many requests)\b/i.test(normalized)
+  return /^(?:(?:error|failed|failure)(?:\s*[:：]|$)|(?:unable|could not|cannot|failed)\s+to\s+(?:extract|retrieve|fetch|download|transcribe)\b|service unavailable\b|rate limit(?:ed)?\b|too many requests\b)/i.test(normalized)
     || /(?:failed to extract transcript|transcript extraction (?:failed|error)|no transcript (?:data|available)|transcript (?:unavailable|not found)|SIGI_STATE|UNIVERSAL_DATA_FOR_REHYDRATION)/i.test(normalized)
     || /^(?:(?:full )?transcript\s*:\s*)?(?:\(\s*empty\s*\)|empty|none|null|n\/?a)\s*$/i.test(normalized);
 }
 
 export async function testTokScriptConnection() {
   const config = await requireProvider("tokscript");
-  const client = new TokScriptClient(config.baseUrl, config.apiKey);
+  const client = new TokScriptClient(config.baseUrl, config.apiKey, AbortSignal.timeout(20_000));
   await client.connect();
   const tools = await client.listTools();
   return { ok: true, message: `连接成功，可用工具 ${tools.length} 个` };
@@ -636,7 +611,7 @@ export async function testTokScriptConnection() {
 export async function fetchTikTok(
   url: string,
   signal?: AbortSignal,
-  options: { includeCover?: boolean; timeoutMs?: number } = {},
+  options: { includeCover?: boolean; timeoutMs?: number; allowPartial?: boolean; includeTranscript?: boolean; includeDownload?: boolean } = {},
 ): Promise<TokScriptResult> {
   const config = await requireProvider("tokscript");
   const timeoutSignal = AbortSignal.timeout(Math.max(15_000, options.timeoutMs || 180_000));
@@ -659,39 +634,56 @@ export async function fetchTikTok(
     const transcriptTool = pick(["get_tiktok_transcript", "get_transcript"]);
     const downloadTool = pick(["download_video", "download_tiktok_video"]);
     const coverTool = pick(["download_cover_image", "get_cover_image"]);
-    if (!transcriptTool || !downloadTool) {
+    if ((!transcriptTool || !downloadTool) && !options.allowPartial) {
       throw new Error("TokScript 当前账号没有返回转写或下载工具，请检查套餐权限");
     }
-    // Transcript must succeed — it's the one thing this call can never do
-    // without. Fetch it first so a download-stage failure (see the local
-    // yt-dlp fallback in lib/video-processing.ts) never costs us a transcript
-    // we'd otherwise already have.
-    const parsedTranscript = await callTokScriptToolWithOneRetry({
-      client,
-      tool: transcriptTool,
-      url: resolvedUrl,
-      stage: "transcript",
-      parse: parseTranscriptToolPayload,
-      requestSignal,
-      userSignal: signal,
-    });
+    let transcriptError = "";
+    let downloadError = "";
+    const loadTranscript = async () => {
+      if (options.includeTranscript === false) return { payload: {}, plainText: "" };
+      try {
+        if (!transcriptTool) throw new Error("口播工具不可用");
+        return await callTokScriptToolWithOneRetry({
+          client,
+          tool: transcriptTool,
+          url: resolvedUrl,
+          stage: "transcript",
+          parse: parseTranscriptToolPayload,
+          requestSignal,
+          userSignal: signal,
+        });
+      } catch (error) {
+        if (signal?.aborted || !options.allowPartial) throw error;
+        transcriptError = error instanceof TokScriptToolCallError ? error.message : "TokScript 口播获取失败或超时";
+        return { payload: {}, plainText: "" };
+      }
+    };
+    const loadDownload = async (): Promise<Record<string, unknown>> => {
+      if (options.includeDownload === false) return {};
+      try {
+        if (!downloadTool) throw new Error("下载工具不可用");
+        return await callTokScriptToolWithOneRetry({
+          client,
+          tool: downloadTool,
+          url: resolvedUrl,
+          stage: "download",
+          parse: parseToolPayload,
+          requestSignal,
+          userSignal: signal,
+        });
+      } catch (error) {
+        if (signal?.aborted) throw error;
+        downloadError = error instanceof TokScriptToolCallError ? error.message : "TokScript 下载地址获取失败或超时";
+        return {};
+      }
+    };
+    // Independent calls share the authenticated MCP session, not success/failure.
+    // Legacy subtitle bridges retain their strict transcript-first contract.
+    const [parsedTranscript, downloadRaw] = options.allowPartial
+      ? await Promise.all([loadTranscript(), loadDownload()])
+      : [await loadTranscript(), await loadDownload()];
+    signal?.throwIfAborted();
     const transcriptRaw = parsedTranscript.payload;
-    // A failed download here is not fatal to this function — it just leaves
-    // downloadUrl empty, and the caller falls back to local yt-dlp.
-    let downloadRaw: Record<string, unknown> = {};
-    try {
-      downloadRaw = await callTokScriptToolWithOneRetry({
-        client,
-        tool: downloadTool,
-        url: resolvedUrl,
-        stage: "download",
-        parse: parseToolPayload,
-        requestSignal,
-        userSignal: signal,
-      });
-    } catch (error) {
-      if (signal?.aborted) throw error;
-    }
     // A failed cover fetch is not fatal either — same tolerance as the
     // download above, and for the same reason: it would otherwise discard an
     // already-successful transcript over a thumbnail image, the least
@@ -718,23 +710,24 @@ export async function fetchTikTok(
     const transcript = explicitTranscript(transcriptRaw)
       || labelledPlainTextTranscript(parsedTranscript.plainText)
       || segments.map((segment) => segment.text).join(" ");
-    const normalizedTranscript = transcript.trim();
+    let normalizedTranscript = transcript.trim();
     if (!normalizedTranscript || tokScriptTranscriptFailure(normalizedTranscript)) {
-      throw new Error("TokScript 未返回有效口播文案");
+      if (!options.allowPartial) throw new Error("TokScript 未返回有效口播文案");
+      normalizedTranscript = "";
+      if (options.includeTranscript !== false) transcriptError ||= "TokScript 未返回有效口播文案";
     }
-    const noProductVoiceover = tokScriptTranscriptIsNoProductVoiceover(
-      normalizedTranscript,
-      audioTrackName(transcriptRaw),
-    );
+    const noProductVoiceover = tokScriptTranscriptIsNoProductVoiceover(normalizedTranscript);
     const transcriptZh = explicitTranscriptZh(transcriptRaw)
       || translatedSegments(transcriptRaw)
       || explicitTranscriptZh(downloadRaw)
       || translatedSegments(downloadRaw);
     return {
       transcript: noProductVoiceover ? NO_PRODUCT_VOICEOVER_TRANSCRIPT : normalizedTranscript,
+      ...(transcriptError ? { transcriptError } : {}),
+      ...(downloadError ? { downloadError } : {}),
       transcriptZh: noProductVoiceover ? NO_PRODUCT_VOICEOVER_TRANSCRIPT : transcriptZh,
       language: textValue(transcriptRaw, ["language", "detected_language", "detectedLanguage"]),
-      segments: noProductVoiceover ? [] : segments,
+      segments: noProductVoiceover || !normalizedTranscript ? [] : segments,
       downloadUrl: findMediaUrl(downloadRaw, "video"),
       coverUrl: findMediaUrl(coverRaw || downloadRaw, "cover"),
       title: textValue(transcriptRaw, ["title", "description", "caption"]),
@@ -749,7 +742,8 @@ export async function fetchTikTok(
         favorites: numeric(transcriptRaw, ["favorite_count", "favoriteCount", "collect_count", "collectCount"]),
         followers: numeric(transcriptRaw, ["follower_count", "followerCount", "followers"]),
       },
-      raw: { transcript: transcriptRaw, download: downloadRaw, cover: coverRaw },
+      raw: { transcript: transcriptRaw, download: downloadRaw, cover: coverRaw,
+        ...(options.allowPartial ? { stageErrors: { transcript: transcriptError, download: downloadError } } : {}) },
     };
   } catch (error) {
     if (signal?.aborted) throw error;

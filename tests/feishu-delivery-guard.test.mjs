@@ -23,12 +23,12 @@ test("delivery source accepts harmless URL decoration, but not a changed or remo
 });
 
 test("only confirmed permanent delivery errors are paused, with a fixed safe message", () => {
-  for (const [message, reason] of [["RecordIdNotFound https://secret.invalid", "record_missing"], ["FieldNameNotFound token=secret", "field_missing"]]) {
+  for (const [message, reason] of [["RecordIdNotFound https://secret.invalid", "record_missing"], ["FieldNameNotFound token=secret", "field_missing"], ["RolePermNotAllow", "permission_required"]]) {
     const failure = guard.permanentDeliveryFailure(new Error(message));
     assert.equal(failure.reason, reason);
     assert.doesNotMatch(failure.message, /secret|token|https:/);
   }
-  for (const message of ["timeout", "HTTP 429", "HTTP 500", "RolePermNotAllow"]) assert.equal(guard.permanentDeliveryFailure(new Error(message)), null);
+  for (const message of ["timeout", "HTTP 429", "HTTP 500"]) assert.equal(guard.permanentDeliveryFailure(new Error(message)), null);
 });
 
 async function fixture() {
@@ -51,6 +51,7 @@ async function fixture() {
   const hooks = {
     getFeishuAutomationJobs: () => pending ? [job] : [],
     getVideo: () => video,
+    listVideoStages: async () => [],
     getProduct: () => ({ id: "product" }),
     getFeishuProductCardMapping: () => null,
     listFeishuAutomationJobVideoIds: () => pending && !job.blockedReason ? ["video"] : [],
@@ -148,6 +149,14 @@ test("an attachment added manually during upload is retained", async () => {
   assert.deepEqual(f.writes, []);
 });
 
+test("a new execution of the same video supersedes an older completion waiting on upload", async () => {
+  const f = await fixture();
+  f.video.attemptCount = 1; f.row.中文翻译 = "";
+  f.hooks.uploadBaseAttachment = async () => { f.video.attemptCount = 2; return [{file_token:"old-attempt"}]; };
+  await f.automation.completeFeishuAutomation("video");
+  assert.deepEqual(f.writes,[]); assert.equal(f.pending(),true); assert.equal(f.job.blockedReason,"");
+});
+
 test("a file upload failure still delivers blank text, retains the pending job and later retries only the file", async () => {
   const f = await fixture();
   f.row.原口播 = ""; f.row.中文翻译 = "";
@@ -196,6 +205,62 @@ test("network write failures remain retryable; fixing them does not require new 
   assert.equal(f.row.中文翻译, "接口中文");
 });
 
+test("confirmed permission errors pause without repeatedly polling or uploading", async () => {
+  const f = await fixture();
+  f.hooks.beforeRead = () => { throw Error("HTTP 403 permission denied credential=hidden"); };
+  await f.automation.completeFeishuAutomation("video");
+  assert.equal(f.job.blockedReason,"permission_required");
+  const requests = f.requests();
+  await f.automation.completeFeishuAutomation("video");
+  assert.equal(f.requests(),requests); assert.equal(f.uploads.length,0);
+  assert.doesNotMatch(f.blocks[0].message,/hidden|credential/);
+});
+
+test("rate limiting schedules a delay and skips all Feishu and model calls until due", async () => {
+  const f = await fixture();
+  f.row.文件 = [{file_token:"retained"}]; f.row.中文翻译 = "";
+  let writes = 0;
+  f.hooks.beforeWrite = () => { writes++; throw Error("HTTP 429 too many requests"); };
+  f.hooks.incrementFeishuAutomationJobAttempts = () => { f.job.attempts++; f.job.nextRetryAt = new Date(Date.now()+30_000).toISOString(); };
+  assert.equal(await f.automation.completeFeishuAutomation("video"),false);
+  assert.equal(writes,1); assert.equal(f.job.attempts,1);
+  const requests = f.requests();
+  await f.automation.completeFeishuAutomation("video");
+  assert.equal(f.requests(),requests); assert.equal(f.subtitles(),0);
+  f.job.nextRetryAt = "2000-01-01T00:00:00.000Z"; f.hooks.beforeWrite = null;
+  assert.equal(await f.automation.completeFeishuAutomation("video"),true);
+});
+
+test("missing translation remains blank while the file succeeds, instead of storing a blocking placeholder", async () => {
+  const f = await fixture();
+  f.video.transcriptZh = ""; f.row.中文翻译 = "";
+  assert.equal(await f.automation.completeFeishuAutomation("video"),false);
+  assert.deepEqual(f.row.文件,[{file_token:"uploaded"}]);
+  assert.equal(f.row.中文翻译,""); assert.equal(f.job.blockedReason,"translation_failed");
+  assert.equal(f.row.原口播,"人工原文"); assert.equal(f.pending(),true);
+});
+
+test("translation still in progress is not permanently paused by an earlier video completion", async () => {
+  const f = await fixture();
+  f.video.transcriptZh = ""; f.row.中文翻译 = "";
+  f.hooks.listVideoStages = async () => [{stage:"translation",state:"running",updatedAt:new Date().toISOString()}];
+  assert.equal(await f.automation.completeFeishuAutomation("video"),false);
+  assert.equal(f.job.blockedReason,""); assert.equal(f.job.attempts,0);
+  assert.equal(f.uploads.length,1);
+  f.video.transcriptZh = "迟到的真实译文";
+  assert.equal(await f.automation.completeFeishuAutomation("video"),true);
+  assert.equal(f.row.中文翻译,"迟到的真实译文"); assert.equal(f.uploads.length,1);
+});
+
+test("a failed transcript-only task can still deliver its file without any video-analysis column", async () => {
+  const f = await fixture();
+  f.video.status = "failed"; f.video.transcriptOriginal = ""; f.video.transcriptZh = "";
+  f.row.原口播 = ""; f.row.中文翻译 = ""; f.job.fieldMap.analysis = "不存在的视频分析列";
+  assert.equal(await f.automation.completeFeishuAutomation("video"),false);
+  assert.equal(f.job.blockedReason,"transcript_failed"); assert.equal(f.row.原口播,"");
+  assert.deepEqual(f.row.文件,[{file_token:"uploaded"}]); assert.equal(f.row.中文翻译,"");
+});
+
 test("explicitly skipped product-document mapping never falls back to a nonexistent column", async () => {
   const f = await fixture();
   assert.equal(f.automation.resolveAutomationFields({}, { productDocument: "" }).map.productDocument, "");
@@ -203,5 +268,44 @@ test("explicitly skipped product-document mapping never falls back to a nonexist
 
 test("a task-table delivery binding is saved before its analysis can start", async () => {
   const route = await readFile(new URL("../app/api/feishu/task-table/route.ts", import.meta.url), "utf8");
-  assert.ok(route.indexOf("await saveFeishuAutomationJob(") < route.indexOf("await enqueueVideos("));
+  const inbox = await readFile(new URL("../lib/feishu/inbox.ts", import.meta.url), "utf8");
+  assert.match(route, /await claimFeishuRequest/);
+  assert.doesNotMatch(route, /await createVideo\(/);
+  const materialize = inbox.slice(inbox.indexOf("export async function materializeInboxVideo"), inbox.indexOf("async function processTask"));
+  const binding = materialize.indexOf("await saveFeishuAutomationJob(");
+  const commit = materialize.indexOf("await connection.commit();", binding);
+  assert.ok(binding >= 0 && binding < commit && commit < materialize.indexOf("await enqueueVideos("));
+});
+
+test("video link display labels and disabled mappings never become input URLs", async () => {
+  const f = await fixture();
+  assert.equal(f.automation.resolveAutomationFields({ 视频链接: { text: "查看视频", link: "https://www.tiktok.com/t/Real/" } }).videoUrl, "https://www.tiktok.com/t/Real/");
+  assert.equal(f.automation.resolveAutomationFields({ 视频链接: "https://www.tiktok.com/t/Real/" }, { videoUrl: "" }).videoUrl, "");
+  const fitted = await f.automation.fitAutomationFieldMapToTable(f.client, { appToken: "app", tableId: "table", fieldMap: { videoUrl: "", translation: "" } });
+  assert.equal(fitted.videoUrl, ""); assert.equal(fitted.translation, "");
+});
+
+test("a repeated field-list cursor stops instead of returning an incomplete mapping", async () => {
+  const f = await fixture();
+  let calls = 0;
+  f.client.request = async () => { calls++; return { code: 0, data: { items: [], has_more: true, page_token: "same" } }; };
+  await assert.rejects(f.automation.listBitableTableFieldNames(f.job, f.client), /分页/);
+  assert.equal(calls, 2);
+});
+
+test("failed subtitles retain a durable delivery and successful video/text delivery", async () => {
+  const f = await fixture();
+  f.row.中文翻译 = "";
+  f.columns.push("链接字幕"); f.job.fieldMap.linkedSubtitle = "链接字幕";
+  f.video.transcriptSegments = [{ start: 0, end: 1, text: "hello" }];
+  f.hooks.generateBilingualSubtitleFile = async () => { throw Error("temporary subtitle failure"); };
+  for (let n = 0; n < 2; n++) assert.equal(await f.automation.completeFeishuAutomation("video"), false);
+  assert.equal(f.pending(), true);
+  assert.equal(f.job.blockedReason, "subtitle_failed");
+  assert.equal(f.job.attempts, 2);
+  assert.equal(f.row.中文翻译, "接口中文");
+  assert.equal(f.uploads.length, 1, "the delivered MP4 is never uploaded again");
+  const requests = f.requests();
+  await f.automation.completeFeishuAutomation("video");
+  assert.equal(f.requests(), requests, "exhausted jobs do not trigger another model call or Feishu poll");
 });

@@ -26,7 +26,41 @@ async function loadTokScriptModule() {
 
 const tokscript = await loadTokScriptModule();
 
-async function fetchWithTranscriptToolResult(transcriptResult) {
+test("ordinary speech beginning with cannot is not an API diagnostic", () => {
+  assert.equal(tokscript.tokScriptTranscriptFailure("Cannot believe how bright this lamp is!"), false);
+  assert.equal(tokscript.tokScriptTranscriptFailure("Failed to retrieve transcript"), true);
+});
+
+test("all translated segments are joined instead of accepting the first one as the whole translation", async () => {
+  const payload = { data: { segments: [
+    { start: 0, end: 1, text: "Open it.", translationZh: "打开。" },
+    { start: 1, end: 2, text: "Press here.", translationZh: "按这里。" },
+  ] } };
+  const result = await fetchWithTranscriptToolResult({ structuredContent: payload });
+  assert.equal(result.transcriptZh, "打开。 按这里。");
+  payload.data.segments[1].translationZh = "";
+  assert.equal((await fetchWithTranscriptToolResult({ structuredContent: payload })).transcriptZh, "");
+});
+
+test("permission, missing video and invalid input errors are not requested twice", async () => {
+  for (const message of ["Unauthorized: permission denied", "Video not found", "Invalid URL"]) {
+    await assert.rejects(fetchWithTranscriptToolResult({ isError: true, content: [{ type: "text", text: message }] }),
+      error => /attempts=1/.test(error.message));
+  }
+});
+
+test("invalid timestamp segments cannot be written into an SRT", async () => {
+  const result = await fetchWithTranscriptToolResult({ structuredContent: {
+    transcript: "Keep the complete spoken text.",
+    segments: [
+      { start: "invalid", end: 2, text: "bad" }, { start: 2, end: 1, text: "backwards" },
+      { start: -1, end: 1, text: "negative" }, { start: 1, end: 2, text: "valid" },
+    ],
+  } });
+  assert.deepEqual(result.segments, [{ start: 1, end: 2, text: "valid" }]);
+});
+
+async function fetchWithTranscriptToolResult(transcriptResult, options = {}) {
   globalThis.__tokscriptSourceHooks = {
     fetchWithProxy: async (_url, init) => {
       const request = JSON.parse(String(init.body || "{}"));
@@ -53,12 +87,27 @@ async function fetchWithTranscriptToolResult(transcriptResult) {
     return await tokscript.fetchTikTok(
       "https://www.tiktok.com/@creator/video/7600715017335491895",
       undefined,
-      { includeCover: false },
+      { includeCover: false, ...options },
     );
   } finally {
     delete globalThis.__tokscriptSourceHooks;
   }
 }
+
+test("partial task mode retains a playable file when speech extraction fails, never calling that silence", async()=>{
+  const result=await fetchWithTranscriptToolResult({isError:true,content:[{type:"text",text:"Unauthorized: permission denied"}]},{allowPartial:true});
+  assert.equal(result.transcript,"");
+  assert.equal(result.downloadUrl,"https://cdn.example/video.mp4");
+  assert.match(result.transcriptError,/stage=transcript; category=permission; attempts=1/);
+  assert.deepEqual(result.segments,[]);
+  assert.notEqual(result.transcript,"背景音乐，无有效产品口播");
+});
+
+test("partial task mode can skip previously successful transcript work", async()=>{
+  const result=await fetchWithTranscriptToolResult({isError:true,content:[{type:"text",text:"must not call transcript"}]},{allowPartial:true,includeTranscript:false});
+  assert.equal(result.transcriptError,undefined);
+  assert.equal(result.downloadUrl,"https://cdn.example/video.mp4");
+});
 
 test("TokScript plain-text extraction diagnostics are never accepted as speech", () => {
   assert.equal(
@@ -79,16 +128,17 @@ test("TokScript plain-text extraction diagnostics are never accepted as speech",
   assert.equal(tokscript.tokScriptTranscriptFailure("This monitor is easy to carry and use outdoors."), false);
 });
 
-test("short, repetitive, and soundtrack-matching text is marked as no product voiceover", () => {
-  assert.equal(tokscript.tokScriptTranscriptIsNoProductVoiceover("you"), true);
+test("short, repetitive, non-space and soundtrack-matching speech is retained", () => {
+  assert.equal(tokscript.tokScriptTranscriptIsNoProductVoiceover("you"), false);
+  assert.equal(tokscript.tokScriptTranscriptIsNoProductVoiceover("按一下就能打开"), false);
   assert.equal(tokscript.tokScriptTranscriptIsNoProductVoiceover("buy now"), false);
-  assert.equal(tokscript.tokScriptTranscriptIsNoProductVoiceover("you are you are you are you are"), true);
+  assert.equal(tokscript.tokScriptTranscriptIsNoProductVoiceover("you are you are you are you are"), false);
   assert.equal(
     tokscript.tokScriptTranscriptIsNoProductVoiceover(
       "I think I like when it rains, you told me that you feel the same",
       "I Think I Like When It Rains",
     ),
-    true,
+    false,
   );
   assert.equal(
     tokscript.tokScriptTranscriptIsNoProductVoiceover(
@@ -99,14 +149,14 @@ test("short, repetitive, and soundtrack-matching text is marked as no product vo
   );
 });
 
-test("a soundtrack transcript becomes the stable no-voiceover marker", async () => {
+test("soundtrack metadata never deletes a real transcript", async () => {
   const result = await fetchWithTranscriptToolResult({
     structuredContent: {
       transcript: "I think I like when it rains, you told me that you feel the same",
       audio: { name: "I Think I Like When It Rains" },
     },
   });
-  assert.equal(result.transcript, "背景音乐，无有效产品口播");
+  assert.equal(result.transcript, "I think I like when it rains, you told me that you feel the same");
   assert.deepEqual(result.segments, []);
 });
 
@@ -230,7 +280,7 @@ test("an MCP isError result is rejected before its text can become a transcript"
         return true;
       },
     );
-    assert.equal(downloadCalls, 1);
+    assert.equal(downloadCalls, 0, "transcript is requested first and its failure is not speech");
     assert.equal(transcriptCalls, 2, "the failing transcript tool is retried exactly once");
   } finally {
     delete globalThis.__tokscriptSourceHooks;
@@ -294,8 +344,8 @@ test("a persistent tool error stores only fixed stage, category and system text"
             { name: "get_tiktok_transcript", inputSchema: { properties: { url: {} } } },
           ],
         };
-      } else if (request.method === "tools/call" && request.params.name === "download_video") {
-        downloadCalls += 1;
+      } else if (request.method === "tools/call" && request.params.name === "get_tiktok_transcript") {
+        transcriptCalls += 1;
         result = {
           isError: true,
           content: [{
@@ -304,7 +354,7 @@ test("a persistent tool error stores only fixed stage, category and system text"
           }],
         };
       } else if (request.method === "tools/call") {
-        transcriptCalls += 1;
+        downloadCalls += 1;
       }
       return new Response(JSON.stringify({ jsonrpc: "2.0", id: request.id, result }), {
         status: 200,
@@ -321,12 +371,12 @@ test("a persistent tool error stores only fixed stage, category and system text"
       ),
       (error) => {
         assert.equal(error.name, "TokScriptToolCallError");
-        assert.match(error.message, /stage=download/);
+        assert.match(error.message, /stage=transcript/);
         assert.match(error.message, /category=rate_limit/);
         assert.match(error.message, /attempts=2/);
         assert.equal(
           error.message,
-          "TokScript 工具返回错误（stage=download; category=rate_limit; attempts=2）：服务请求受限",
+          "TokScript 工具返回错误（stage=transcript; category=rate_limit; attempts=2）：服务请求受限",
         );
         assert.equal("cause" in error, false);
         const durableErrorSurface = `${error.name}\n${error.message}\n${JSON.stringify(error)}`;
@@ -340,8 +390,8 @@ test("a persistent tool error stores only fixed stage, category and system text"
         return true;
       },
     );
-    assert.equal(downloadCalls, 2);
-    assert.equal(transcriptCalls, 0);
+    assert.equal(downloadCalls, 0);
+    assert.equal(transcriptCalls, 2);
   } finally {
     delete globalThis.__tokscriptSourceHooks;
   }
@@ -379,12 +429,12 @@ test("a tool network exception is contained to two calls and reduced to fixed te
       ),
       (error) => {
         assert.equal(error.name, "TokScriptToolCallError");
-        assert.match(error.message, /stage=download/);
+        assert.match(error.message, /stage=transcript/);
         assert.match(error.message, /category=network_error/);
         assert.match(error.message, /attempts=2/);
         assert.equal(
           error.message,
-          "TokScript 工具返回错误（stage=download; category=network_error; attempts=2）：服务网络异常",
+          "TokScript 工具返回错误（stage=transcript; category=network_error; attempts=2）：服务网络异常",
         );
         assert.doesNotMatch(error.message, /fetch failed|https?:|signed\.example|network-secret/);
         return true;
@@ -403,6 +453,7 @@ test("official TikTok short links resolve to the canonical video before TokScrip
     undefined,
     async (url, init) => {
       requests.push({ url: String(url), redirect: init.redirect });
+      if (requests.length > 1) return new Response("video page", { status: 200 });
       return new Response(null, {
         status: 302,
         headers: { location: "https://www.tiktok.com/@creator/video/7600715017335491895?_r=1" },
@@ -410,7 +461,10 @@ test("official TikTok short links resolve to the canonical video before TokScrip
     },
   );
   assert.equal(result, "https://www.tiktok.com/@creator/video/7600715017335491895?_r=1");
-  assert.deepEqual(requests, [{ url: "https://www.tiktok.com/t/SHORT123/", redirect: "manual" }]);
+  assert.deepEqual(requests, [
+    { url: "https://www.tiktok.com/t/SHORT123/", redirect: "manual" },
+    { url: "https://www.tiktok.com/@creator/video/7600715017335491895?_r=1", redirect: "manual" },
+  ]);
 });
 
 test("short-link resolution refuses redirects outside official TikTok hosts", async () => {

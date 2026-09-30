@@ -46,7 +46,7 @@ export async function runPromptTestAction(_prev: PromptTestResult | null, formDa
       // 口播翻译没有独立的 capture 表，直接把 captureId 输入框当作原文文本用。
       const transcript = captureId;
       const startedAt = Date.now();
-      const translation = await translateTranscriptWithQwen({ transcript });
+      const translation = await translateTranscriptWithQwen({ transcript, promptTemplate: template });
       return {
         ok: true,
         renderedPrompt: renderTemplate(template, { transcript }),

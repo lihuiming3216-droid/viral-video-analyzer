@@ -338,6 +338,6 @@ test("only known deleted-document codes trigger recovery", () => {
 
 test("stale document links are cleared explicitly with SQL NULL", async () => {
   const database = await readFile(new URL("../lib/database.ts", import.meta.url), "utf8");
-  assert.match(database, /export function clearProductDocumentLink\(id: string\)/);
+  assert.match(database, /export async function clearProductDocumentLink\(id: string\)/);
   assert.match(database, /UPDATE products SET document_id=NULL, document_url=NULL/);
 });

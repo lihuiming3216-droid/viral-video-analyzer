@@ -8,6 +8,13 @@ import test from "node:test";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const read = (file) => readFileSync(path.join(root, file), "utf8");
+
+test("the runtime image keeps the public preview referenced by the application", () => {
+  assert.match(read("app/layout.tsx"), /\/og\.png/);
+  assert.ok(existsSync(path.join(root, "public/og.png")));
+  assert.doesNotMatch(read(".dockerignore"), /^public\/og\.png\s*$/m);
+  assert.match(read("Dockerfile"), /COPY --from=build \/app\/public \.\/public/);
+});
 const revision = "a".repeat(40);
 const previousImage = `sha256:${"b".repeat(64)}`;
 

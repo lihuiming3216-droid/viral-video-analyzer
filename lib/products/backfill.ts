@@ -1,11 +1,11 @@
 import "server-only";
-import { randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import type { Client } from "@larksuiteoapi/node-sdk";
 import { syncProductCardManagedFields } from "@/lib/feishu/document";
 import { getProductCatalog } from "@/lib/products/catalog";
 import { reorganizeCatalogFromCache } from "@/lib/products/catalog-reorganize";
 import { readCatalog } from "@/lib/products/catalog-store";
-import { catalogFields, validatePid } from "@/lib/products/catalog-types";
+import { cachedCatalogResult, catalogFields, validatePid } from "@/lib/products/catalog-types";
 
 
 function reply(body: Record<string, unknown>, options: { status?: number } = {}) {
@@ -22,8 +22,17 @@ function needsBackfill(value: string | undefined) {
   return !normalized || /^(未找到|无法获取|无法分析|暂无|无)$/.test(normalized);
 }
 
-/** One-card maintenance endpoint. It never creates a card and never overwrites a populated field. */
+/** Legacy maintenance: fill blanks/missing-value markers, never create a card or replace substantive text. */
 export async function backfillProductCard(client: Client, rawPid: string, rawDocumentId: string) {
+  return writeProductCard(client, rawPid, rawDocumentId, false);
+}
+
+/** Explicit overwrite only: use verified existing cache, never request a provider. */
+export async function refreshProductCard(client: Client, rawPid: string, rawDocumentId: string) {
+  return writeProductCard(client, rawPid, rawDocumentId, true);
+}
+
+async function writeProductCard(client: Client, rawPid: string, rawDocumentId: string, refresh: boolean) {
   const pid = validatePid(rawPid.trim());
   const documentId = rawDocumentId.trim();
   if (!/^[A-Za-z0-9_-]{10,191}$/.test(documentId)) {
@@ -36,16 +45,31 @@ export async function backfillProductCard(client: Client, rawPid: string, rawDoc
   if (preflight.duplicateLabels.length) {
     return reply({ ok: false, error: `模板字段重复：${preflight.duplicateLabels.join("、")}` }, { status: 409 });
   }
-  if (preflight.currentValues["商品ID"] && preflight.currentValues["商品ID"] !== pid) {
+  if (!preflight.currentValues["商品ID"]) {
+    return reply({ ok: false, error: "手卡缺少商品 ID，无法确认归属；请先补填正确 PID" }, { status: 409 });
+  }
+  if (preflight.currentValues["商品ID"] !== pid) {
     return reply({ ok: false, error: "手卡商品 ID 与任务 PID 不一致" }, { status: 409 });
   }
-  const requested = Object.entries(labels).filter(([, label]) => needsBackfill(preflight.currentValues[label])).map(([key]) => key);
+  const requested = Object.entries(labels).filter(([, label]) =>
+    !preflight.missingLabels?.includes(label) && (refresh || needsBackfill(preflight.currentValues[label]))).map(([key]) => key);
   if (!requested.length) return reply({ ok: true, state: "complete", filled: [], message: "无需补录" });
 
   let catalog;
   const current = await readCatalog(pid);
-  if (current?.fetch_state === "ready" && current.analysis_state === "failed") {
-    catalog = await reorganizeCatalogFromCache(pid, randomUUID());
+  if (refresh) {
+    let stored: unknown;
+    try { stored = typeof current?.result_json === "string" ? JSON.parse(current.result_json) : current?.result_json; }
+    catch { return reply({ ok: false, error: "商品缓存格式无效，未改动手卡，请管理员核查" }, { status: 409 }); }
+    catalog = current?.fetch_state === "ready" && current.analysis_state === "ready" ? cachedCatalogResult(stored, pid) : null;
+    if (!catalog) return reply({ ok: false, error: "没有可用的已整理缓存；未改动手卡。请先在后台重新整理商品资料，再刷新这份手卡" }, { status: 409 });
+  } else if (current?.fetch_state === "ready" && current.analysis_state === "failed") {
+    // Repeated HTTP submissions for the same failed catalog are one repair,
+    // not fresh billable reorganizations. Explicit admin reorganization has
+    // its own request ID when another paid attempt is really intended.
+    const hash = createHash("sha256").update(`backfill:${pid}:${current.updated_at}`).digest("hex").slice(0, 32);
+    const recoveryId = `${hash.slice(0, 8)}-${hash.slice(8, 12)}-${hash.slice(12, 16)}-${hash.slice(16, 20)}-${hash.slice(20)}`;
+    catalog = await reorganizeCatalogFromCache(pid, recoveryId);
   } else {
     catalog = await getProductCatalog(pid);
   }

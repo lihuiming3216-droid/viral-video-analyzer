@@ -4,6 +4,33 @@
 
 SET NAMES utf8mb4;
 
+-- Invocation receipts are not URL de-duplication. Distinct user operations
+-- remain distinct; uncertain accepted receipts are never silently recycled.
+CREATE TABLE IF NOT EXISTS feishu_request_receipts (
+  id CHAR(64) PRIMARY KEY,
+  payload_sha256 CHAR(64) NOT NULL,
+  state VARCHAR(16) NOT NULL,
+  created_at VARCHAR(32) NOT NULL,
+  updated_at VARCHAR(32) NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+-- Accepted input and receipt commit together. No historical receipt is replayed
+-- or silently upgraded: old uncertain operations must still be investigated.
+CREATE TABLE IF NOT EXISTS feishu_inbox_tasks (
+  id CHAR(64) PRIMARY KEY,
+  kind VARCHAR(16) NOT NULL,
+  input_cipher MEDIUMTEXT NOT NULL,
+  state VARCHAR(16) NOT NULL DEFAULT 'pending',
+  video_id VARCHAR(36),
+  error_message VARCHAR(500) NOT NULL DEFAULT '',
+  created_at VARCHAR(32) NOT NULL,
+  updated_at VARCHAR(32) NOT NULL,
+  CONSTRAINT fk_feishu_inbox_receipt FOREIGN KEY (id) REFERENCES feishu_request_receipts(id),
+  INDEX idx_feishu_inbox_state (kind, state, created_at),
+  INDEX idx_feishu_inbox_video (video_id),
+  INDEX idx_feishu_inbox_updated (state, updated_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
 -- A PID is charged at most once automatically, across rows/cards/processes.
 -- Requested/failed states are deliberately never recycled on restart/timeout.
 -- Raw responses and image bytes live in the persistent private .data directory.
@@ -186,6 +213,17 @@ CREATE TABLE IF NOT EXISTS video_attempts (
   INDEX idx_video_attempts_video_started (video_id, started_at DESC)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
+CREATE TABLE IF NOT EXISTS video_stage_results (
+  video_id VARCHAR(36) NOT NULL,
+  attempt_number INT NOT NULL,
+  stage VARCHAR(24) NOT NULL,
+  state VARCHAR(16) NOT NULL,
+  error_message VARCHAR(500) NOT NULL DEFAULT '',
+  updated_at VARCHAR(32) NOT NULL,
+  PRIMARY KEY (video_id, attempt_number, stage),
+  CONSTRAINT fk_video_stage_video FOREIGN KEY (video_id) REFERENCES videos(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
 -- Independent settings; additive only, no migration rewrites existing paid caches.
 CREATE TABLE IF NOT EXISTS ai_purpose_settings (
   purpose VARCHAR(32) PRIMARY KEY,
@@ -286,6 +324,17 @@ CREATE TABLE IF NOT EXISTS feishu_automation_delivery_blocks (
   updated_at VARCHAR(32) NOT NULL,
   PRIMARY KEY (video_id, app_token, table_id, record_id),
   CONSTRAINT fk_feishu_delivery_block_job FOREIGN KEY (video_id, app_token, table_id, record_id)
+    REFERENCES feishu_automation_jobs(video_id, app_token, table_id, record_id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE IF NOT EXISTS feishu_automation_delivery_retries (
+  video_id VARCHAR(36) NOT NULL,
+  app_token VARCHAR(191) NOT NULL,
+  table_id VARCHAR(191) NOT NULL,
+  record_id VARCHAR(191) NOT NULL,
+  next_retry_at VARCHAR(32) NOT NULL,
+  PRIMARY KEY (video_id, app_token, table_id, record_id),
+  CONSTRAINT fk_feishu_delivery_retry_job FOREIGN KEY (video_id, app_token, table_id, record_id)
     REFERENCES feishu_automation_jobs(video_id, app_token, table_id, record_id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 

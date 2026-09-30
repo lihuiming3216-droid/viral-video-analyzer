@@ -1,9 +1,10 @@
 import "server-only";
 
 import { execFile } from "node:child_process";
-import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statfsSync, statSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statfsSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { Readable } from "node:stream";
+import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { promisify } from "node:util";
 import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
@@ -67,7 +68,13 @@ export async function saveUploadedVideo(videoId: string, file: File) {
   const relative = path.join(videoId, `original${safeExtension(file.name)}`);
   const target = resolveMediaPath(relative);
   mkdirSync(path.dirname(target), { recursive: true });
-  writeFileSync(target, Buffer.from(await file.arrayBuffer()));
+  const temporary = `${target}.${randomUUID()}.part`;
+  try {
+    await pipeline(Readable.fromWeb(file.stream() as never), createWriteStream(temporary));
+    renameSync(temporary, target);
+  } finally {
+    rmSync(temporary, { force: true });
+  }
   return relative;
 }
 
@@ -102,24 +109,43 @@ export async function downloadMedia(
   } catch (error) {
     throw normalizedDownloadError(error, kind, timeoutSignal, signal);
   }
-  if (!response.ok || !response.body) throw new Error(`${kind === "video" ? "视频" : "封面"}下载失败（${response.status}）`);
+  if (!response.ok || !response.body) {
+    await response.body?.cancel().catch(() => undefined);
+    throw new Error(`${kind === "video" ? "视频" : "封面"}下载失败（${response.status}）`);
+  }
   const length = Number(response.headers.get("content-length") || 0);
-  if (length > 600 * 1024 * 1024) throw new Error("视频超过 600MB，暂不支持下载");
+  const maxBytes = (kind === "video" ? 600 : 12) * 1024 * 1024;
+  const tooLarge = () => new Error(kind === "video" ? "视频超过 600MB，暂不支持下载" : "封面超过 12MB，暂不支持下载");
+  if (length > maxBytes) {
+    await response.body.cancel().catch(() => undefined);
+    throw tooLarge();
+  }
   const contentType = response.headers.get("content-type") || "";
   const extension = kind === "cover"
     ? contentType.includes("png") ? ".png" : ".jpg"
-    : safeExtension(new URL(response.url).pathname);
+    : safeExtension(new URL(response.url || url).pathname);
   const relative = path.join(videoId, kind === "video" ? `original${extension}` : `cover${extension}`);
   const target = resolveMediaPath(relative);
   mkdirSync(path.dirname(target), { recursive: true });
+  const temporary = `${target}.${randomUUID()}.part`;
+  let bytes = 0;
+  const limiter = new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      bytes += chunk.length;
+      callback(bytes > maxBytes ? tooLarge() : null, chunk);
+    },
+  });
   try {
     // Keep the timeout active while streaming the response body. Previously it
     // only covered response headers, so a stalled body escaped as the raw
     // English error "The operation was aborted due to timeout".
-    await pipeline(Readable.fromWeb(response.body as never), createWriteStream(target), { signal: requestSignal });
+    await pipeline(Readable.fromWeb(response.body as never), limiter, createWriteStream(temporary), { signal: requestSignal });
+    if (!bytes) throw new Error("下载内容为空");
+    renameSync(temporary, target);
   } catch (error) {
-    rmSync(target, { force: true });
     throw normalizedDownloadError(error, kind, timeoutSignal, signal);
+  } finally {
+    rmSync(temporary, { force: true });
   }
   return relative;
 }
@@ -206,19 +232,20 @@ export async function validateDownloadedVideoFile(
 }
 
 async function detectCuts(absolutePath: string, signal?: AbortSignal) {
+  let stderr = "";
   try {
-    await runFile(
+    const result = await runFile(
       ffmpegPath,
       ["-hide_banner", "-i", absolutePath, "-filter:v", "select='gt(scene,0.30)',showinfo", "-f", "null", "-"],
       { maxBuffer: 32 * 1024 * 1024, signal },
     );
-    return [] as number[];
+    stderr = result.stderr;
   } catch (error) {
     if (signal?.aborted) throw error;
-    const stderr = String((error as { stderr?: string }).stderr || "");
-    const times = [...stderr.matchAll(/pts_time:([0-9.]+)/g)].map((match) => Number(match[1]));
-    return times.filter((time) => Number.isFinite(time));
+    stderr = String((error as { stderr?: string }).stderr || "");
   }
+  const times = [...stderr.matchAll(/pts_time:([0-9.]+)/g)].map((match) => Number(match[1]));
+  return times.filter((time) => Number.isFinite(time));
 }
 
 function buildBoundaries(duration: number, detected: number[]) {

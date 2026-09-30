@@ -1,10 +1,12 @@
-import { countRecentVideos, getVideo, listRecentVideos, listVideoAttempts } from "@/lib/database";
+import { countRecentVideos, getFeishuAutomationJobs, getVideo, listRecentVideos, listVideoAttempts, listVideoStages } from "@/lib/database";
 import type { VideoAttemptDiagnostics } from "@/lib/types";
 import { AdminTopbar } from "../AdminTopbar";
 import { Pagination } from "../Pagination";
 import { STATUS_META, statusMeta } from "../status";
 import { AttemptSteps } from "./AttemptSteps";
 import { retryVideoAction } from "./actions";
+import { InboxStatus } from "./InboxStatus";
+import { requireAdmin } from "@/lib/require-admin";
 
 export const dynamic = "force-dynamic";
 
@@ -45,6 +47,7 @@ export default async function AdminTasksPage({
 }: {
   searchParams: Promise<{ id?: string; q?: string; status?: string; page?: string }>;
 }) {
+  await requireAdmin();
   const { id, q, status, page: pageParam } = await searchParams;
   const search = q?.trim() || "";
   const page = Math.max(1, Number(pageParam) || 1);
@@ -58,6 +61,12 @@ export default async function AdminTasksPage({
     ? await Promise.all([getVideo(selectedId, false), listVideoAttempts(selectedId)])
     : [null, []];
   const latestAttemptId = attempts[0]?.id;
+  const [stages, deliveries] = video ? await Promise.all([listVideoStages(video.id, video.attemptCount), getFeishuAutomationJobs(video.id)]) : [[], []];
+  const stageLabels: Record<string, string> = { download: "视频文件", transcript: "TokScript 口播", translation: "中文翻译", analysis: "完整视频分析" };
+  const stageStates: Record<string, string> = { running: "处理中", completed: "已完成", failed: "未完成", skipped: "未执行" };
+  const deliveryPauses: Record<string, string> = { permission_required: "没有写入权限，已暂停", record_missing: "目标行已删除，已暂停",
+    field_missing: "目标字段不存在，已暂停", source_changed: "该行链接已变更，已暂停", retry_exhausted: "写回连续失败，达到上限后暂停",
+    transcript_failed: "口播尚未完成，其他成功结果保留", translation_failed: "中文翻译未完成，其他成功结果保留", subtitle_failed: "字幕未完成，其他成功结果保留" };
 
   const filterHref = (nextStatus?: string) => {
     const params = new URLSearchParams();
@@ -70,6 +79,7 @@ export default async function AdminTasksPage({
   return (
     <>
       <AdminTopbar title="任务" right={<span style={{ fontSize: 10, color: "var(--text-faint)", fontFamily: "var(--mono)" }}>共 {total} 条任务</span>} />
+      <InboxStatus />
 
       <div style={{ flex: 1, minHeight: 0, display: "flex" }}>
         <div style={{ width: 340, flex: "0 0 340px", borderRight: "1px solid var(--border)", display: "flex", flexDirection: "column", overflow: "auto" }}>
@@ -209,6 +219,21 @@ export default async function AdminTasksPage({
                 <Kv label="更新时间" value={new Date(video.updatedAt).toLocaleString("zh-CN", { hour12: false })} />
               </div>
 
+              <div style={{ marginTop: 22, fontSize: 10.5, fontWeight: 750, letterSpacing: ".08em", textTransform: "uppercase", color: "var(--text-faint)" }}>
+                各环节结果
+              </div>
+              <div className="admin-card" style={{ marginTop: 10, padding: "4px 20px" }}>
+                {stages.map(stage => <Kv key={stage.stage} label={stageLabels[stage.stage] || stage.stage}
+                  value={<span>{stageStates[stage.state] || stage.state}{stage.error ? `：${stage.error}` : ""}</span>} />)}
+                {!stages.length && <p style={{ fontSize: 12 }}>历史任务尚无分环节记录</p>}
+              </div>
+              {deliveries.length > 0 && <div className="admin-card" style={{ marginTop: 10, padding: "4px 20px" }}>
+                <p style={{ fontSize: 12 }}>飞书尚未完成的回填</p>
+                {deliveries.map(job => <p key={JSON.stringify([job.appToken, job.tableId, job.recordId])} style={{ fontSize: 12, overflowWrap: "anywhere" }}>
+                  表 {job.tableId} · 行 {job.recordId}：{job.blockedReason ? deliveryPauses[job.blockedReason] || "已暂停，请核查" : job.nextRetryAt
+                    ? `等待重试（${new Date(job.nextRetryAt).toLocaleString("zh-CN", { hour12: false })}）` : "等待结果或写回"}
+                </p>)}
+              </div>}
               <div style={{ marginTop: 22, fontSize: 10.5, fontWeight: 750, letterSpacing: ".08em", textTransform: "uppercase", color: "var(--text-faint)" }}>
                 Attempt 时间线（共 {attempts.length} 次）
               </div>

@@ -271,6 +271,7 @@ export async function testQwenConnection() {
   const config = await requireProvider("qwen");
   const response = await fetch(`${config.baseUrl}/models`, {
     headers: { Authorization: `Bearer ${config.apiKey}` },
+    signal: AbortSignal.timeout(15_000),
   });
   if (!response.ok) throw new Error(`Qwen 连接失败（${response.status}），请确认 Base URL 所在地域与 Key 一致`);
   const sharedEndpoint = (() => {
@@ -493,15 +494,20 @@ export async function transcribeMediaWithQwen(input: {
     const rawSegments = Array.isArray((parsed.result as { segments?: unknown[] })?.segments)
       ? (parsed.result as { segments: unknown[] }).segments
       : [];
-    return rawSegments.map((item) => {
+    const segments = rawSegments.map((item) => {
       const row = item as Record<string, unknown>;
       return {
-        start: Number(row.start) || 0,
-        end: Number(row.end) || 0,
+        start: Number(row.start),
+        end: Number(row.end),
         text: String(row.text || "").trim(),
         translated: String(row.translated || "").trim(),
       };
     }).filter((segment) => segment.text);
+    if (segments.some(segment => !Number.isFinite(segment.start) || !Number.isFinite(segment.end)
+      || segment.start < 0 || segment.end < segment.start)) {
+      throw new Error("Qwen 返回了无效字幕时间，不会写回错位字幕");
+    }
+    return segments;
   } finally {
     releaseSlot?.();
   }
@@ -512,13 +518,16 @@ export async function transcribeMediaWithQwen(input: {
  * intentionally independent from the full-video analysis request so a slow or
  * failed multimodal call cannot erase an otherwise valid translation.
  */
-async function requestTranslation<T>(prompt: string, maxTokens: number, validate: (raw: Record<string, unknown>) => T, signal?: AbortSignal): Promise<T> {
+async function requestTranslation<T>(prompt: string, maxTokens: number, validate: (raw: Record<string, unknown>) => T, signal?: AbortSignal, beforeRequest?: () => Promise<void>): Promise<T> {
   const config = await requireAiRuntime("translation");
   for (let attempt = 0; attempt <= config.retries; attempt++) {
     let releaseSlot: (() => void) | undefined;
     let response: Response | undefined;
+    let requestStarted = false;
     try {
       releaseSlot = await acquireQwenRequestSlot("translation", signal);
+      await beforeRequest?.();
+      requestStarted = true;
       const timeout = AbortSignal.timeout(QWEN_TRANSLATION_TIMEOUT_MS);
       response = await fetchQwen(`${config.baseUrl}/chat/completions`, {
         method: "POST", headers: { Authorization: `Bearer ${config.apiKey}`, "Content-Type": "application/json" },
@@ -531,7 +540,8 @@ async function requestTranslation<T>(prompt: string, maxTokens: number, validate
       });
       const parsed = await parseOmniStream(response, () => undefined);
       return validate(parsed.result);
-    } catch {
+    } catch (error) {
+      if (!requestStarted) throw error;
       if (signal?.aborted) throw signal.reason;
       const retryable = !response || response.ok || response.status === 408 || response.status === 429 || response.status >= 500;
       if (attempt >= config.retries || !retryable) {
@@ -545,15 +555,17 @@ async function requestTranslation<T>(prompt: string, maxTokens: number, validate
 export async function translateTranscriptWithQwen(input: {
   transcript: string;
   signal?: AbortSignal;
+  /** Admin prompt preview only; ordinary tasks use the saved template. */
+  promptTemplate?: string;
 }) {
   const transcript = input.transcript.trim();
   if (!transcript) return "";
-  const templateRow = await getPromptTemplate(
+  const template = input.promptTemplate?.trim() || (await getPromptTemplate(
       TRANSCRIPT_TRANSLATION_PROMPT_SLUG,
       "口播翻译",
       DEFAULT_TRANSCRIPT_TRANSLATION_TEMPLATE,
-    );
-  const promptText = templateRow.template.replaceAll("{{TRANSCRIPT_JSON}}", JSON.stringify(transcript));
+    )).template;
+  const promptText = template.replaceAll("{{TRANSCRIPT_JSON}}", JSON.stringify(transcript));
   return requestTranslation(promptText, 4_500, result => {
     const translation = String(result.translationZh || result.translation_zh || result.translation || "").trim();
     if (!translation) throw new Error("Qwen 未返回口播中文翻译");
@@ -571,6 +583,8 @@ export async function translateTranscriptWithQwen(input: {
 export async function translateSegmentsWithQwen(input: {
   segments: Array<{ start: number; end: number; text: string }>;
   signal?: AbortSignal;
+  /** Durable per-task billing budget, claimed before every actual request. */
+  beforeRequest?: () => Promise<void>;
 }): Promise<string[]> {
   const segments = input.segments.filter((segment) => segment.text.trim());
   if (!segments.length) return [];
@@ -585,9 +599,9 @@ export async function translateSegmentsWithQwen(input: {
     );
   return requestTranslation(promptText, 8_000, result => {
     const translations = Array.isArray(result.translations) ? result.translations.map((value) => String(value ?? "").trim()) : [];
-    if (translations.length !== segments.length) {
+    if (translations.length !== segments.length || translations.some(value => !value)) {
       throw new Error(`Qwen 返回的分段翻译数量（${translations.length}）跟原文分段数量（${segments.length}）不一致`);
     }
     return translations;
-  }, input.signal);
+  }, input.signal, input.beforeRequest);
 }

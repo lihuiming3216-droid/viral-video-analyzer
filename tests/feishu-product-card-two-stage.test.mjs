@@ -25,6 +25,9 @@ async function loadDocumentModule() {
     export const setFeishuRootFolder = () => {};
   `;
   const stubUrl = `data:text/javascript;base64,${Buffer.from(stubSource).toString("base64")}`;
+  const types = ts.transpileModule(await readFile(new URL("../lib/products/catalog-types.ts", import.meta.url), "utf8"),
+    {compilerOptions:{module:ts.ModuleKind.ESNext,target:ts.ScriptTarget.ES2022}}).outputText;
+  const typesUrl = `data:text/javascript;base64,${Buffer.from(types).toString("base64")}`;
   let compiled = ts.transpileModule(documentSource, {
     compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
   }).outputText;
@@ -33,7 +36,8 @@ async function loadDocumentModule() {
     .replaceAll('"@/lib/database"', JSON.stringify(stubUrl))
     .replaceAll('"@/lib/json-utils"', JSON.stringify(stubUrl))
     .replaceAll('"@/lib/video-processing"', JSON.stringify(stubUrl))
-    .replaceAll('"@/lib/feishu/store"', JSON.stringify(stubUrl));
+    .replaceAll('"@/lib/feishu/store"', JSON.stringify(stubUrl))
+    .replaceAll('"@/lib/products/catalog-types"', JSON.stringify(typesUrl));
   return import(`data:text/javascript;base64,${Buffer.from(compiled).toString("base64")}`);
 }
 
@@ -59,11 +63,16 @@ test("source shop and main-image metadata fill empty template rows but never rep
   assert.equal(documentModule.syncProductCardManagedBlockText("商品主图：https://manual.invalid/image", input), "商品主图：https://manual.invalid/image");
 });
 
-test("ordinary fill-only mode preserves all populated basic fields, including placeholders and manual zero values", () => {
+test("ordinary fill-only mode preserves manual facts and zeros while replacing missing-value markers", () => {
   const input = { mode: "verified-basic", fillEmptyOnly: true, usageMethod: "新步骤", coreFunctions: ["新功能"] };
-  for (const value of ["人工步骤", "未找到", "暂无", "无", "0"]) {
+  for (const value of ["人工步骤", "0", "待补齐，人工另有说明"]) {
     assert.equal(documentModule.syncProductCardManagedBlockText(`使用方法：${value}`, input), `使用方法：${value}`);
   }
+  for(const value of ["待补齐","未找到","暂无","无"]) {
+    assert.equal(documentModule.syncProductCardManagedBlockText(`使用方法：${value}`, input), "使用方法：新步骤");
+  }
+  assert.equal(documentModule.syncProductCardManagedBlockText("使用方法：人工步骤", {...input,usageMethod:"待补齐",preserveExistingOnMissing:true}), "使用方法：人工步骤");
+  assert.equal(documentModule.syncProductCardManagedBlockText("使用方法：待补齐", {...input,expectedValues:{使用方法:""}}), "使用方法：待补齐");
   assert.equal(documentModule.syncProductCardManagedBlockText("使用方法：  ", input), "使用方法：  新步骤");
   assert.equal(documentModule.syncProductCardManagedBlockText("视频分析：人工内容", input), "视频分析：人工内容");
   assert.equal(documentModule.syncProductCardManagedBlockText("使用方法：人工步骤", { ...input, fillEmptyOnly: false }), "使用方法：新步骤");

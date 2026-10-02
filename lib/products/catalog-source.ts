@@ -235,11 +235,30 @@ function removeUrls(value: unknown): unknown {
   return value;
 }
 
+/** Remove transport-only SKU bookkeeping, never truncate variants or their names. */
+function skuTextEvidence(value: unknown): unknown {
+  if (!Array.isArray(value)) return value;
+  return value.map(part => {
+    const sku = object(part);
+    const props = Array.isArray(sku.sku_sale_props) ? sku.sku_sale_props.map(object) : [];
+    // Some suppliers provide only identifier relationships. Preserve them until
+    // all properties have readable names/values; otherwise variants could merge.
+    if (!props.length || !props.every(prop => typeof prop.prop_name === "string" && prop.prop_name.trim()
+      && typeof prop.prop_value === "string" && prop.prop_value.trim())) return part;
+    const descriptive = Object.fromEntries(Object.entries(sku).filter(([key]) =>
+      !/^(sku_id|sale_prop_value_ids|status|stock|inventory|available_quantity)$/.test(key)));
+    return { ...descriptive, sku_sale_props: props.map(prop => Object.fromEntries(Object.entries(prop)
+      .filter(([key]) => !/^(prop_id|prop_value_id)$/.test(key)))) };
+  });
+}
+
 export async function prepareCatalogEvidence(pid: string, item: Record<string, unknown>, options: { cacheOnly?: boolean } = {}): Promise<CatalogEvidence> {
   const directory = catalogDirectory(pid);
   const fields = Object.fromEntries(Object.entries(item).filter(([key]) =>
-    /^(product_name|product_title|product_specifications|product_sku_props|product_skus|shop_name)$/.test(key)
-      || /description|detail|feature|function|instruction|usage/i.test(key)));
+    !/image|video|media|url|token|secret/i.test(key) &&
+    (/^(product_name|product_title|product_specifications|product_sku_props|product_skus|shop_name)$/.test(key)
+      || /description|detail|feature|function|instruction|usage/i.test(key)))
+    .map(([key, value]) => [key, key === "product_skus" ? skuTextEvidence(value) : value]));
   const text = JSON.stringify(removeUrls(fields));
   if (text.length > 100_000) throw new CatalogError("商品文字资料过长，已保留原文，需管理员处理");
   const allCandidates = imageCandidates(item);

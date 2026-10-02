@@ -23,7 +23,7 @@ import { fetchTikTok } from "@/lib/providers/tokscript";
 import { buildBilingualSrt, buildTimestampedText, generateBilingualSubtitleFile, type TranscriptSegment } from "@/lib/subtitle";
 import { resolveMediaPath } from "@/lib/video-processing";
 import { assertDeliveryFields, assertDeliverySource, emptyFieldPatch, fieldHasContent, permanentDeliveryFailure } from "@/lib/feishu/delivery-guard";
-import { catalogError, catalogFields, type CatalogSourceMetadata } from "@/lib/products/catalog-types";
+import { CATALOG_PENDING_TEXT, catalogError, catalogFields, isMissingCatalogText, pendingCatalogCardInput, type CatalogSourceMetadata } from "@/lib/products/catalog-types";
 
 export interface FeishuAutomationFieldMap {
   productUrl: string;
@@ -956,7 +956,8 @@ async function handleFeishuAutomationUnlocked(input: FeishuAutomationInput) {
       expectedValues: preflight.currentValues, protectRevision: true,
     });
     const emptyLabels = Object.values(catalogFields).filter(label =>
-      !preflight.missingLabels.includes(label) && !preflight.currentValues[label]?.trim());
+      !preflight.missingLabels.includes(label) && isMissingCatalogText(preflight.currentValues[label]));
+    let verified = preflight;
     if (!emptyLabels.length) {
       productCardStatus = "手卡已就绪，已有基础资料已保留；需要替换请使用刷新基础资料";
     } else {
@@ -964,10 +965,12 @@ async function handleFeishuAutomationUnlocked(input: FeishuAutomationInput) {
       await assertCurrentPid();
       const catalog = await getProductCatalog(effectivePid);
       catalogMetadata = await getProductMetadataByPid(effectivePid);
-      const fieldText = (key: keyof typeof catalogFields) => catalog.fields[key].text;
+      await assertCurrentPid();
+      const fieldText = (key: keyof typeof catalogFields) => catalog.fields[key].basis === "missing"
+        || isMissingCatalogText(catalog.fields[key].text) ? CATALOG_PENDING_TEXT : catalog.fields[key].text;
       const synced = await syncProductCardManagedFields(input.client, {
         documentId: shell.documentId, mode: "verified-basic", derivedOnly: true, fillEmptyOnly: true,
-        sku: fieldText("sku"), coreFunctions: [fieldText("coreFunctions")],
+        sku: fieldText("sku"), coreFunctions: fieldText("coreFunctions") ? [fieldText("coreFunctions")!] : undefined,
         productParameters: fieldText("productParameters"), usageMethod: fieldText("usageMethod"),
         audience: fieldText("audience"), scenes: fieldText("scenes"),
         shopName: catalogMetadata?.shopName || "",
@@ -983,13 +986,43 @@ async function handleFeishuAutomationUnlocked(input: FeishuAutomationInput) {
         synced.missingLabels.length ? `无法定位字段：${synced.missingLabels.join("、")}` : "",
       ].filter(Boolean).join("；");
       productCardStatus = "手卡空白基础资料已补录，已有内容保留";
+      // A successful PATCH is not the final acceptance criterion. Confirm all
+      // six visible basic fields at the current revision, not just AI output.
+      verified = await syncProductCardManagedFields(input.client, {
+        documentId: shell.documentId, mode: "verified-basic", preflightOnly: true, protectRevision: true,
+      });
+    }
+    if (verified.currentValues["商品ID"] !== effectivePid) throw new Error("手卡正文中的商品 ID 与当前 PID 不一致，请先核对手卡");
+    const incomplete = Object.values(catalogFields).filter(label => verified.missingLabels.includes(label)
+      || isMissingCatalogText(verified.currentValues[label]));
+    if (incomplete.length) {
+      productRefreshError = `基础资料待补齐：${incomplete.join("、")}`;
+      productCardStatus = `手卡链接已回填，${productRefreshError}；已有内容保留`;
     }
   } catch (error) {
     // Do not expose provider bodies, signed URLs or credentials in logs/status.
     if (error instanceof HandcardSourceChangedError) throw error;
     productRefreshError = error instanceof Error && /^(模板|手卡正文|产品手卡模板|飞书没有返回)/.test(error.message)
       ? error.message.slice(0, 300) : catalogError(error);
-    productCardStatus = `手卡已就绪，商品资料未完成：${productRefreshError}`;
+    // Source outages leave a reusable placeholder, never a fake product fact
+    // or a notification. Recheck identity and revision before touching blanks.
+    try {
+      await assertCurrentPid();
+      const latest = await syncProductCardManagedFields(input.client, {
+        documentId: shell.documentId, mode: "verified-basic", preflightOnly: true, protectRevision: true,
+      });
+      if (!latest.duplicateLabels.length && latest.currentValues["商品ID"] === effectivePid) {
+        await syncProductCardManagedFields(input.client, {
+          documentId: shell.documentId, mode: "verified-basic", derivedOnly: true, fillEmptyOnly: true,
+          ...pendingCatalogCardInput(latest.currentValues, latest.missingLabels),
+          expectedValues: latest.currentValues, preserveExistingOnMissing: true, protectRevision: true,
+        });
+      }
+    } catch (pendingError) {
+      if (pendingError instanceof HandcardSourceChangedError) throw pendingError;
+      productRefreshError += `；待补齐标记写入未完成：${safeAutomationFailure(pendingError)}`;
+    }
+    productCardStatus = "手卡已就绪，基础资料待补齐；已有内容保留";
   }
 
   product = await withProductIdentityLock(effectivePid, async () => {

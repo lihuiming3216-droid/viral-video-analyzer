@@ -1,7 +1,7 @@
 import "server-only";
 import path from "node:path";
 import { requireAiRuntime } from "@/lib/ai/settings";
-import { catalogError, CatalogError, validatePid, cachedCatalogResult, type CatalogResult } from "@/lib/products/catalog-types";
+import { catalogError, CatalogError, validatePid, cachedCatalogResult, restrictCachedCatalogEvidence, type CatalogResult } from "@/lib/products/catalog-types";
 import { readCatalog, claimCatalog, claimCatalogCreditRetry, claimCatalogPublicRecovery, markCatalogFetched, claimCatalogAnalysis, finishCatalogAnalysis, failCatalog, readCatalogMetadata, saveCatalogMetadata, type CatalogRow } from "@/lib/products/catalog-store";
 import { cachedProduct, fetchProductOnce, prepareCatalogEvidence, catalogDirectory, readPrivateJson, savePrivate, readCreditRejection, archiveCreditRejection, catalogSourceMetadata } from "@/lib/products/catalog-source";
 import { cachedPublicProduct, fetchPublicProductOnce } from "@/lib/products/tiktok-public-source";
@@ -36,9 +36,20 @@ async function cachedCatalogProduct(pid: string): Promise<Record<string, unknown
   return item ? supplierItem(item, publicFailed) : null;
 }
 
+/** Reuse saved bytes only; never fetch or analyze to validate old image references. */
+export async function catalogForWrite(result: CatalogResult): Promise<CatalogResult> {
+  if (Object.values(result.fields).every(fact => fact.evidence.every(id => id === "product-text"))) {
+    return restrictCachedCatalogEvidence(result, []);
+  }
+  const item = await cachedCatalogProduct(result.pid);
+  if (!item) return restrictCachedCatalogEvidence(result, []);
+  const evidence = await prepareCatalogEvidence(result.pid, item, { cacheOnly: true });
+  return restrictCachedCatalogEvidence(result, evidence.images);
+}
+
 async function fetchCatalogProductOnce(pid: string): Promise<Record<string, unknown>> {
   try {
-    return await fetchPublicProductOnce(pid);
+    return await fetchPublicProductOnce(pid, { retryFailed: true });
   } catch (error) {
     if (process.env.CHUHAIJIANG_FALLBACK_ENABLED !== "true") {
       throw new CatalogError(`${catalogError(error)}；出海匠付费备选当前已停用`);
@@ -55,7 +66,7 @@ async function recoverFailedWithPublicSource(pid: string, row: CatalogRow): Prom
     throw new CatalogError("该 PID 已开始免费资料恢复，请稍后查看");
   }
   try {
-    const item = await fetchPublicProductOnce(pid);
+    const item = await fetchPublicProductOnce(pid, { retryFailed: true });
     await markCatalogFetched(pid);
     return item;
   } catch (error) {
@@ -147,8 +158,12 @@ export function getProductCatalog(pid: string): Promise<CatalogResult> {
 async function runCatalog(pid: string): Promise<CatalogResult> {
   let row = await readCatalog(pid);
   if (row?.analysis_state === "ready" && row.result_json) {
-    const result = typeof row.result_json === "string" ? JSON.parse(row.result_json) : row.result_json;
-    return cachedCatalogResult(result, pid)!;
+    let result: unknown;
+    try { result = typeof row.result_json === "string" ? JSON.parse(row.result_json) : row.result_json; }
+    catch { throw new CatalogError("商品整理缓存格式无效，已保留手卡；不会重新收费，请管理员核查"); }
+    const cached = cachedCatalogResult(result, pid);
+    if (!cached) throw new CatalogError("商品整理缓存结果为空，已保留手卡；不会重新收费，请管理员核查");
+    return catalogForWrite(cached);
   }
   if (row?.analysis_state === "failed") throw new CatalogError(row.error_message);
   if (row?.fetch_state === "failed") await requireAiRuntime("product");

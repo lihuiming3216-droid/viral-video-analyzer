@@ -12,6 +12,7 @@ import {
   saveFeishuFolder, setFeishuRootFolder,
 } from "@/lib/feishu/store";
 import type { Product, SceneRecord, VideoRecord } from "@/lib/types";
+import { isMissingCatalogText } from "@/lib/products/catalog-types";
 
 const defaultProductTemplateToken = "B3GNdl05HoEdjnx8WPrcwC5Hnlg";
 
@@ -1331,7 +1332,7 @@ export type ProductCardManagedFieldsInput = {
   preflightOnly?: boolean;
   /** Missing provider facts must not erase existing manual values. */
   preserveExistingOnMissing?: boolean;
-  /** Ordinary backfill never replaces any populated basic fact. */
+  /** Ordinary backfill only replaces blanks or explicit missing-value markers. */
   fillEmptyOnly?: boolean;
   /** Snapshot before the slow provider call; skip values edited since then. */
   expectedValues?: Partial<Record<ProductCardManagedLabel, string>>;
@@ -1407,12 +1408,12 @@ export function syncProductCardManagedBlockText(
   const values = productCardManagedValues(input);
   if (!values.has(matched.label)) return content;
   if (input.fillEmptyOnly && PRODUCT_CARD_DERIVED_LABELS.includes(matched.label as typeof PRODUCT_CARD_DERIVED_LABELS[number])
-    && matched.value.trim()) return content;
+    && !isMissingCatalogText(matched.value)) return content;
   if (input.expectedValues && hasOwn(input.expectedValues, matched.label)
     && input.expectedValues[matched.label] !== matched.value.trim()) return content;
   if (PRODUCT_CARD_METADATA_LABELS.includes(matched.label as typeof PRODUCT_CARD_METADATA_LABELS[number])
     && matched.value.trim()) return content;
-  if (input.preserveExistingOnMissing && matched.value.trim() && (!values.get(matched.label) || values.get(matched.label) === "未找到")) return content;
+  if (input.preserveExistingOnMissing && !isMissingCatalogText(matched.value) && isMissingCatalogText(values.get(matched.label))) return content;
   return `${matched.prefix}${values.get(matched.label) || ""}${matched.tail}`;
 }
 

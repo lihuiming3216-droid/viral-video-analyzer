@@ -189,6 +189,63 @@ test("failed exact-PID saved pages recover with checksum and no repeated HTTP; c
   assert.equal(await readFile(path.join(dir, "receipt.json"), "utf8"), receipt);
 });
 
+test("explicit free-source recovery tries the direct PDP once, preserves old evidence and caches success", async t => {
+  const file = await publicSource(t);
+  const dir = file.publicCatalogDirectory(fixturePid);
+  await mkdir(dir, { recursive: true });
+  const html = "<title>Security Check</title>";
+  const receipt = JSON.stringify({ pid: fixturePid, source: "tiktok-public", state: "failed", httpStatus: 200,
+    errorMessage: "TikTok 返回安全验证页，未取得商品资料", requestedUrl: `https://www.tiktok.com/view/product/${fixturePid}`,
+    fetchedAt: "2026-01-01T00:00:00Z", responseSha256: createHash("sha256").update(html).digest("hex") });
+  await writeFile(path.join(dir, "response.html"), html);
+  await writeFile(path.join(dir, "receipt.json"), receipt);
+  await writeFile(path.join(dir, "request-started.json"), "original marker");
+  let calls = 0;
+  globalThis.__catalogFetch = async url => { calls++; assert.equal(url, `https://shop.tiktok.com/us/pdp/${fixturePid}?source=anchor`); return new Response(publicProductHtml(fixturePid)); };
+  const options = { retryFailed: true };
+  assert.equal((await file.fetchPublicProductOnce(fixturePid, options)).product_id, fixturePid);
+  assert.equal((await file.fetchPublicProductOnce(fixturePid, options)).product_id, fixturePid);
+  assert.equal(calls, 1);
+  assert.equal(await readFile(path.join(dir, "request-started.json"), "utf8"), "original marker");
+  const generation = createHash("sha256").update(receipt).digest("hex");
+  assert.equal(await readFile(path.join(dir, "retries", generation, "previous-response.html"), "utf8"), html);
+  assert.equal(await readFile(path.join(dir, "retries", generation, "previous-receipt.json"), "utf8"), receipt);
+});
+
+test("new free capture retries one blocked response but recent failures and wrong PID never loop", async t => {
+  const file = await publicSource(t);
+  let calls = 0;
+  globalThis.__catalogFetch = async () => { calls++; return new Response("<title>Security Check</title>"); };
+  await assert.rejects(file.fetchPublicProductOnce(fixturePid, { retryFailed: true }), /安全验证/);
+  assert.equal(calls, 2);
+  await assert.rejects(file.fetchPublicProductOnce(fixturePid, { retryFailed: true }), /一分钟/);
+  assert.equal(calls, 2);
+  const wrong = "1732350695360139846";
+  globalThis.__catalogFetch = async () => { calls++; return new Response(publicProductHtml(fixturePid)); };
+  await assert.rejects(file.fetchPublicProductOnce(wrong, { retryFailed: true }), /PID/);
+  assert.equal(calls, 3);
+});
+
+test("cross-process free recovery is claimed once and a corrupt failure cannot request anything", async t => {
+  const file = await publicSource(t);
+  const dir = file.publicCatalogDirectory(fixturePid);
+  await mkdir(dir, { recursive: true });
+  const html = "<title>Security Check</title>";
+  const receipt = JSON.stringify({pid:fixturePid,source:"tiktok-public",state:"failed",httpStatus:200,fetchedAt:"2026-01-01T00:00:00Z",
+    errorMessage:"TikTok 返回安全验证页，未取得商品资料",responseSha256:createHash("sha256").update(html).digest("hex")});
+  await writeFile(path.join(dir, "response.html"), html);
+  await writeFile(path.join(dir, "receipt.json"), receipt);
+  let calls = 0;
+  globalThis.__catalogFetch = async () => { calls++; await new Promise(resolve=>setTimeout(resolve,30)); return new Response(publicProductHtml(fixturePid)); };
+  const outcomes = await Promise.allSettled(Array.from({length:8},()=>file.fetchPublicProductOnce(fixturePid,{retryFailed:true})));
+  assert.equal(outcomes.filter(x=>x.status==='fulfilled').length,1);
+  assert.equal(calls,1);
+  await writeFile(path.join(dir,"receipt.json"),receipt);
+  await writeFile(path.join(dir,"response.html"),html+'tampered');
+  await assert.rejects(file.fetchPublicProductOnce(fixturePid,{retryFailed:true}),/校验/);
+  assert.equal(calls,1);
+});
+
 test("PID identity is exact, textual and unambiguous; no URL/name guesses", () => {
   for (const pid of ["../123456", "123", "1e18", "123456?x", "１２３４５６"]) assert.throws(() => types.validatePid(pid));
   for (const items of [[], [{ product_id: 1732350695360139845 }], [{ product_id: fixturePid, id: "other" }], [{ product_id: fixturePid }, { product_id: fixturePid }]]) {
@@ -305,6 +362,34 @@ test("untrusted image hosts never receive a request, and partial missing images 
   }
 });
 
+test("large SKU inventories keep every named variant without transport IDs overwhelming model text", async t => {
+  const { file } = await modules(t);
+  const product_skus = Array.from({ length: 282 }, (_, index) => ({
+    sku_id: "1".repeat(80) + index, sale_prop_value_ids: "2".repeat(80), status: 1, stock: 2000,
+    price: { real_price: 9.58 },
+    sku_sale_props: [{ prop_id: "3".repeat(80), prop_name: "Color", prop_value: `Black-${index}`, prop_value_id: "4".repeat(80) },
+      { prop_id: "5".repeat(80), prop_name: "Model", prop_value: `Phone-${index}`, prop_value_id: "6".repeat(80) }],
+  }));
+  const description = "Ordinary description must survive unchanged.\nNo additional app required.";
+  const evidence = await file.prepareCatalogEvidence(fixturePid, { product_name: "Phone case", product_description: description, product_skus }, { cacheOnly: true });
+  const text = JSON.parse(evidence.text);
+  assert.equal(text.product_description, description);
+  assert.equal(text.product_skus.length, 282);
+  assert.equal(text.product_skus[281].sku_sale_props[1].prop_value, "Phone-281");
+  assert.deepEqual(text.product_skus[0].price, { real_price: 9.58 });
+  assert.equal(text.product_skus[0].sku_id, undefined);
+  assert.equal(text.product_skus[0].sku_sale_props[0].prop_value_id, undefined);
+  assert.equal(product_skus[0].sku_id, "1".repeat(80) + "0");
+});
+
+test("identifier-only SKU relationships stay intact and real oversized descriptions are not silently truncated", async t => {
+  const { file } = await modules(t);
+  const product_skus = [{ sku_id: "sku-1", sale_prop_value_ids: "prop-1", stock: 2 }];
+  const evidence = await file.prepareCatalogEvidence(fixturePid, { product_name: "Bottle", product_skus }, { cacheOnly: true });
+  assert.deepEqual(JSON.parse(evidence.text).product_skus, product_skus);
+  await assert.rejects(file.prepareCatalogEvidence(fixturePid, { product_name: "Bottle", product_description: "a".repeat(100_001) }, { cacheOnly: true }), /文字资料过长/);
+});
+
 test("each field is independently grounded, inference is labelled, invalid claims do not erase valid ones", async t => {
   const { analyzer } = await modules(t);
   const input = { pid: fixturePid, text: "travel bottle", images: [], warnings: [] };
@@ -335,7 +420,50 @@ test("Qwen's single-product array and labelled references are normalized without
   raw.fields.usageMethod.basis = "inference";
   const unsafe = analyzer.validateCatalogResult(raw, input, "fixture");
   assert.equal(unsafe.fields.coreFunctions.basis, "missing");
-  assert.equal(unsafe.fields.usageMethod.basis, "missing");
+  assert.equal(unsafe.fields.usageMethod.basis, "inference");
+  assert.match(unsafe.fields.usageMethod.text, /^推断：/);
+});
+
+test("routine usage inference is labelled but unknown images, invented numbers and risky steps stay missing", async t => {
+  const { analyzer } = await modules(t);
+  const input = { pid: fixturePid, text: "Storage basket", images: [], warnings: [] };
+  const raw = result(fixturePid);
+  raw.fields.usageMethod = { text: "将物品放入收纳篮，摆放于平稳表面。", basis: "inference", evidence: ["product-text"] };
+  assert.equal(analyzer.validateCatalogResult(raw, input, "fixture").fields.usageMethod.text, "推断：将物品放入收纳篮，摆放于平稳表面。");
+  for (const text of ["使用5V电源充电3小时", "接通市电后拆机维修", "服用两片", "将工具伸入耳道", "点燃蜡烛", "放入洗衣机清洗"]) {
+    raw.fields.usageMethod.text = text;
+    assert.equal(analyzer.validateCatalogResult(raw, input, "fixture").fields.usageMethod.basis, "missing");
+  }
+  raw.fields.usageMethod.text = "放入收纳物品。";
+  raw.fields.usageMethod.evidence.push("image-9");
+  assert.equal(analyzer.validateCatalogResult(raw, input, "fixture").fields.usageMethod.basis, "missing");
+  raw.fields.productParameters = { text: "大容量", basis: "inference", evidence: ["product-text"] };
+  assert.equal(analyzer.validateCatalogResult(raw, input, "fixture").fields.productParameters.basis, "missing");
+});
+
+test("seller compliance claims are attributed even when model text omitted the attribution", async t => {
+  const { analyzer } = await modules(t);
+  const raw = result(fixturePid);
+  raw.fields.productParameters.text = "材质：硅胶；加州65号提案合规，不含致癌物。";
+  raw.fields.coreFunctions.text = "防漏收纳。";
+  const verified = analyzer.validateCatalogResult(raw, {pid:fixturePid,text:"seller specifications",images:[],warnings:[]}, "fixture");
+  assert.match(verified.fields.productParameters.text, /^卖家宣称：/);
+  assert.match(verified.fields.coreFunctions.text, /^卖家宣称：/);
+});
+
+test("unsafe inferred care does not erase an independent ordinary use sentence", async t => {
+  const { analyzer } = await modules(t);
+  const raw = result(fixturePid);
+  raw.fields.usageMethod = {text:"通过拉链开合主仓存取物品。冷水机洗。",basis:"inference",evidence:["product-text"]};
+  const input = {pid:fixturePid,text:"backpack",images:[],warnings:[]};
+  const verified = analyzer.validateCatalogResult(raw,input,"fixture");
+  assert.equal(verified.fields.usageMethod.text,"推断：通过拉链开合主仓存取物品");
+  assert.equal(verified.fields.usageMethod.basis,"inference");
+  assert.ok(verified.warnings.some(w=>w.includes("特殊操作步骤未采用")));
+  raw.fields.usageMethod = {text:"插头接入电源插座。",basis:"inference",evidence:["product-text"]};
+  assert.equal(analyzer.validateCatalogResult(raw,input,"fixture").fields.usageMethod.basis,"missing");
+  raw.fields.usageMethod = {text:"通过拉链开合主仓存取物品。冷水机洗。",basis:"inference",evidence:["image-9"]};
+  assert.equal(analyzer.validateCatalogResult(raw,input,"fixture").fields.usageMethod.basis,"missing");
 });
 
 test("Qwen product request uses selected endpoint/model, exact schema enum and all actual images", async t => {
@@ -481,6 +609,38 @@ test("twenty simultaneous clicks plus restart organize exactly once and reuse gl
   assert.equal(out.length, 20);
   await (await f.restart()).getProductCatalog(fixturePid);
   assert.deepEqual(f.counts(), { paid: 1, ai: 1 });
+});
+
+test("corrupt completed-cache JSON and a serialized null cannot escape as success or trigger paid work", async t => {
+  for (const result_json of ["not JSON", "null"]) {
+    const f = await service(t,{pid:fixturePid,fetch_state:"ready",analysis_state:"ready",result_json});
+    await assert.rejects(f.api.getProductCatalog(fixturePid), /缓存.*(?:无效|为空)/);
+    await assert.rejects((await f.restart()).getProductCatalog(fixturePid), /缓存.*(?:无效|为空)/);
+    assert.deepEqual(f.counts(),{paid:0,ai:0});
+  }
+});
+
+test("legacy main/SKU references cannot fill new blanks; text facts survive without mutating the cached row or paid calls", async t => {
+  const cached=result(fixturePid);
+  cached.fields.productParameters.evidence=["product-text","image-1"];
+  cached.fields.scenes.evidence=["image-9"];
+  const original=structuredClone(cached);
+  const f=await service(t,{pid:fixturePid,fetch_state:"ready",analysis_state:"ready",result_json:cached});
+  f.disk.set("raw",{product_id:fixturePid});
+  let checks=0;
+  f.hooks.prepareCatalogEvidence=async(_pid,_item,options)=>{
+    assert.equal(options.cacheOnly,true);checks++;
+    return {pid:fixturePid,images:[]};
+  };
+  const out=await f.api.getProductCatalog(fixturePid);
+  assert.equal(out.fields.productParameters.basis,"missing");
+  assert.equal(out.fields.scenes.basis,"missing");
+  assert.deepEqual(out.fields.sku,original.fields.sku);
+  assert.deepEqual(f.row().result_json,original);
+  assert.deepEqual(f.counts(),{paid:0,ai:0});
+  assert.equal(checks,1);
+  assert.equal(types.restrictCachedCatalogEvidence(cached,[{id:"image-1",label:"详情图1"}]).fields.productParameters.basis,"direct");
+  assert.equal(types.restrictCachedCatalogEvidence(cached,[{id:"image-1",label:"商品图1"}]).fields.productParameters.basis,"missing");
 });
 
 test("PID-only name retrieval charges once, skips AI, and shares the source with later catalog analysis", async t => {

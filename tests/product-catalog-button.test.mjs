@@ -15,12 +15,19 @@ async function fixture(t) {
   const events = [];
   const catalog = { pid, fields: Object.fromEntries(Object.keys(types.catalogFields).map(key => [key, { text: key, basis: "direct", evidence: ["product-text"] }])), warnings: [] };
   const currentValues = { 商品名称: "旧名称", 产品链接: "", 商品ID: pid, ...Object.fromEntries(Object.values(types.catalogFields).map(label => [label, ""])) };
+  const initialValues = structuredClone(currentValues);
   const hooks = {
     getFeishuFieldMapping: async () => null,
     ensureProductCardByPid: async (_client, input) => { events.push(["shell", input]); return { documentId: "card", documentUrl: "https://feishu.cn/docx/card", reused: true }; },
     syncProductCardManagedFields: async (_client, input) => {
       events.push(["sync", input]);
-      return { currentValues, duplicateLabels: [], missingLabels: [], skippedLabels: [] };
+      if (!input.preflightOnly && input.mode === "verified-basic") {
+        for (const [key,label] of Object.entries(types.catalogFields)) {
+          const value = Array.isArray(input[key]) ? input[key].join("；") : input[key];
+          if (value !== undefined && !(input.fillEmptyOnly && !types.isMissingCatalogText(currentValues[label]))) currentValues[label] = value;
+        }
+      }
+      return { currentValues: structuredClone(currentValues), duplicateLabels: [], missingLabels: [], skippedLabels: [] };
     },
     getProductCatalog: async value => { events.push(["catalog", value]); return catalog; },
     getProductMetadataByPid: async value => { events.push(["metadata", value]); return {
@@ -49,7 +56,7 @@ async function fixture(t) {
     events.push(["write", request.data.fields]); return { code: 0 };
   } };
   const input = { client, appToken: "app", tableId: "table", recordId: "row", fields: { 产品名称: "分装瓶", PID: pid }, writeBack: true };
-  return { hooks, events, catalog, currentValues, input, automation, run: () => automation.handleFeishuAutomation(input) };
+  return { hooks, events, catalog, currentValues, initialValues, input, automation, run: () => automation.handleFeishuAutomation(input) };
 }
 
 test("PID and name alone deliver a reused card link before catalog processing and fill six fields", async t => {
@@ -65,7 +72,7 @@ test("PID and name alone deliver a reused card link before catalog processing an
   assert.equal(derived.preserveExistingOnMissing, true);
   assert.equal(derived.protectRevision, true);
   assert.equal(derived.fillEmptyOnly, true);
-  assert.deepEqual(derived.expectedValues, f.currentValues);
+  assert.deepEqual(derived.expectedValues, f.initialValues);
   assert.equal(derived.shopName, "Fixture Shop");
   assert.match(derived.mainImageUrl, /main\.webp$/);
   const productUpdate = f.events.find(([kind]) => kind === "update-product")[1];
@@ -90,10 +97,12 @@ test("provider failure leaves the delivered card available and publishes a safe 
   f.hooks.getProductCatalog = async () => { throw Error("private-token https://signed.invalid"); };
   const out = await f.run();
   assert.equal(out.documentReady, true);
-  assert.match(out.productCardStatus, /未完成/);
+  assert.match(out.productCardStatus, /待补齐/);
   assert.doesNotMatch(out.productCardStatus, /private-token|signed.invalid/);
   assert.ok(f.events.some(([kind, input]) => kind === "write" && input.产品手卡));
-  assert.equal(f.events.filter(([kind, input]) => kind === "sync" && input.derivedOnly).length, 0);
+  const pending = f.events.find(([kind, input]) => kind === "sync" && input.derivedOnly)[1];
+  assert.equal(pending.fillEmptyOnly, true);
+  for (const label of Object.values(types.catalogFields)) assert.equal(f.currentValues[label], "待补齐");
 });
 
 test("template identity mismatch prevents paid calls but not the card link", async t => {
@@ -104,15 +113,53 @@ test("template identity mismatch prevents paid calls but not the card link", asy
   assert.equal(f.events.filter(([kind]) => kind === "catalog").length, 0);
 });
 
-test("one unavailable field is written as missing with preservation enabled; other fields still succeed", async t => {
+test("an unavailable field displays pending, stays partial and does not prevent other facts", async t => {
   const f = await fixture(t);
   f.catalog.fields.usageMethod = { text: "未找到", basis: "missing", evidence: [] };
   const out = await f.run();
   const input = f.events.find(([kind, input]) => kind === "sync" && input.derivedOnly)[1];
-  assert.equal(input.usageMethod, "未找到");
+  assert.equal(input.usageMethod, "待补齐");
   assert.equal(input.preserveExistingOnMissing, true);
   assert.equal(input.audience, "audience");
   assert.match(out.productCardWarning, /使用方法/);
+  assert.match(out.productRefreshError, /待补齐.*使用方法/);
+  assert.match(out.productCardStatus, /待补齐/);
+  assert.doesNotMatch(out.productCardStatus, /资料已补录/);
+});
+
+test("write acknowledgement alone cannot complete a handcard with empty actual fields", async t => {
+  const f = await fixture(t);
+  const sync = f.hooks.syncProductCardManagedFields;
+  f.hooks.syncProductCardManagedFields = async (client,input) => input.derivedOnly
+    ? {currentValues:structuredClone(f.currentValues),duplicateLabels:[],missingLabels:[],skippedLabels:[]}
+    : sync(client,input);
+  const out = await f.run();
+  assert.match(out.productRefreshError,/待补齐/);
+  assert.match(out.productCardStatus,/待补齐/);
+  assert.ok(f.events.some(([kind,input])=>kind==='write'&&input.产品手卡));
+});
+
+test("old missing-value markers are replaceable, outages mark pending and never label them complete", async t => {
+  const f = await fixture(t);
+  for(const label of Object.values(types.catalogFields)) f.currentValues[label]="人工资料";
+  f.currentValues.使用方法="未找到";
+  f.hooks.getProductCatalog=async()=>{throw Error('no additional billable request');};
+  const out=await f.run();
+  assert.match(out.productCardStatus,/待补齐/);
+  assert.equal(f.currentValues.使用方法,"待补齐");
+  assert.equal(f.events.some(([kind])=>kind==='catalog'),false); // This throwing hook does not add an event.
+  for (const label of Object.values(types.catalogFields).filter(l=>l!=="使用方法")) assert.equal(f.currentValues[label],"人工资料");
+});
+
+test("a later button click replaces pending with a real fact but keeps manual facts", async t => {
+  const f = await fixture(t);
+  for(const label of Object.values(types.catalogFields)) f.currentValues[label]="人工资料";
+  f.currentValues.使用方法="待补齐";
+  const out=await f.run();
+  assert.equal(f.currentValues.使用方法,"usageMethod");
+  assert.equal(out.productRefreshError,"");
+  assert.equal(f.events.filter(([kind])=>kind==='catalog').length,1);
+  assert.equal(f.currentValues.产品主要功能,"人工资料");
 });
 
 test("manual test-device names cannot bypass PID document reuse", async t => {

@@ -313,15 +313,19 @@ export async function recoverPublicProductFromSavedPage(pid: string, apply = fal
   return product;
 }
 
-/** One public-page capture per PID. A verified failure is reused by fallback logic. */
-export async function fetchPublicProductOnce(pid: string) {
+/** Success is cached once. An explicit catalog request may retry a verified free-source failure. */
+export async function fetchPublicProductOnce(pid: string, options: { retryFailed?: boolean } = {}) {
   const normalized = validatePid(pid);
   let existing;
   try { existing = await cachedPublicProduct(normalized); }
   catch {
-    // Even failed snapshots can become readable after a parser update. Never
-    // clear the request marker or fall through to another network capture.
-    return recoverPublicProductFromSavedPage(normalized, true);
+    // Parser repairs always precede another capture. Corruption and wrong-PID
+    // evidence are not retryable, and a successful snapshot is never replaced.
+    try { return await recoverPublicProductFromSavedPage(normalized, true); }
+    catch (error) {
+      if (!options.retryFailed) throw error;
+      return retryFailedPublicProduct(normalized, error);
+    }
   }
   if (existing) return existing;
   const directory = publicCatalogDirectory(normalized);
@@ -337,7 +341,62 @@ export async function fetchPublicProductOnce(pid: string) {
     await marker.sync();
   } finally { await marker.close(); }
 
-  const requestedUrl = tiktokProductUrlFromPid(normalized);
+  try { return await capturePublicProduct(normalized, tiktokProductUrlFromPid(normalized)); }
+  catch (error) {
+    if (!options.retryFailed) throw error;
+    // Only the owner of this first capture bypasses the click cooldown. At
+    // most one alternate free request follows; paid-provider markers are untouched.
+    return retryFailedPublicProduct(normalized, error, true);
+  }
+}
+
+async function retryFailedPublicProduct(pid: string, failure: unknown, immediate = false) {
+  const directory = publicCatalogDirectory(pid);
+  const receiptFile = path.join(directory, "receipt.json");
+  const receiptBody = await readFile(receiptFile);
+  const receipt = object(JSON.parse(receiptBody.toString("utf8")));
+  const message = failure instanceof Error ? failure.message : "";
+  if (receipt.pid !== pid || receipt.source !== "tiktok-public" || receipt.state !== "failed"
+    || /校验|PID.*匹配|PID.*一致/.test(message)) throw failure;
+  const status = Number(receipt.httpStatus || 0);
+  const retryable = status && status !== 200
+    ? status === 408 || status === 429 || status >= 500
+    : /安全验证页|没有返回可解析的详情数据|读取失败/.test(String(receipt.errorMessage || message));
+  if (!retryable) throw failure;
+  if (receipt.responseSha256) {
+    const file = path.join(directory, "response.html");
+    if ((await stat(file)).size > MAX_PUBLIC_RESPONSE_BYTES || hash(await readFile(file)) !== receipt.responseSha256) {
+      throw new CatalogError("TikTok 原始商品页面校验失败，已停止恢复");
+    }
+  }
+  const fetchedAt = Date.parse(String(receipt.fetchedAt));
+  if (!immediate && (!Number.isFinite(fetchedAt) || Date.now() - fetchedAt < 60_000)) {
+    throw new CatalogError("商品公开页刚刚读取失败，请一分钟后再次点击；公开页重试本身不收费");
+  }
+  // One durable retry per failed generation, even across processes/restarts.
+  // Keep every old response and never delete a supplier or model charge marker.
+  const generation = hash(receiptBody);
+  const archive = path.join(directory, "retries", generation);
+  await mkdir(archive, { recursive: true, mode: 0o700 });
+  let marker;
+  try { marker = await open(path.join(archive, "request-started.json"), "wx", 0o600); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new CatalogError("该次公开页恢复已开始或结果待核查，请稍后查看；不会重复取数");
+    throw error;
+  }
+  try { await marker.writeFile(JSON.stringify({ pid, source: "tiktok-public", startedAt: new Date().toISOString(), previousReceiptSha256: generation })); await marker.sync(); }
+  finally { await marker.close(); }
+  if (hash(await readFile(receiptFile)) !== generation) throw new CatalogError("商品公开页记录已变化，已停止重复恢复");
+  await savePrivate(path.join(archive, "previous-receipt.json"), receiptBody);
+  if (receipt.responseSha256) await copyFile(path.join(directory, "response.html"), path.join(archive, "previous-response.html"), constants.COPYFILE_EXCL);
+  const primary = tiktokProductUrlFromPid(pid);
+  const alternate = `https://shop.tiktok.com/us/pdp/${pid}?source=anchor`;
+  const requestedUrl = receipt.requestedUrl === primary ? alternate : primary;
+  return capturePublicProduct(pid, requestedUrl, generation);
+}
+
+async function capturePublicProduct(normalized: string, requestedUrl: string, retryFrom = "") {
+  const directory = publicCatalogDirectory(normalized);
   let response: Response | undefined;
   let body = Buffer.alloc(0);
   try {
@@ -366,7 +425,8 @@ export async function fetchPublicProductOnce(pid: string) {
       responseBytes: body.length,
       responseSha256: hash(body),
       productSha256: hash(productBody),
-      automaticRetries: 0,
+      automaticRetries: retryFrom ? 1 : 0,
+      ...(retryFrom ? { retryFrom } : {}),
     }));
     return product;
   } catch (error) {
@@ -380,7 +440,8 @@ export async function fetchPublicProductOnce(pid: string) {
       fetchedAt: new Date().toISOString(),
       responseBytes: body.length,
       responseSha256: body.length ? hash(body) : "",
-      automaticRetries: 0,
+      automaticRetries: retryFrom ? 1 : 0,
+      ...(retryFrom ? { retryFrom } : {}),
     })).catch(() => undefined);
     if (error instanceof CatalogError) throw error;
     throw new CatalogError("TikTok 公开商品页读取失败");

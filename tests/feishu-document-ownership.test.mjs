@@ -33,7 +33,10 @@ async function loadDocumentModule() {
     .replaceAll('"@/lib/database"', JSON.stringify(stubUrl))
     .replaceAll('"@/lib/json-utils"', JSON.stringify(stubUrl))
     .replaceAll('"@/lib/video-processing"', JSON.stringify(stubUrl))
-    .replaceAll('"@/lib/feishu/store"', JSON.stringify(stubUrl));
+    .replaceAll('"@/lib/feishu/store"', JSON.stringify(stubUrl))
+    .replaceAll('"@/lib/products/catalog-types"', JSON.stringify(`data:text/javascript;base64,${Buffer.from(ts.transpileModule(
+      await readFile(new URL("../lib/products/catalog-types.ts", import.meta.url), "utf8"),
+      {compilerOptions:{module:ts.ModuleKind.ESNext,target:ts.ScriptTarget.ES2022}}).outputText).toString("base64")}`));
   const moduleUrl = `data:text/javascript;base64,${Buffer.from(compiled).toString("base64")}`;
   return import(moduleUrl);
 }

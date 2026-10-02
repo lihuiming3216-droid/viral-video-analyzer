@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { loadAutomationFixture } from "./helpers/automation-fixture.mjs";
-const catalogFields = { sku: "SKU", coreFunctions: "产品主要功能", productParameters: "产品参数", usageMethod: "使用方法", audience: "适用人群", scenes: "使用场景" };
+const catalogFields = { sku: "产品SKU", coreFunctions: "产品主要功能", productParameters: "产品参数", usageMethod: "使用方法", audience: "适用人群", scenes: "使用场景" };
 const hooks = new Proxy({}, { get: (_target, name) => {
     const h = globalThis.__manualCardTestHooks || {};
     if (name === "getFeishuFieldMapping")
@@ -13,7 +13,7 @@ const hooks = new Proxy({}, { get: (_target, name) => {
     if (name === "ensureProductCardByPid")
       return h.ensureByPid;
     if (name === "syncProductCardManagedFields")
-      return () => ({ currentValues: { 商品ID: "1732364299482009895" }, duplicateLabels: [], missingLabels: [], skippedLabels: [] });
+      return h.sync || (() => ({ currentValues: { 商品ID: "1732364299482009895" }, duplicateLabels: [], missingLabels: [], skippedLabels: [] }));
     if (name === "getProductCatalog")
       return () => ({ fields: Object.fromEntries(Object.keys(catalogFields).map(k => [k, { text: k, basis: "direct" }])), warnings: [] });
     if (name === "getProductMetadataByPid")
@@ -39,6 +39,7 @@ test("legacy button payload hydrates only current-row product-card fields", () =
 });
 test("PID click copies the template and fills empty basic facts without requiring a product link", async () => {
   const ensureCalls = [];
+  const currentValues = {商品ID:pid};
   const created = {
     id: "product-1", name: "血压仪大号", pid, productUrl: "",
     documentId: "manual-doc", documentUrl: "https://feishu.cn/docx/manual-doc",
@@ -46,6 +47,13 @@ test("PID click copies the template and fills empty basic facts without requirin
   globalThis.__manualCardTestHooks = {
     getProductByPid: () => null,
     createProduct: () => created,
+    sync: (_client,input) => {
+      if (!input.preflightOnly && input.mode === "verified-basic") {
+        Object.assign(currentValues,{产品SKU:input.sku,产品主要功能:input.coreFunctions?.join("；"),产品参数:input.productParameters,
+          使用方法:input.usageMethod,适用人群:input.audience,使用场景:input.scenes});
+      }
+      return {currentValues:{...currentValues},duplicateLabels:[],missingLabels:[],skippedLabels:[]};
+    },
     ensureByPid: async (_client, input) => {
       ensureCalls.push(input);
       return {

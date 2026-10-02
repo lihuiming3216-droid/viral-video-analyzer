@@ -6,17 +6,17 @@ import { requireAiRuntime } from "@/lib/ai/settings";
 import { analyzeCatalog } from "@/lib/products/catalog-analyzer";
 import { cachedProduct, prepareCatalogEvidence, catalogDirectory, readPrivateJson, savePrivate } from "@/lib/products/catalog-source";
 import { cachedPublicProduct } from "@/lib/products/tiktok-public-source";
-import { CatalogError, catalogError, validatePid, cachedCatalogResult } from "@/lib/products/catalog-types";
+import { CatalogError, catalogError, validatePid, cachedCatalogResult, restrictCachedCatalogEvidence } from "@/lib/products/catalog-types";
 
 let queue: Promise<unknown> = Promise.resolve();
 /** Explicit admin action only. Bound image memory; no supplier calls or recycled charge markers. */
-export function reorganizeCatalogFromCache(pid: string, id: string) {
-  const task = queue.then(() => runReorganization(pid, id));
+export function reorganizeCatalogFromCache(pid: string, id: string, options: { fillMissingOnly?: boolean } = {}) {
+  const task = queue.then(() => runReorganization(pid, id, options));
   queue = task.catch(() => undefined);
   return task;
 }
 
-async function runReorganization(pid: string, id: string) {
+async function runReorganization(pid: string, id: string, options: { fillMissingOnly?: boolean }) {
   validatePid(pid);
   if (!/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(id)) throw new CatalogError("重新整理任务标识无效");
   const pool = await getPool();
@@ -41,16 +41,32 @@ async function runReorganization(pid: string, id: string) {
     if (!result) {
       const [active] = await connection.execute<RowDataPacket[]>("SELECT id FROM product_catalog_reorganizations WHERE pid=? AND state='requested' LIMIT 1", [pid]);
       if (active.length) throw new CatalogError("该PID有未确认完成的重新整理任务，请管理员先核查，不重复收费");
-      const [rows] = await connection.execute<RowDataPacket[]>("SELECT fetch_state,analysis_state FROM product_catalog_cache WHERE pid=?", [pid]);
+      const [rows] = await connection.execute<RowDataPacket[]>("SELECT fetch_state,analysis_state,result_json FROM product_catalog_cache WHERE pid=?", [pid]);
       if (!rows[0] || rows[0].fetch_state !== "ready" || rows[0].analysis_state === "requested") throw new CatalogError("该PID尚无完整缓存或原整理仍在进行，不能重新整理");
+      let previous = null;
+      if (options.fillMissingOnly && rows[0].analysis_state === "ready") {
+        try {
+          const stored = rows[0].result_json;
+          previous = cachedCatalogResult(typeof stored === "string" ? JSON.parse(stored) : stored, pid);
+        } catch { /* Reject malformed previous results before any paid request. */ }
+        if (!previous) throw new CatalogError("旧整理缓存结构无效，未请求模型、未覆盖旧资料");
+      }
       const item = await cachedPublicProduct(pid) || await cachedProduct(pid);
       if (!item) throw new CatalogError("没有完整商品缓存，不会调用出海匠补取");
       const runtime = await requireAiRuntime("product");
       const evidence = await prepareCatalogEvidence(pid, item, { cacheOnly: true });
+      if (previous) previous = restrictCachedCatalogEvidence(previous, evidence.images);
       const time = new Date().toISOString();
       await connection.execute("INSERT INTO product_catalog_reorganizations(id,pid,state,created_at,updated_at) VALUES (?,?,'requested',?,?)", [id, pid, time, time]);
       claimed = true;
       result = await analyzeCatalog(evidence, runtime, id);
+      if (previous) {
+        result = { ...result, fields: { ...result.fields }, warnings: [...new Set([...previous.warnings, ...result.warnings,
+          "本次仅补旧缓存缺项及不符合当前来源规则的旧图引用；其他事实保持不变，已有手卡文字不改动"])] };
+        for (const key of Object.keys(previous.fields) as (keyof typeof previous.fields)[]) {
+          if (previous.fields[key].basis !== "missing") result.fields[key] = previous.fields[key];
+        }
+      }
       await savePrivate(resultFile, JSON.stringify(result));
       saved = true;
     }

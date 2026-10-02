@@ -21,7 +21,7 @@ async function load(t) {
       if (sql.includes("RELEASE_LOCK")) return [[{ released: 1 }]];
       if (sql.startsWith("SELECT * FROM product_catalog_reorganizations")) return [[state.ledger.get(args[0])].filter(Boolean)];
       if (sql.startsWith("SELECT id FROM product_catalog_reorganizations")) return [[...state.ledger.values()].filter(r => r.pid === args[0] && r.state === "requested")];
-      if (sql.startsWith("SELECT fetch_state")) return [[state.catalog]];
+      if (sql.startsWith("SELECT fetch_state")) return [[structuredClone(state.catalog)]];
       if (sql.startsWith("INSERT INTO product_catalog_reorganizations")) { state.ledger.set(args[0], { id: args[0], pid: args[1], state: "requested" }); return [{ affectedRows: 1 }]; }
       if (sql.startsWith("UPDATE product_catalog_cache")) {
         if (state.failPublish) throw Error("database disconnected");
@@ -38,8 +38,8 @@ async function load(t) {
     requireAiRuntime: async () => ({ model: "new", provider: "qwen", retries: 0 }),
     cachedProduct: async () => state.rawPresent ? { product_id: pid } : null,
     cachedPublicProduct: async () => null,
-    prepareCatalogEvidence: async (_pid, _item, options) => { assert.equal(options.cacheOnly, true); return { pid }; },
-    analyzeCatalog: async (_input, _runtime, runId) => { state.modelCalls++; assert.ok(runId); if (state.failModel) throw Error("untrusted provider secret"); return result("new"); },
+    prepareCatalogEvidence: async (_pid, _item, options) => { assert.equal(options.cacheOnly, true); return { pid,images:[] }; },
+    analyzeCatalog: async (_input, _runtime, runId) => { state.modelCalls++; assert.ok(runId); if (state.failModel) throw Error("untrusted provider secret"); return state.newResult || result("new"); },
     catalogDirectory: () => "/private-fixture/" + pid,
     readPrivateJson: async file => state.files.get(file) || null,
     savePrivate: async (file, body) => state.files.set(file, JSON.parse(body)),
@@ -67,6 +67,40 @@ test("a failed manual model call preserves the old catalog and its id cannot be 
   assert.equal(f.state.ledger.get(id).state, "failed");
   await assert.rejects(f.api.reorganizeCatalogFromCache(pid, id), /不会重复请求/);
   assert.equal(f.state.modelCalls, 1);
+});
+
+test("explicit missing-only recovery preserves every old fact and reuses its durable merged result", async t => {
+  const f = await load(t); const id = randomUUID();
+  const previous = result("old");
+  previous.fields.usageMethod = { text:"未找到", basis:"missing", evidence:[] };
+  f.state.catalog.result_json = JSON.stringify(previous);
+  f.state.newResult = result("new");
+  f.state.newResult.fields.usageMethod = {text:"推断：套在对应手机上。",basis:"inference",evidence:["product-text"]};
+  f.state.newResult.fields.coreFunctions = {text:"changed fact must not replace old",basis:"direct",evidence:["product-text"]};
+  const repaired = await f.api.reorganizeCatalogFromCache(pid,id,{fillMissingOnly:true});
+  assert.equal(repaired.fields.usageMethod.basis,"inference");
+  assert.deepEqual(repaired.fields.coreFunctions,previous.fields.coreFunctions);
+  assert.deepEqual((await f.api.reorganizeCatalogFromCache(pid,id,{fillMissingOnly:true})).fields,repaired.fields);
+  assert.equal(f.state.modelCalls,1);
+});
+
+test("missing-only recovery rejects corrupt previous facts before paid model work", async t => {
+  const f = await load(t);
+  f.state.catalog.result_json = "not JSON";
+  await assert.rejects(f.api.reorganizeCatalogFromCache(pid,randomUUID(),{fillMissingOnly:true}), /未请求模型/);
+  assert.equal(f.state.modelCalls,0);
+});
+
+test("missing-only reorganization replaces unsupported legacy image facts but preserves eligible old facts", async t => {
+  const f=await load(t);const previous=result("old");
+  previous.fields.productParameters.evidence=["product-text","image-1"];
+  f.state.catalog.result_json=previous;
+  f.state.newResult=result("new");
+  f.state.newResult.fields.productParameters.text="cached-text parameters";
+  const repaired=await f.api.reorganizeCatalogFromCache(pid,randomUUID(),{fillMissingOnly:true});
+  assert.equal(repaired.fields.productParameters.text,"cached-text parameters");
+  assert.deepEqual(repaired.fields.sku,previous.fields.sku);
+  assert.equal(f.state.modelCalls,1);
 });
 
 test("a durable result survives DB publication failure and replay publishes without another model request", async t => {

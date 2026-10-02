@@ -3,6 +3,21 @@ export const catalogFields = {
   usageMethod: "使用方法", audience: "适用人群", scenes: "使用场景",
 } as const;
 export type CatalogField = keyof typeof catalogFields;
+export const CATALOG_PENDING_TEXT = "待补齐";
+export function isMissingCatalogText(value: string | undefined) {
+  return /^(待补齐|未找到|无法获取|无法分析|暂无|无)?$/.test((value || "").replace(/\s+/g, ""));
+}
+
+/** A placeholder is not a product fact and may only occupy a missing field. */
+export function pendingCatalogCardInput(currentValues: Partial<Record<string, string>>, missingLabels: readonly string[] = []) {
+  const input: Partial<Record<Exclude<CatalogField, "coreFunctions">, string> & { coreFunctions: string[] }> = {};
+  for (const [key, label] of Object.entries(catalogFields)) {
+    if (missingLabels.includes(label) || !isMissingCatalogText(currentValues[label])) continue;
+    if (key === "coreFunctions") input.coreFunctions = [CATALOG_PENDING_TEXT];
+    else input[key as Exclude<CatalogField, "coreFunctions">] = CATALOG_PENDING_TEXT;
+  }
+  return input;
+}
 export type CatalogFact = { text: string; basis: "direct" | "inference" | "missing"; evidence: string[] };
 export type CatalogResult = {
   pid: string; fields: Record<CatalogField, CatalogFact>; warnings: string[];
@@ -52,4 +67,20 @@ export function cachedCatalogResult(value: unknown, pid: string): CatalogResult 
         && Array.isArray(fact.evidence) && fact.evidence.every(id => typeof id === "string");
     })) throw new CatalogError("商品整理缓存不完整或 PID 不匹配，已停止写入");
   return value as CatalogResult;
+}
+
+/** Old main/SKU image numbers must not become current detail-image evidence. */
+export function restrictCachedCatalogEvidence(result: CatalogResult, images: CatalogImage[]): CatalogResult {
+  const allowed = new Set(["product-text", ...images.filter(image =>
+    /^image-[1-8]$/.test(image.id) && image.label === `详情图${image.id.slice(6)}`).map(image => image.id)]);
+  const fields = { ...result.fields };
+  const warnings = [...result.warnings];
+  for (const key of Object.keys(catalogFields) as CatalogField[]) {
+    const fact = fields[key];
+    if (fact.basis !== "missing" && (!fact.evidence.length || !fact.evidence.every(id => allowed.has(id)))) {
+      fields[key] = { text: "未找到", basis: "missing", evidence: [] };
+      warnings.push(`${catalogFields[key]}的旧缓存来源不符合当前文字/详情图规则，未复用；已有手卡内容不改动`);
+    }
+  }
+  return { ...result, fields, warnings: [...new Set(warnings)] };
 }

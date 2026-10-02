@@ -40,6 +40,15 @@ test("verification reuses the image and smoke test while running regression cont
   assert.match(workflow, /bash deploy\/smoke-test.sh "viral-video-analyzer:\$GITHUB_SHA"/);
 });
 
+test("both PID regression containers include the reviewed maintenance helpers read-only", () => {
+  for (const source of [workflow, read(".github/workflows/deploy.yml")]) {
+    const step=source.split("\n").find(line=>line.includes("docker run") && line.includes("tests/product-backfill.test.mjs"));
+    assert.ok(step);
+    assert.ok(step.includes('-v "$PWD/deploy:/app/deploy:ro"'));
+    assert.ok(step.includes("--network none"));
+  }
+});
+
 test("smoke containers use an internal temporary network and no production volumes", () => {
   const smoke = read("deploy/smoke-test.sh");
   assert.match(smoke, /docker network create --internal "\$network"/);

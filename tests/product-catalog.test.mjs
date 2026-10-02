@@ -882,6 +882,27 @@ test("a previously paid trial imports raw data and an organized result without e
   assert.deepEqual(f.counts(), { paid: 0, ai: 0 });
 });
 
+test("both disk-import and interrupted-DB recovery reject old main/SKU image facts without new calls", async t => {
+  for (const state of [null, "requested"]) {
+    const f=await service(t,state ? {pid:fixturePid,fetch_state:"ready",analysis_state:state} : null);
+    f.disk.set("raw",{product_id:fixturePid});
+    const saved=result(fixturePid);
+    saved.fields.productParameters.evidence=["image-1"];
+    f.disk.set(`/isolated/${fixturePid}/organized.json`,saved);
+    f.hooks.prepareCatalogEvidence=async(_pid,_item,options)=>{
+      assert.equal(options.cacheOnly,true);
+      return {pid:fixturePid,images:[{id:"image-1",label:"商品图1"}]};
+    };
+    const out=await f.api.getProductCatalog(fixturePid);
+    assert.equal(out.fields.productParameters.basis,"missing");
+    assert.equal(out.fields.sku.basis,"direct");
+    assert.equal(f.disk.get(`/isolated/${fixturePid}/organized.json`).fields.productParameters.basis,"direct");
+    assert.deepEqual(f.counts(),{paid:0,ai:0});
+    const restarted=await f.restart();
+    assert.equal((await restarted.getProductCatalog(fixturePid)).fields.productParameters.basis,"missing");
+  }
+});
+
 test("a DB failure after durable organization recovers without analyzing again", async t => {
   env(t, "OPENAI_API_KEY", "test"); env(t, "CHUHAIJIANG_API_KEY", "test");
   const f = await service(t);

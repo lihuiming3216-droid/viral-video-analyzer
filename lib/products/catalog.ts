@@ -188,7 +188,7 @@ async function runCatalog(pid: string): Promise<CatalogResult> {
     const recovered = cachedCatalogResult(await readPrivateJson(resultFile), pid);
     if (recovered) {
       await finishCatalogAnalysis(pid, recovered);
-      return recovered;
+      return catalogForWrite(recovered);
     }
   }
   const config = durable ? undefined : await requireAiRuntime("product");
@@ -201,7 +201,7 @@ async function runCatalog(pid: string): Promise<CatalogResult> {
     if (recovered) {
       organizedSaved = true;
       await finishCatalogAnalysis(pid, recovered);
-      return recovered;
+      return catalogForWrite(recovered);
     }
     const evidence = await prepareCatalogEvidence(pid, item);
     const result = await analyzeCatalog(evidence, config);

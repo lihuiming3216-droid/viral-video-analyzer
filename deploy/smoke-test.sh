@@ -33,7 +33,7 @@ docker run --rm --network "$network" --entrypoint node \
   -e FEISHU_DELIVERY_MYSQL_TEST=isolated-test-only -v "$PWD/tests:/app/tests:ro" \
   -v "$PWD/README.md:/app/README.md:ro" -v "$PWD/docker-compose.yml:/app/docker-compose.yml:ro" \
   "$image" --test --test-concurrency=2 \
-    tests/feishu-delivery-mysql.test.mjs tests/product-catalog-mysql.test.mjs \
+    tests/feishu-delivery-mysql.test.mjs tests/product-catalog-mysql.test.mjs tests/feishu-video-library-mysql.test.mjs \
     tests/product-verified-facts.test.mjs tests/video-attempt-integrity.test.mjs \
     tests/video-attempt-diagnostics.test.mjs tests/product-doc-failure-delivery-state.test.mjs \
     tests/feishu-product-card-mapping.test.mjs tests/feishu-video-delivery-reliability.test.mjs \

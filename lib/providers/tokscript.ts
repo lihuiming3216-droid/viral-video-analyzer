@@ -52,7 +52,7 @@ export interface TokScriptResult {
   raw: unknown;
 }
 
-class TokScriptClient {
+export class TokScriptClient {
   private sessionId = "";
   private requestId = 1;
 
@@ -132,6 +132,11 @@ class TokScriptClient {
     const args: Record<string, unknown> = { [urlKey]: url };
     if (keys.includes("platform")) args.platform = "tiktok";
     return this.post("tools/call", { name: tool.name, arguments: args });
+  }
+
+  /** Explicit schema-backed arguments for the library's async translation API. */
+  async callToolArguments(name: string, args: Record<string, unknown>) {
+    return this.post("tools/call", { name, arguments: args });
   }
 }
 

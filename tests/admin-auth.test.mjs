@@ -11,7 +11,7 @@ const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.Modu
 const auth = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString("base64")}`);
 
 test("Feishu machine routes keep their existing authentication; admin and server actions never bypass login", () => {
-  for (const route of ["/api/feishu/automation", "/api/feishu/product-doc-sync", "/api/feishu/task-table", "/feishu/subtitle", "/feishu/tokscript-subtitle", "/feishu/link-subtitle"]) {
+  for (const route of ["/api/feishu/automation", "/api/feishu/product-doc-sync", "/api/feishu/task-table", "/api/feishu/video-library", "/feishu/subtitle", "/feishu/tokscript-subtitle", "/feishu/link-subtitle"]) {
     assert.equal(auth.publicMachineRoute(route, "POST"), true);
     assert.equal(auth.publicMachineRoute(route, "POST", true), false);
     assert.equal(auth.publicMachineRoute(route, "GET"), false);

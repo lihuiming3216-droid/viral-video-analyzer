@@ -86,7 +86,7 @@ function withProductIdentityLock<T>(pid: string, operation: () => Promise<T> | T
   return withAutomationLock(`product:${pid}`, operation);
 }
 
-function withProductCardRecordLock<T>(
+export function withProductCardRecordLock<T>(
   input: { appToken: string; tableId: string; recordId: string },
   operation: () => Promise<T> | T,
 ) {

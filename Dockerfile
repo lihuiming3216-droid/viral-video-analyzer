@@ -40,6 +40,7 @@ COPY --from=build /app/instrumentation.ts ./instrumentation.ts
 COPY --from=build /app/proxy.ts ./proxy.ts
 COPY --from=build /app/scripts/configure-admin-auth.mjs ./scripts/configure-admin-auth.mjs
 COPY --from=build /app/deploy/check-runtime.cjs ./deploy/check-runtime.cjs
+COPY --from=build /app/deploy/configure-video-library.cjs ./deploy/configure-video-library.cjs
 
 RUN mkdir -p /app/.data
 EXPOSE 3000

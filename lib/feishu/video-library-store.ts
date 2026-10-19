@@ -62,7 +62,7 @@ export async function claimLibraryTask(input: LibraryEvent) {
 /** Event, row ownership and baseline commit atomically. No external requests. */
 async function claimLibraryTaskOnce(input: LibraryEvent) {
   const rowKey = libraryDigest([input.appToken, input.tableId, input.recordId]);
-  const id = libraryDigest([rowKey, input.eventMs, librarySourceKey(input.sourceUrl)]);
+  const sourceKey = librarySourceKey(input.sourceUrl);
   const db = await (await getPool()).getConnection();
   let reusable = true;
   try {
@@ -75,12 +75,19 @@ async function claimLibraryTaskOnce(input: LibraryEvent) {
       [rowKey, input.appToken, input.tableId, input.recordId, now]);
     const [rows] = await db.execute<RowDataPacket[]>("SELECT event_ms,latest_task_id FROM feishu_video_library_rows WHERE row_key=? FOR UPDATE", [rowKey]);
     const previousId = rows[0].latest_task_id ? String(rows[0].latest_task_id) : "";
-    if (Number(rows[0].event_ms) >= input.eventMs) {
-      await db.commit();
-      return { id, accepted: false, duplicate: previousId === id, previousId };
-    }
     const [previous] = previousId ? await db.execute<RowDataPacket[]>("SELECT source_url,owned_json FROM feishu_video_library_tasks WHERE id=?", [previousId]) : [[]];
-    const reset = !previous[0] || librarySourceKey(String(previous[0].source_url)) !== librarySourceKey(input.sourceUrl);
+    const previousSource = previous[0] ? librarySourceKey(String(previous[0].source_url)) : "";
+    const previousTime = Number(rows[0].event_ms);
+    const replay = previousTime === input.eventMs && previousSource === sourceKey;
+    if (previousTime > input.eventMs || replay) {
+      await db.commit();
+      return { id: previousId, accepted: false, duplicate: replay, previousId };
+    }
+    // Native ModifiedTime fields have millisecond units but may round to the
+    // second. Different links in the same bucket must still form new versions;
+    // the HTTP acceptor already verifies which link is live before this claim.
+    const id = libraryDigest([rowKey, input.eventMs, sourceKey, ...(previousTime === input.eventMs ? [previousId] : [])]);
+    const reset = !previous[0] || previousSource !== sourceKey;
     const baseline = libraryOutputSnapshot(input.fields);
     const owned = reset ? input.eventFields || baseline : object(previous[0].owned_json);
     if (previousId) await db.execute("UPDATE feishu_video_library_tasks SET state='superseded',finished_at=?,updated_at=? WHERE id=? AND state IN ('accepted','running')", [now, now, previousId]);

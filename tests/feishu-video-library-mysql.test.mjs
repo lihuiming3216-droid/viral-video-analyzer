@@ -62,6 +62,18 @@ test("completed originals and media remain in history when a row starts another 
   assert.equal(previous.state,"completed");assert.equal(previous.original,"complete original");assert.equal(previous.fileToken,"uploaded");
 });
 
+test("different links in one rounded native second still support A to B to A without dropping the last event",async t=>{
+  const f=await fixture(t),time=Date.UTC(2026,9,19,3,1);
+  const a=await f.claim(time),b=await f.claim(time,second),last=await f.claim(time);
+  assert.ok(a.accepted&&b.accepted&&last.accepted);
+  assert.equal(new Set([a.id,b.id,last.id]).size,3);
+  const replay=await f.claim(time);
+  assert.equal(replay.duplicate,true);assert.equal(replay.id,last.id);
+  assert.equal((await f.api.getLibraryTask(a.id)).state,"superseded");
+  assert.equal((await f.api.getLibraryTask(b.id)).state,"superseded");
+  assert.equal((await f.api.getLibraryTask(last.id)).current,true);
+});
+
 test("five lightweight jobs obtain their own slots, with no waiting queue and no duplicate execution",async t=>{
   const f=await fixture(t),time=Date.UTC(2026,9,19,4),leases=[];
   try {

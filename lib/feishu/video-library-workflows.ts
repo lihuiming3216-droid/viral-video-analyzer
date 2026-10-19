@@ -3,6 +3,7 @@ import { VIDEO_LIBRARY_FIELDS, VIDEO_LIBRARY_SCOPE } from "@/lib/feishu/video-li
 /** Native workflow definitions, not a polling schedule. Secret stays in headers. */
 export function videoLibraryWorkflow(input: {
   kind: "add" | "change"; tableName: string; sourceFieldId: string; endpoint: string; secret: string;
+  eventTimeFieldId: string;
   outputFieldIds: { transcript: string; translation: string; file: string };
 }) {
   const endpoint = new URL(input.endpoint);
@@ -10,7 +11,7 @@ export function videoLibraryWorkflow(input: {
     || endpoint.pathname !== "/api/feishu/video-library" || endpoint.port || endpoint.username || endpoint.password || endpoint.search || endpoint.hash) {
     throw new Error("视频库自动化只能请求已确认的 HTTPS 服务器入口");
   }
-  if ([input.sourceFieldId, ...Object.values(input.outputFieldIds)].some(id => !/^fld[A-Za-z0-9]+$/.test(id)) || !input.secret || !input.tableName) throw new Error("缺少真实字段或鉴权配置");
+  if ([input.sourceFieldId, input.eventTimeFieldId, ...Object.values(input.outputFieldIds)].some(id => !/^fld[A-Za-z0-9]+$/.test(id)) || !input.secret || !input.tableName) throw new Error("缺少真实字段或鉴权配置");
   const fieldCondition = { field_name: VIDEO_LIBRARY_FIELDS.source, operator: "isNotEmpty", value: [] };
   const trigger = {
     id: "step_trigger", type: input.kind === "add" ? "AddRecordTrigger" : "SetRecordTrigger",
@@ -38,7 +39,9 @@ export function videoLibraryWorkflow(input: {
         form_body: [literal("appToken", VIDEO_LIBRARY_SCOPE.appToken), literal("tableId", VIDEO_LIBRARY_SCOPE.tableId),
           reference("recordId", "$.step_trigger.recordId"),
           reference("sourceUrl", `$.step_trigger.${input.sourceFieldId}`),
-          reference("eventTime", "$.step_trigger.recordModifiedTime"),
+          // Built-in recordModifiedTime is rendered to minutes in native HTTP
+          // forms. A real ModifiedTime field's timestamp child preserves ms.
+          reference("eventTime", `$.step_trigger.${input.eventTimeFieldId}.timestamp`),
           reference("snapshotTranscript", `$.step_trigger.${input.outputFieldIds.transcript}`),
           reference("snapshotTranslation", `$.step_trigger.${input.outputFieldIds.translation}`),
           reference("snapshotFileTokens", `$.step_trigger.${input.outputFieldIds.file}.fileToken`)],

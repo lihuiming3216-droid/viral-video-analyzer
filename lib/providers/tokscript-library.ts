@@ -70,10 +70,19 @@ function text(record: Record<string, unknown>, key: string) {
   return typeof record[key] === "string" ? record[key] as string : "";
 }
 
-export function libraryStoredTranscript(payload: Record<string, unknown>, expected: string) {
+export function libraryOriginalTranscript(payload: Record<string, unknown>, expected: string) {
   const source = text(payload, "source_url");
-  if (!source || librarySourceKey(source) !== librarySourceKey(expected)) throw new Error("TokScript 原文来源与视频不一致");
-  const transcript = libraryCaptionText(payload.transcript);
+  // get_tiktok_transcript is a single-video request and may omit source_url.
+  // Never reinterpret a stored bulk/translated library entry as original speech.
+  if (source && librarySourceKey(source) !== librarySourceKey(expected)) throw new Error("TokScript 原文来源与视频不一致");
+  if (payload.is_bulk || payload.is_collection || Array.isArray(payload.items)) throw new Error("TokScript 未返回单条视频的原口播");
+  const raw = payload.transcript;
+  const segments = record(raw).segments;
+  if (Array.isArray(segments) && segments.some(segment => typeof record(segment).text !== "string")) {
+    throw new Error("TokScript 原口播分段不完整，不能静默丢弃内容");
+  }
+  const transcript = libraryCaptionText(Array.isArray(segments)
+    ? segments.map(segment => text(record(segment), "text")).join("\n") : raw);
   if (!transcript) throw new Error("TokScript 未取得原口播，不能判定为无口播");
   return transcript;
 }
@@ -86,6 +95,7 @@ export function libraryExportTranslation(payload: unknown, expected: string) {
   if (rows.length !== 1) throw new Error("TokScript 翻译缺少唯一匹配的视频来源");
   const translated = libraryCaptionText(rows[0].transcript);
   if (!translated) throw new Error("TokScript 未返回中文全文翻译");
+  if (translated.length > 40 && !/[\u3400-\u9fff]/u.test(translated)) throw new Error("TokScript 返回的长文本不是中文翻译");
   return translated;
 }
 
@@ -140,6 +150,16 @@ export async function fetchLibraryVideo(
   const client = new TokScriptClient(config.baseUrl, config.apiKey, currentSignal);
   const result: LibraryProviderResult = { transcript: "", translation: "", downloadUrl: "", errors: {} };
   const sourceUrl = await resolveTokScriptVideoUrl(source, currentSignal);
+  librarySourceKey(sourceUrl);
+  // TokScript's library is keyed by source URL and can reuse an original as a
+  // translated cache hit. Keep deterministic, separate URL keys per language;
+  // both still resolve to and are verified against the identical TikTok ID.
+  const originalUrl = new URL(sourceUrl);
+  originalUrl.hostname = "www.tiktok.com";
+  originalUrl.search = "";
+  originalUrl.hash = "";
+  const translatedUrl = new URL(originalUrl);
+  translatedUrl.searchParams.set("tokscript_translation", "zh-CN");
   await client.connect();
   const tools = await client.listTools();
   const names = new Set(tools.map(tool => tool.name));
@@ -157,11 +177,31 @@ export async function fetchLibraryVideo(
       await hooks.onDownload?.(result.downloadUrl);
     } catch { result.errors.download = signal?.aborted ? "视频获取已停止" : "视频获取或回填失败，其他成功结果保留"; }
   })();
+  const originalRequest = (async () => {
+    if (!names.has("get_tiktok_transcript")) throw new Error("当前账号没有 TokScript 原口播工具");
+    const deadline = AbortSignal.timeout(60_000);
+    const originalClient = new TokScriptClient(config.baseUrl, config.apiKey, signal ? AbortSignal.any([signal, deadline]) : deadline);
+    await originalClient.connect();
+    // Explicit JSON keeps new extractions and cached WEBVTT responses in the
+    // same strict parser. Do not select a preferred/translated language.
+    return libraryOriginalTranscript(toolPayload(await originalClient.callToolArguments("get_tiktok_transcript", { video_url: originalUrl.toString(), format: "json" })), sourceUrl);
+  })();
+  const originals = (async () => {
+    try {
+      result.transcript = await originalRequest;
+      await hooks.onTranscript?.(result.transcript);
+    } catch { result.errors.transcript = signal?.aborted ? "原口播获取已停止" : "TokScript 原口播提取或回填失败，不能判定为无口播"; }
+  })();
   const transcripts = (async () => {
+    // TokScript writes original and translated entries into the same library.
+    // Sequence those provider calls to avoid an original response racing the
+    // Chinese export. An original failure still permits the translation; its
+    // separate 60s deadline never aborts the translation/download client.
+    await originalRequest.catch(() => undefined);
     let completed: Record<string, unknown> | undefined;
     try {
       // One known submission. An uncertain timeout must never resubmit blindly.
-      const job = await call("submit_transcript_job", { urls: [sourceUrl], target_language: "zh-CN" });
+      const job = await call("submit_transcript_job", { urls: [translatedUrl.toString()], target_language: "zh-CN" });
       const jobId = text(job, "job_id");
       if (!jobId || text(job, "target_language") !== "zh-CN") throw new Error("TokScript 未确认中文任务编号");
       await hooks.onJob?.(jobId);
@@ -179,29 +219,18 @@ export async function fetchLibraryVideo(
         });
       }
     } catch { result.errors.translation = "TokScript 中文任务失败或超时，其他成功结果保留"; }
-    // Even a failed translation job must not hide an already-stored original.
-    await Promise.all([
-      (async () => {
-        try {
-          result.transcript = libraryStoredTranscript(await call("get_stored_video", { url: sourceUrl }), sourceUrl);
-          await hooks.onTranscript?.(result.transcript);
-        } catch { result.errors.transcript = signal?.aborted ? "原口播获取已停止" : "TokScript 原口播提取或回填失败，不能判定为无口播"; }
-      })(),
-      (async () => {
-        if (!completed) return;
-        try {
-          if (completed.transcript_ready !== true) throw new Error("TokScript 任务结束但没有有效口播");
-          const key = text(completed, "result_key");
-          if (!key) throw new Error("TokScript 未提供翻译结果编号");
-          const exported = await call("export_results", { result_key: key, format: "json" });
-          result.translation = libraryExportTranslation(await exportJson(text(exported, "download_url"), currentSignal), sourceUrl);
-          delete result.errors.translation;
-          await hooks.onTranslation?.(result.translation);
-        } catch { result.errors.translation = signal?.aborted ? "中文翻译已停止" : "TokScript 中文全文获取或回填失败，其他成功结果保留"; }
-      })(),
-    ]);
+    if (!completed) return;
+    try {
+      if (completed.transcript_ready !== true) throw new Error("TokScript 任务结束但没有有效口播");
+      const key = text(completed, "result_key");
+      if (!key) throw new Error("TokScript 未提供翻译结果编号");
+      const exported = await call("export_results", { result_key: key, format: "json" });
+      result.translation = libraryExportTranslation(await exportJson(text(exported, "download_url"), currentSignal), sourceUrl);
+      delete result.errors.translation;
+      await hooks.onTranslation?.(result.translation);
+    } catch { result.errors.translation = signal?.aborted ? "中文翻译已停止" : "TokScript 中文全文获取或回填失败，其他成功结果保留"; }
   })();
-  await Promise.all([downloads, transcripts]);
+  await Promise.all([downloads, originals, transcripts]);
   signal?.throwIfAborted();
   return result;
 }

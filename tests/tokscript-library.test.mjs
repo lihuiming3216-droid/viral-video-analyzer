@@ -17,7 +17,7 @@ async function fixture(t, changes={}) {
       if(name==="download_video")return {download_url:"https://api.tokscript.com/media/test.mp4"};
       if(name==="submit_transcript_job")return {job_id:"job-1",target_language:"zh-CN"};
       if(name==="get_job_status")return {status:"complete",transcript_ready:true,result_key:"key"};
-      if(name==="get_stored_video")return {source_url:url,transcript:original};
+      if(name==="get_tiktok_transcript")return {transcript:original};
       if(name==="export_results")return {download_url:"https://sample.r2.dev/results.json"};
       throw Error("Unexpected tool");
     },
@@ -32,7 +32,7 @@ async function fixture(t, changes={}) {
     export const tokScriptTranscriptFailure=text=>/^Failed to|^No transcript available/i.test(text);
     export class TokScriptClient {
       async connect(){};
-      async listTools(){return ["download_video","submit_transcript_job","get_job_status","get_stored_video","export_results"].map(name=>({name}));}
+      async listTools(){return ["download_video","submit_transcript_job","get_job_status","get_tiktok_transcript","export_results"].map(name=>({name}));}
       async callTool(tool,url){return {structuredContent:await globalThis[${JSON.stringify(key)}].call(tool.name,{video_url:url})};}
       async callToolArguments(name,args){return {structuredContent:await globalThis[${JSON.stringify(key)}].call(name,args)};}
     }
@@ -50,6 +50,10 @@ test("full original and translated captions use separate proven sources, without
   assert.deepEqual(result.errors,{});
   assert.equal(f.calls.filter(call=>call.name==="submit_transcript_job").length,1);
   assert.equal(f.calls.find(call=>call.name==="submit_transcript_job").args.target_language,"zh-CN");
+  const originalArgs=f.calls.find(call=>call.name==="get_tiktok_transcript").args;
+  assert.equal(originalArgs.format,"json");assert.equal(originalArgs.language,undefined);
+  assert.equal(new URL(originalArgs.video_url).search,"");
+  assert.equal(new URL(f.calls.find(call=>call.name==='submit_transcript_job').args.urls[0]).searchParams.get('tokscript_translation'),'zh-CN');
   assert.ok(f.events.some(event=>event[0]==="original")&&f.events.some(event=>event[0]==="chinese")&&f.events.some(event=>event[0]==="file"));
   assert.doesNotMatch(source,/qwen|openai|chuhaijiang|analyzeVideo|enqueueVideos/);
 });
@@ -62,10 +66,34 @@ test("caption cleanup preserves repetition, numbers and complete non-caption tex
 
 test("publication captions and mismatched video exports cannot masquerade as speech",async t=>{
   const {api}=await fixture(t);
-  assert.throws(()=>api.libraryStoredTranscript({source_url:url,title:"Buy now",caption:"Advertisement"},url),/原口播/);
-  assert.throws(()=>api.libraryStoredTranscript({source_url:url.replace(/4446$/,"4447"),transcript:original},url),/不一致/);
+  assert.throws(()=>api.libraryOriginalTranscript({source_url:url,title:"Buy now",caption:"Advertisement"},url),/原口播/);
+  assert.throws(()=>api.libraryOriginalTranscript({source_url:url.replace(/4446$/,"4447"),transcript:original},url),/不一致/);
+  assert.throws(()=>api.libraryOriginalTranscript({is_bulk:true,items:[{transcript:chinese}]},url),/单条/);
   assert.throws(()=>api.libraryExportTranslation([{source_url:url.replace(/4446$/,"4447"),transcript:chinese}],url),/唯一/);
   assert.throws(()=>api.libraryExportTranslation([{source_url:url,transcript:chinese},{source_url:url,transcript:chinese}],url),/唯一/);
+  assert.throws(()=>api.libraryExportTranslation([{source_url:url,transcript:'A long English original transcript that was not actually translated to Chinese.'}],url),/不是中文/);
+  assert.equal(api.libraryOriginalTranscript({transcript:{segments:[{start:0,text:"Repeat."},{start:1,text:"Repeat."}]}},url),"Repeat.\nRepeat.");
+  assert.throws(()=>api.libraryOriginalTranscript({transcript:{segments:[{text:"one"},{start:1}]}},url),/分段不完整/);
+});
+
+test("an original extraction failure does not suppress translation or video",async t=>{
+  const f=await fixture(t),call=f.hooks.call;
+  f.hooks.call=async(name,args)=>{if(name==='get_tiktok_transcript')throw Error('original unavailable');return call(name,args);};
+  const result=await f.api.fetchLibraryVideo(url);
+  assert.ok(result.errors.transcript&&result.translation&&result.downloadUrl);
+});
+
+test("original speech publishes before a translation job completes and never reads a translated bulk library",async t=>{
+  const f=await fixture(t);const originalCall=f.hooks.call;
+  let finishTranslation,receivedOriginal;
+  const pending=new Promise(resolve=>{finishTranslation=resolve;});
+  const ready=new Promise(resolve=>{receivedOriginal=resolve;});
+  f.hooks.call=async(name,args)=>name==="get_job_status"?pending:originalCall(name,args);
+  const work=f.api.fetchLibraryVideo(url,{onTranscript:async value=>receivedOriginal(value)});
+  assert.equal(await ready,"Open the case.\nPress twice.");
+  assert.ok(!f.calls.some(call=>call.name==="get_stored_video"));
+  finishTranslation({status:"failed"});
+  const result=await work;assert.ok(result.transcript&&result.downloadUrl&&result.errors.translation);
 });
 
 test("download failure does not block the two texts",async t=>{

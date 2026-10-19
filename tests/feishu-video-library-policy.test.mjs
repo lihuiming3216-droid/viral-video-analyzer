@@ -35,7 +35,7 @@ test("managed patches cannot mutate source, product info, or unrelated columns",
 });
 
 test("native triggers watch only source-link additions/changes and do not exclude bulk pastes",()=>{
-  const options={tableName:"数据表",sourceFieldId:"fldo5Xf5YH",outputFieldIds:{transcript:"fldOriginal",translation:"fldTranslation",file:"fldFile"},endpoint:"https://52.37.212.216/api/feishu/video-library",secret:"fixture-only"};
+  const options={tableName:"数据表",sourceFieldId:"fldo5Xf5YH",eventTimeFieldId:"fldEventTime",outputFieldIds:{transcript:"fldOriginal",translation:"fldTranslation",file:"fldFile"},endpoint:"https://52.37.212.216/api/feishu/video-library",secret:"fixture-only"};
   const add=workflows.videoLibraryWorkflow({...options,kind:"add"}),change=workflows.videoLibraryWorkflow({...options,kind:"change"});
   assert.equal(add.steps[0].type,"AddRecordTrigger");assert.equal(add.steps[0].data.watched_field_name,"视频链接");
   assert.equal(change.steps[0].type,"SetRecordTrigger");assert.deepEqual(change.steps[0].data.field_watch_info,[{field_name:"视频链接",operator:"isNotEmpty",value:[]}]);
@@ -43,14 +43,15 @@ test("native triggers watch only source-link additions/changes and do not exclud
     assert.ok(!workflow.steps[0].data.trigger_control_list.includes("pasteUpdate"));
     assert.doesNotMatch(JSON.stringify(workflow.steps[0]),/中文翻译|原口播|文件|TimerTrigger/);
     const http=workflow.steps[1].data;
-    assert.ok(http.form_body.some(item=>item.key==="eventTime"&&item.value[0].value==="$.step_trigger.recordModifiedTime"));
+    assert.ok(http.form_body.some(item=>item.key==="eventTime"&&item.value[0].value==="$.step_trigger.fldEventTime.timestamp"));
+    assert.ok(!JSON.stringify(http).includes('$.step_trigger.recordModifiedTime'),"native minute-formatted dates cannot identify rapid link edits");
     assert.ok(http.headers.some(item=>item.key==="x-feishu-automation-secret"));
     assert.ok(!JSON.stringify(http.form_body).includes("fixture-only"));
   }
 });
 
 test("workflow credentials cannot be configured to leave the confirmed HTTPS server",()=>{
-  const options={kind:"add",tableName:"数据表",sourceFieldId:"fldo5Xf5YH",outputFieldIds:{transcript:"fldOriginal",translation:"fldTranslation",file:"fldFile"},secret:"fixture-only"};
+  const options={kind:"add",tableName:"数据表",sourceFieldId:"fldo5Xf5YH",eventTimeFieldId:"fldEventTime",outputFieldIds:{transcript:"fldOriginal",translation:"fldTranslation",file:"fldFile"},secret:"fixture-only"};
   for(const endpoint of ["http://52.37.212.216/api/feishu/video-library","https://evil.example/api/feishu/video-library","https://52.37.212.216/api/feishu/video-library?secret=exposed"])
     assert.throws(()=>workflows.videoLibraryWorkflow({...options,endpoint}));
 });

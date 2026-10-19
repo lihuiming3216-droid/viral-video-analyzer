@@ -70,12 +70,19 @@ async function main() {
   await fs.mkdir(directory,{recursive:true,mode:0o700});
   await privateSave(directory+'/workflow-b-before.json',before);
   const oldLoad=Module._load,oldResolve=Module._resolveFilename;
+  if(prepare&&before.status!=='disabled')throw Error('Workflow B is active; inspect before replacing its definition');
+  const eventTimeFieldName='事件时间（系统）';
+  if(prepare&&!fields.has(eventTimeFieldName)){
+    const created=await api('POST',fieldsPath,{field_name:eventTimeFieldName,type:1002,property:{date_formatter:'yyyy-MM-dd HH:mm'}});
+    fields.set(eventTimeFieldName,created.field);
+  }
+  if(fields.get(eventTimeFieldName)?.type!==1002)throw Error('A real ModifiedTime field is required for millisecond event identity');
   Module._load=function(name,...args){return name==='server-only'?{}:oldLoad.call(this,name,...args);};
   Module._resolveFilename=function(name,...args){return oldResolve.call(this,name.startsWith('@/')?path.join(process.cwd(),name.slice(2)):name,...args);};
   Module._extensions['.ts']=(module,file)=>module._compile(ts.transpileModule(syncFs.readFileSync(file,'utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022,esModuleInterop:true}}).outputText,file);
   const {videoLibraryWorkflow}=require('../lib/feishu/video-library-workflows.ts');
   const outputFieldIds={transcript:fields.get('原口播').field_id,translation:fields.get('中文翻译').field_id,file:fields.get('文件').field_id};
-  const definitions=Object.fromEntries(['add','change'].map(kind=>[kind,videoLibraryWorkflow({kind,tableName:'数据表',sourceFieldId:fields.get('视频链接').field_id,outputFieldIds,endpoint:'https://52.37.212.216/api/feishu/video-library',secret})]));
+  const definitions=Object.fromEntries(['add','change'].map(kind=>[kind,videoLibraryWorkflow({kind,tableName:'数据表',sourceFieldId:fields.get('视频链接').field_id,eventTimeFieldId:fields.get(eventTimeFieldName).field_id,outputFieldIds,endpoint:'https://52.37.212.216/api/feishu/video-library',secret})]));
   const signature=value=>crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
   const definition = value => ({title:value.title,steps:value.steps});
   if(prepare){

@@ -11,7 +11,7 @@ import {
   type LibraryTask,
 } from "@/lib/feishu/video-library-store";
 import {
-  libraryEventTime, libraryLink, libraryOwnedPatch, librarySameValue, VIDEO_LIBRARY_FIELDS as F, VIDEO_LIBRARY_OUTPUTS, VIDEO_LIBRARY_SCOPE,
+  libraryEventTime, libraryLink, libraryOwnedPatch, librarySameValue, libraryTriggerSnapshot, VIDEO_LIBRARY_FIELDS as F, VIDEO_LIBRARY_OUTPUTS, VIDEO_LIBRARY_SCOPE,
 } from "@/lib/feishu/video-library-policy";
 
 const global = globalThis as typeof globalThis & { __feishuVideoLibraryControllers?: Map<string, AbortController> };
@@ -37,6 +37,7 @@ export async function acceptVideoLibraryEvent(body: Record<string, unknown>) {
   const eventMs = libraryEventTime(body.eventTime);
   const { enabledAfter } = await libraryActivation();
   if (eventMs < enabledAfter) return { accepted: false, ignored: "上线前的旧事件不补跑" };
+  const eventFields = libraryTriggerSnapshot(body);
   const scope = { appToken, tableId, recordId };
   return withProductCardRecordLock(scope, async () => {
     const client = getChatgptFeishuClient();
@@ -44,7 +45,7 @@ export async function acceptVideoLibraryEvent(body: Record<string, unknown>) {
     if (!sourceMatches(sourceUrl, fields[F.source])) return { accepted: false, ignored: "视频链接已变化，忽略旧事件" };
     const columns = new Set(await listBitableTableFieldNames(scope, client));
     if (Object.values(F).some(name => !columns.has(name))) throw new Error("优质视频库缺少原口播、中文翻译、文件、处理状态或失败原因字段");
-    const receipt = await claimLibraryTask({ ...scope, eventMs, sourceUrl, fields });
+    const receipt = await claimLibraryTask({ ...scope, eventMs, sourceUrl, fields, eventFields });
     if (receipt.accepted && receipt.previousId) controllers.get(receipt.previousId)?.abort(new LibrarySourceChangedError());
     return { accepted: receipt.accepted, duplicate: receipt.duplicate, jobId: receipt.id };
   });
@@ -71,6 +72,7 @@ export async function publishVideoLibraryTask(
       const fields = await getBaseRecordFields(client, task);
       if (!sourceMatches(task.sourceUrl, fields[F.source])) {
         await updateLibraryTask(id, { state: "superseded", finished_at: new Date().toISOString() });
+        controllers.get(id)?.abort(new LibrarySourceChangedError());
         throw new LibrarySourceChangedError();
       }
       const patch = libraryOwnedPatch(fields, task.owned, proposed);
@@ -94,9 +96,12 @@ export async function publishVideoLibraryTask(
             .map(([name]) => [name, name === F.file ? [] : ""]));
           if (Object.keys(clear).length) await patchBaseRecord(client, { ...task, fields: clear });
           await updateLibraryTask(id, { state: "superseded", finished_at: new Date().toISOString() });
+          controllers.get(id)?.abort(new LibrarySourceChangedError());
         }
         throw new LibrarySourceChangedError();
       }
+      const unverified = Object.entries(patch.fields).filter(([name, value]) => !librarySameValue(after[name], value));
+      if (unverified.length) throw new Error(`飞书回读未确认已保存：${unverified.map(([name]) => name).join("、")}`);
       const owned = { ...task.owned };
       for (const [name, value] of Object.entries(proposed)) {
         if (VIDEO_LIBRARY_OUTPUTS.includes(name as typeof VIDEO_LIBRARY_OUTPUTS[number])

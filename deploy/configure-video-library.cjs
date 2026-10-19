@@ -54,6 +54,11 @@ async function main() {
   const fields=new Map(fieldList.items.map(field=>[field.field_name,field]));
   for(const [name,type] of [['视频链接',15],['文件',17],['原口播',1],['中文翻译',1]])if(fields.get(name)?.type!==type)throw Error('Core field missing or unexpected type: '+name);
   const before=await api('GET',base+workflowB);
+  if(enable){
+    const legacy=await api('GET','/bitable/v1/apps/'+scope.appToken+'/workflows?page_size=100');
+    const old=(legacy.workflows||[]).find(workflow=>workflow.workflow_id==='7687285007543045108');
+    if(old&&/^(?:enable|enabled)$/i.test(old.status))throw Error('The existing legacy automation is still active; user must confirm its cutover before enabling');
+  }
   let manifest;
   try{manifest=JSON.parse(await fs.readFile(manifestFile,'utf8'));}catch(error){if(error.code!=='ENOENT')throw error;}
   if(!prepare&&!enable){emit({state:'read-only',fields:fieldList.items.map(field=>({name:field.field_name,type:field.type,id:field.field_id})),workflowBStatus:before.status,hasPreparedManifest:Boolean(manifest)});return;}
@@ -65,7 +70,8 @@ async function main() {
   Module._resolveFilename=function(name,...args){return oldResolve.call(this,name.startsWith('@/')?path.join(process.cwd(),name.slice(2)):name,...args);};
   Module._extensions['.ts']=(module,file)=>module._compile(ts.transpileModule(syncFs.readFileSync(file,'utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022,esModuleInterop:true}}).outputText,file);
   const {videoLibraryWorkflow}=require('../lib/feishu/video-library-workflows.ts');
-  const definitions=Object.fromEntries(['add','change'].map(kind=>[kind,videoLibraryWorkflow({kind,tableName:'数据表',sourceFieldId:fields.get('视频链接').field_id,endpoint:'https://52.37.212.216/api/feishu/video-library',secret})]));
+  const outputFieldIds={transcript:fields.get('原口播').field_id,translation:fields.get('中文翻译').field_id,file:fields.get('文件').field_id};
+  const definitions=Object.fromEntries(['add','change'].map(kind=>[kind,videoLibraryWorkflow({kind,tableName:'数据表',sourceFieldId:fields.get('视频链接').field_id,outputFieldIds,endpoint:'https://52.37.212.216/api/feishu/video-library',secret})]));
   const signature=value=>crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
   const definition = value => ({title:value.title,steps:value.steps});
   if(prepare){

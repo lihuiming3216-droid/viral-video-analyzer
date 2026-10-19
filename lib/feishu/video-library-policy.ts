@@ -61,6 +61,31 @@ export function libraryOutputSnapshot(fields: Record<string, unknown>) {
   return Object.fromEntries(VIDEO_LIBRARY_OUTPUTS.map(name => [name, fields[name] ?? (name === VIDEO_LIBRARY_FIELDS.file ? [] : "")]));
 }
 
+/** Native trigger values protect edits made while its HTTP delivery was delayed. */
+export function libraryTriggerSnapshot(body: Record<string, unknown>) {
+  for (const key of ["snapshotTranscript", "snapshotTranslation", "snapshotFileTokens"]) {
+    if (!(key in body)) throw new Error("自动化缺少触发时的原口播、翻译或附件快照，已停止以保护人工内容");
+  }
+  let tokens = body.snapshotFileTokens;
+  if (typeof tokens === "string") {
+    if (!tokens.trim() || tokens === "null") tokens = [];
+    else {
+      const source = tokens;
+      try { tokens = JSON.parse(source); }
+      catch { tokens = source.split(",").map(value => value.trim()).filter(Boolean); }
+    }
+  }
+  if (typeof tokens === "string") tokens = [tokens];
+  if (!Array.isArray(tokens) || tokens.some(token => typeof token !== "string" || !/^[A-Za-z0-9_-]{5,191}$/.test(token))) {
+    throw new Error("自动化附件快照格式无效，已停止以保护现有文件");
+  }
+  const transcript = libraryFieldValue(body.snapshotTranscript);
+  const translation = libraryFieldValue(body.snapshotTranslation);
+  if (typeof transcript !== "string" || typeof translation !== "string") throw new Error("自动化文字快照格式无效");
+  return { [VIDEO_LIBRARY_FIELDS.transcript]: transcript, [VIDEO_LIBRARY_FIELDS.translation]: translation,
+    [VIDEO_LIBRARY_FIELDS.file]: tokens.map(file_token => ({ file_token })) };
+}
+
 export function libraryOwnedPatch(
   current: Record<string, unknown>, owned: Record<string, unknown>, proposed: Record<string, unknown>,
 ) {

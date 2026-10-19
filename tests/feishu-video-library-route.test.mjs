@@ -44,7 +44,7 @@ test("unauthenticated requests stop before reading or accepting any user input",
 
 test("oversized bodies and malformed JSON cannot create a task",async t=>{
   const f=await fixture(t);
-  assert.equal((await f.api.POST(f.request("x".repeat(33000)))).status,413);
+  assert.equal((await f.api.POST(f.request("x".repeat(256*1024+1)))).status,413);
   const invalid=await f.api.POST(f.request("not-json private-value"));assert.equal(invalid.status,400);
   assert.doesNotMatch(await invalid.text(),/private-value/);assert.equal(f.accepted.length,0);assert.equal(f.jobs.length,0);
 });

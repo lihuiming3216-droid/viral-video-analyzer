@@ -35,7 +35,7 @@ test("managed patches cannot mutate source, product info, or unrelated columns",
 });
 
 test("native triggers watch only source-link additions/changes and do not exclude bulk pastes",()=>{
-  const options={tableName:"数据表",sourceFieldId:"fldo5Xf5YH",endpoint:"https://52.37.212.216/api/feishu/video-library",secret:"fixture-only"};
+  const options={tableName:"数据表",sourceFieldId:"fldo5Xf5YH",outputFieldIds:{transcript:"fldOriginal",translation:"fldTranslation",file:"fldFile"},endpoint:"https://52.37.212.216/api/feishu/video-library",secret:"fixture-only"};
   const add=workflows.videoLibraryWorkflow({...options,kind:"add"}),change=workflows.videoLibraryWorkflow({...options,kind:"change"});
   assert.equal(add.steps[0].type,"AddRecordTrigger");assert.equal(add.steps[0].data.watched_field_name,"视频链接");
   assert.equal(change.steps[0].type,"SetRecordTrigger");assert.deepEqual(change.steps[0].data.field_watch_info,[{field_name:"视频链接",operator:"isNotEmpty",value:[]}]);
@@ -50,7 +50,15 @@ test("native triggers watch only source-link additions/changes and do not exclud
 });
 
 test("workflow credentials cannot be configured to leave the confirmed HTTPS server",()=>{
-  const options={kind:"add",tableName:"数据表",sourceFieldId:"fldo5Xf5YH",secret:"fixture-only"};
+  const options={kind:"add",tableName:"数据表",sourceFieldId:"fldo5Xf5YH",outputFieldIds:{transcript:"fldOriginal",translation:"fldTranslation",file:"fldFile"},secret:"fixture-only"};
   for(const endpoint of ["http://52.37.212.216/api/feishu/video-library","https://evil.example/api/feishu/video-library","https://52.37.212.216/api/feishu/video-library?secret=exposed"])
     assert.throws(()=>workflows.videoLibraryWorkflow({...options,endpoint}));
+});
+
+test("native snapshots accept both JSON and comma-separated file token lists without retaining signed URLs",()=>{
+  const base={snapshotTranscript:"old original",snapshotTranslation:"旧中文"};
+  for(const snapshotFileTokens of [["fileOne","fileTwo"],'["fileOne","fileTwo"]',"fileOne,fileTwo"])
+    assert.deepEqual(api.libraryTriggerSnapshot({...base,snapshotFileTokens}).文件,[{file_token:"fileOne"},{file_token:"fileTwo"}]);
+  assert.throws(()=>api.libraryTriggerSnapshot(base),/快照/);
+  assert.throws(()=>api.libraryTriggerSnapshot({...base,snapshotFileTokens:"https://example.test/file"}),/快照格式无效/);
 });

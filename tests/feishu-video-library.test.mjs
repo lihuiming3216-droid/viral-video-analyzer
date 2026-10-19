@@ -39,7 +39,7 @@ async function fixture(t) {
       const id=`task-${++counter}-${key}`;
       const baseline=policy.libraryOutputSnapshot(input.fields),resetOutputs=!previous||previous.sourceUrl!==input.sourceUrl;
       if(previous&&["accepted","running"].includes(previous.state))previous.state="superseded";
-      tasks.set(id,{id,rowKey:input.recordId,...input,current:true,state:"accepted",resetOutputs,baseline,owned:resetOutputs?baseline:structuredClone(previous.owned),errors:{},original:"",translated:"",mediaPath:"",fileToken:""});
+      tasks.set(id,{id,rowKey:input.recordId,...input,current:true,state:"accepted",resetOutputs,baseline,owned:resetOutputs?input.eventFields||baseline:structuredClone(previous.owned),errors:{},original:"",translated:"",mediaPath:"",fileToken:""});
       heads.set(input.recordId,id);return {id,previousId,accepted:true,duplicate:false};
     },
     getLibraryTask:async id=>{
@@ -54,7 +54,7 @@ async function fixture(t) {
     acquireLibraryExecution:async()=>({acquired:true,valid:()=>true,release:async()=>{}}),
     downloadMedia:async id=>`${id}/original.mp4`,resolveMediaPath:value=>`/media/${value}`,
     validateDownloadedVideoFile:async()=>({audioCodec:"aac"}),
-    uploadBaseAttachment:async(_client,input)=>[{file_token:input.absolutePath}],
+    uploadBaseAttachment:async(_client,input)=>[{file_token:"file"+policy.libraryDigest(input.absolutePath).slice(0,24)}],
     fetchLibraryVideo:async(source,hooks,signal)=>{
       calls.push({kind:"provider",source});entered.get(source)?.resolve();
       if(gates.has(source))await gates.get(source).promise;
@@ -78,10 +78,11 @@ async function fixture(t) {
   for(const specifier of ["@/lib/video-processing","@/lib/providers/tokscript-library","@/lib/feishu/chatgpt-app","@/lib/feishu/automation","@/lib/feishu/webhook-shared","@/lib/feishu/media-upload","@/lib/feishu/video-library-store"])code=code.replaceAll(JSON.stringify(specifier),JSON.stringify(stub));
   code=code.replaceAll('"@/lib/feishu/video-library-policy"',JSON.stringify(policyUrl));
   const api=await import(dataUrl(code));
-  const event=async(index,sourceUrl=url(index),eventTime=Date.now())=>{
+  const event=async(index,sourceUrl=url(index),eventTime=Date.now(),triggerSnapshot)=>{
     const recordId=`recTest${String(index).padStart(6,"0")}`;
     if(!records.has(recordId))records.set(recordId,{视频链接:{link:sourceUrl,text:"video"}});
-    return api.acceptVideoLibraryEvent({...scope,recordId,sourceUrl,eventTime});
+    const snapshot=triggerSnapshot||policy.libraryOutputSnapshot(records.get(recordId));
+    return api.acceptVideoLibraryEvent({...scope,recordId,sourceUrl,eventTime,snapshotTranscript:snapshot.原口播,snapshotTranslation:snapshot.中文翻译,snapshotFileTokens:(snapshot.文件||[]).map(file=>file.file_token)});
   };
   return {api,event,tasks,records,heads,calls,hooks,gates,entered};
 }
@@ -138,6 +139,15 @@ test("manual edits made during processing are preserved and visible as partial s
   assert.equal(row.处理状态,"部分完成");assert.match(row.失败原因,/人工修改/);
 });
 
+test("manual text entered after a link edit but before a delayed webhook is also preserved",async t=>{
+  const f=await fixture(t),recordId="recTest000001";
+  f.records.set(recordId,{视频链接:{link:url(1)},原口播:"新链接的人工口播",中文翻译:"旧译文",文件:[]});
+  const receipt=await f.event(1,url(1),Date.now(),{原口播:"旧口播",中文翻译:"旧译文",文件:[]});
+  await f.api.runVideoLibraryTask(receipt.jobId);
+  const row=f.records.get(recordId);assert.equal(row.原口播,"新链接的人工口播");assert.match(row.失败原因,/人工修改/);
+  assert.equal(row.中文翻译,`中文:${url(1)}`);assert.equal(row.处理状态,"部分完成");
+});
+
 test("failed media upload retains both complete text outputs and records a readable error",async t=>{
   const f=await fixture(t);f.hooks.uploadBaseAttachment=async()=>{throw Error("upload failed credential=not-real");};
   const receipt=await f.event(1);await f.api.runVideoLibraryTask(receipt.jobId);
@@ -154,6 +164,14 @@ test("the post-write source check removes only just-written stale content",async
   const receipt=await f.event(1);await f.api.runVideoLibraryTask(receipt.jobId);
   const row=f.records.get(recordId);assert.equal(row.视频链接.link,url(2));assert.equal(row.原口播,"");
   assert.equal(f.tasks.get(receipt.jobId).state,"superseded");
+});
+
+test("an API success without the actual field value cannot be reported as completed",async t=>{
+  const f=await fixture(t),recordId="recTest000001";
+  f.hooks.afterPatch=async input=>{if(input.fields.原口播?.startsWith("original:"))delete f.records.get(recordId).原口播;};
+  const receipt=await f.event(1);await f.api.runVideoLibraryTask(receipt.jobId);
+  const row=f.records.get(recordId);assert.equal(row.处理状态,"部分完成");assert.match(row.失败原因,/原口播回填失败/);
+  assert.equal(f.tasks.get(receipt.jobId).state,"partial");assert.ok(row.中文翻译&&row.文件.length);
 });
 
 test("library code never invokes historical recovery, models, product generation or a scan loop",()=>{

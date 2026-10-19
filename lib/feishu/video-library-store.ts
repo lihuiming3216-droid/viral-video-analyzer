@@ -42,17 +42,36 @@ export async function getLibraryTask(id: string) {
   return { ...task(rows[0]), current: rows[0].latest_task_id === id };
 }
 
-/** Event, row ownership and baseline commit atomically. No external requests. */
-export async function claimLibraryTask(input: {
+type LibraryEvent = {
   appToken: string; tableId: string; recordId: string; eventMs: number; sourceUrl: string; fields: Record<string, unknown>;
-}) {
+  eventFields?: Record<string, unknown>;
+};
+
+/** Retry only a rolled-back database conflict, never a provider submission. */
+export async function claimLibraryTask(input: LibraryEvent) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try { return await claimLibraryTaskOnce(input); }
+    catch (error) {
+      const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
+      if (attempt === 1 || !["ER_LOCK_DEADLOCK", "ER_LOCK_WAIT_TIMEOUT"].includes(code)) throw error;
+    }
+  }
+  throw new Error("未能确认本次视频事件的认领结果");
+}
+
+/** Event, row ownership and baseline commit atomically. No external requests. */
+async function claimLibraryTaskOnce(input: LibraryEvent) {
   const rowKey = libraryDigest([input.appToken, input.tableId, input.recordId]);
   const id = libraryDigest([rowKey, input.eventMs, librarySourceKey(input.sourceUrl)]);
   const db = await (await getPool()).getConnection();
+  let reusable = true;
   try {
     await db.beginTransaction();
     const now = new Date().toISOString();
-    await db.execute("INSERT IGNORE INTO feishu_video_library_rows(row_key,app_token,table_id,record_id,updated_at) VALUES (?,?,?,?,?)",
+    // ON DUPLICATE KEY UPDATE acquires an exclusive row lock immediately;
+    // INSERT IGNORE's shared duplicate lock can deadlock when five replays all
+    // subsequently try upgrading to SELECT FOR UPDATE (real MySQL regression).
+    await db.execute("INSERT INTO feishu_video_library_rows(row_key,app_token,table_id,record_id,updated_at) VALUES (?,?,?,?,?) ON DUPLICATE KEY UPDATE row_key=feishu_video_library_rows.row_key",
       [rowKey, input.appToken, input.tableId, input.recordId, now]);
     const [rows] = await db.execute<RowDataPacket[]>("SELECT event_ms,latest_task_id FROM feishu_video_library_rows WHERE row_key=? FOR UPDATE", [rowKey]);
     const previousId = rows[0].latest_task_id ? String(rows[0].latest_task_id) : "";
@@ -63,20 +82,24 @@ export async function claimLibraryTask(input: {
     const [previous] = previousId ? await db.execute<RowDataPacket[]>("SELECT source_url,owned_json FROM feishu_video_library_tasks WHERE id=?", [previousId]) : [[]];
     const reset = !previous[0] || librarySourceKey(String(previous[0].source_url)) !== librarySourceKey(input.sourceUrl);
     const baseline = libraryOutputSnapshot(input.fields);
-    const owned = reset ? baseline : object(previous[0].owned_json);
+    const owned = reset ? input.eventFields || baseline : object(previous[0].owned_json);
     if (previousId) await db.execute("UPDATE feishu_video_library_tasks SET state='superseded',finished_at=?,updated_at=? WHERE id=? AND state IN ('accepted','running')", [now, now, previousId]);
     await db.execute("INSERT INTO feishu_video_library_tasks(id,row_key,event_ms,source_url,reset_outputs,baseline_json,owned_json,original_text,translated_text,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
       [id, rowKey, input.eventMs, input.sourceUrl, reset ? 1 : 0, JSON.stringify(baseline), JSON.stringify(owned), "", "", now, now]);
     await db.execute("UPDATE feishu_video_library_rows SET latest_task_id=?,event_ms=?,updated_at=? WHERE row_key=?", [id, input.eventMs, now, rowKey]);
     await db.commit();
     return { id, accepted: true, duplicate: false, previousId };
-  } catch (error) { await db.rollback().catch(() => undefined); throw error; }
-  finally { db.release(); }
+  } catch (error) {
+    try { await db.rollback(); } catch { reusable = false; db.destroy(); }
+    throw error;
+  } finally { if (reusable) db.release(); }
 }
 
 export async function startLibraryTask(id: string) {
   const [result] = await (await getPool()).execute<import("mysql2").ResultSetHeader>(
-    "UPDATE feishu_video_library_tasks t JOIN feishu_video_library_rows r ON r.latest_task_id=t.id SET t.state='running',t.started_at=?,t.updated_at=? WHERE t.id=? AND t.state='accepted'",
+    // A newer row generation transaction already supersedes accepted tasks.
+    // Do not lock the row head in reverse order here (task -> head).
+    "UPDATE feishu_video_library_tasks SET state='running',started_at=?,updated_at=? WHERE id=? AND state='accepted'",
     [new Date().toISOString(), new Date().toISOString(), id]);
   return result.affectedRows === 1;
 }

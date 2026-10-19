@@ -31,6 +31,16 @@ test("concurrent delivery of one native event creates one task and retains the b
   assert.equal((await f.row("SELECT COUNT(*) AS n FROM feishu_inbox_tasks")).n,0);
 });
 
+test("repeated concurrent insertion of fresh row heads cannot deadlock the duplicate event claim",async t=>{
+  const f=await fixture(t),time=Date.UTC(2026,9,19,1);
+  for(let index=0;index<12;index++) {
+    const results=await Promise.all(Array.from({length:5},()=>f.claim(time,url,`rec-stress-${index}`)));
+    assert.equal(results.filter(result=>result.accepted).length,1);
+    assert.equal(new Set(results.map(result=>result.id)).size,1);
+  }
+  assert.equal((await f.row("SELECT COUNT(*) AS n FROM feishu_video_library_tasks")).n,12);
+});
+
 test("A to B to A creates fresh generations and refuses delayed old events",async t=>{
   const f=await fixture(t),time=Date.UTC(2026,9,19,2);
   const a=await f.claim(time);assert.equal(await f.api.startLibraryTask(a.id),true);

@@ -20,7 +20,7 @@ export async function POST(request: NextRequest) {
         const { done, value } = await reader.read();
         if (done) break;
         size += value.length;
-        if (size > 32 * 1024) return NextResponse.json({ code: 413, msg: "请求内容过大" }, { status: 413 });
+        if (size > 256 * 1024) return NextResponse.json({ code: 413, msg: "请求内容过大" }, { status: 413 });
         chunks.push(value);
       }
     } finally { await reader.cancel().catch(() => undefined); reader.releaseLock(); }

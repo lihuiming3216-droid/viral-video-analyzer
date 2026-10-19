@@ -44,7 +44,11 @@ async function main() {
       ...(data?{body:JSON.stringify(data)}:{}),redirect:'error',signal:AbortSignal.timeout(25000),
     });
     const result=await response.json();
-    if(result.code!==0)throw Error('Feishu operation rejected: HTTP '+response.status+' code '+result.code);
+    if(result.code!==0){
+      const diagnostic='/app/.data/maintenance/quality-video-library-20261019/api-error-'+crypto.randomUUID()+'.json';
+      await privateSave(diagnostic,{method,endpoint,httpStatus:response.status,result});
+      throw Error('Feishu operation rejected: HTTP '+response.status+' code '+result.code+'; private diagnostic '+diagnostic);
+    }
     return result.data;
   };
   const base='/base/v3/bases/'+scope.appToken+'/workflows/';
@@ -88,9 +92,11 @@ async function main() {
       await api('PUT',base+workflowA,definitions.add);
     }else{
       if(manifest?.createAttempt)throw Error('Prior workflow creation outcome is uncertain; inspect native workflows before retrying');
-      manifest={...scope,workflowB,createAttempt:{at:new Date().toISOString(),title:definitions.add.title,snapshot:directory}};
+      manifest={...scope,workflowB,createAttempt:{at:new Date().toISOString(),title:definitions.add.title,clientToken:crypto.randomUUID(),snapshot:directory}};
       await privateSave(manifestFile,manifest,true);
-      const created=await api('POST',base.slice(0,-1),definitions.add);
+      // Feishu requires client_token; persist it before the request so an
+      // ambiguous creation can be reconciled without creating a second flow.
+      const created=await api('POST',base.slice(0,-1),{...definitions.add,client_token:manifest.createAttempt.clientToken});
       workflowA=created.workflow_id||created.id;
       if(!workflowA)throw Error('Created workflow did not return an identifier; no blind retry allowed');
     }

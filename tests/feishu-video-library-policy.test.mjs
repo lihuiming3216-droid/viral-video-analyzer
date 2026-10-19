@@ -62,3 +62,11 @@ test("native snapshots accept both JSON and comma-separated file token lists wit
   assert.throws(()=>api.libraryTriggerSnapshot(base),/快照/);
   assert.throws(()=>api.libraryTriggerSnapshot({...base,snapshotFileTokens:"https://example.test/file"}),/快照格式无效/);
 });
+
+test("workflow creation persists the required client token before its only POST",async()=>{
+  const setup=await readFile(new URL("../deploy/configure-video-library.cjs",import.meta.url),"utf8");
+  assert.match(setup,/clientToken:crypto\.randomUUID\(\)/);
+  assert.match(setup,/client_token:manifest\.createAttempt\.clientToken/);
+  assert.ok(setup.indexOf("await privateSave(manifestFile,manifest,true)")<setup.indexOf("client_token:manifest.createAttempt.clientToken"));
+  assert.match(setup,/Prior workflow creation outcome is uncertain/);
+});

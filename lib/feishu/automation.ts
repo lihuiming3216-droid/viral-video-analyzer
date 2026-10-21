@@ -17,7 +17,6 @@ import { ensureFeishuConnection, getChatgptFeishuClient, getConnectedFeishuChann
 import { ensureProductCardByPid, syncProductCardManagedFields } from "@/lib/feishu/document";
 import { uploadBaseAttachment } from "@/lib/feishu/media-upload";
 import { enqueueVideos } from "@/lib/queue";
-import { conciseProductDocAnalysis } from "@/lib/product-doc-analysis";
 import { transcribeMediaWithQwen, translateSegmentsWithQwen } from "@/lib/providers/qwen";
 import { fetchTikTok } from "@/lib/providers/tokscript";
 import { buildBilingualSrt, buildTimestampedText, generateBilingualSubtitleFile, type TranscriptSegment } from "@/lib/subtitle";
@@ -626,8 +625,7 @@ export async function completeFeishuAutomation(videoId: string) {
           // Validate real columns before an upload or subtitle-model request.
           // Input-only/card-button fields are deliberately outside this list.
           const outputNames = [map.status, map.translation, map.transcript, map.videoFile,
-            map.productDocument, map.linkedSubtitle, map.timestampedTranscript, map.timestampedTranslation,
-            ...(video.analysisMode === "product_doc" ? [map.analysis] : [])];
+            map.productDocument, map.linkedSubtitle, map.timestampedTranscript, map.timestampedTranslation];
           assertDeliveryFields(await listBitableTableFieldNames(current, client), outputNames);
           const fields: Record<string, unknown> = {};
           let filePending = false;
@@ -650,15 +648,8 @@ export async function completeFeishuAutomation(videoId: string) {
           if (video.transcriptOriginal) setMappedField(fields, map.transcript, video.transcriptOriginal);
           setMappedField(fields, map.status, video.status === "completed" ? "已完成" : video.status === "failed" ? "失败" : "已停止");
           if (video.status === "completed") {
-            // conciseProductDocAnalysis()'s compact "核心/爆点/借鉴" format was
-            // designed for 手卡 (product_doc mode)'s narrow table cell — it costs
-            // nothing extra to generate (pure local reformatting of the analysis
-            // already in hand, no additional AI call), but writing it for the
-            // unrelated 任务安排表 (full mode) flow was just an accidental side
-            // effect of sharing this delivery function, not an intentional field.
-            if (video.analysisMode === "product_doc") {
-              setMappedField(fields, map.analysis, conciseProductDocAnalysis(video));
-            }
+            // Video analysis is retired for handcards. Never backfill even an
+            // old cached result into the analysis field; files/text are independent.
             if (video.transcriptZh) setMappedField(fields, map.translation, video.transcriptZh);
             setMappedField(fields, map.transcript, video.transcriptOriginal || "");
             const mappedDocumentUrl = productCardMapping?.documentUrl || product?.documentUrl;
@@ -702,8 +693,6 @@ export async function completeFeishuAutomation(videoId: string) {
                 await subtitleFile?.cleanup();
               }
             }
-          } else if (video.errorMessage && video.analysisMode === "product_doc") {
-            setMappedField(fields, map.analysis, `处理失败：${safeAutomationFailure(video.errorMessage)}`);
           }
           for (let attempt = 1; attempt <= 3; attempt += 1) {
             try {

@@ -42,7 +42,7 @@ async function loadAnalysis(hooks) {
     export const tokScriptTranscriptFailure = () => false;
     export const transcriptAndTranslationAgree = () => true;
     export const emitVideoProgress = (...args) => hooks().emitVideoProgress?.(...args);
-    export const createSceneClip = (...args) => hooks().createSceneClip?.(...args);
+    export const createSceneClip = async (...args) => hooks().createSceneClip?.(...args);
     export const downloadMedia = (...args) => hooks().downloadMedia?.(...args);
     export const extractVideoAssets = (...args) => hooks().extractVideoAssets(...args);
     export const prepareLocalVideoForQwen = (...args) => hooks().prepareLocalVideoForQwen(...args);
@@ -102,7 +102,7 @@ test("one attempt uses one local complete MP4, persists two Qwen calls, and neve
     productId: "product-1",
     sourceType: "tiktok",
     sourceUrl: "https://www.tiktok.com/@example/video/123",
-    analysisMode: "product_doc",
+    analysisMode: "full",
     originalPath,
     remoteVideoUrl: "https://temporary.example/source.mp4?token=must-not-reach-qwen",
     transcriptOriginal: "This is the complete spoken script.",
@@ -178,6 +178,8 @@ test("one attempt uses one local complete MP4, persists two Qwen calls, and neve
           viralPoints: [],
           strengths: [],
           structureFormula: "痛点-演示-转化",
+          scores: {},
+          scenes: [{ shotIndex: 1 }],
         };
       }
       throw new Error("不应发起第三次 Qwen 请求");
@@ -230,7 +232,7 @@ test("a structurally incomplete Qwen response exhausts the single permitted retr
     productId: "product-1",
     sourceType: "tiktok",
     sourceUrl: "https://www.tiktok.com/@example/video/456",
-    analysisMode: "product_doc",
+    analysisMode: "full",
     originalPath: `${videoId}/original.mp4`,
     remoteVideoUrl: null,
     transcriptOriginal: "Complete spoken script.",
@@ -373,7 +375,7 @@ test("a finalized TokScript tool error is not retried as a whole fetch", async (
 async function pipeline(overrides = {}) {
   const video = {
     id: "pipeline-test", productId: "product", sourceType: "tiktok",
-    sourceUrl: "https://www.tiktok.com/@demo/video/123", analysisMode: "product_doc",
+    sourceUrl: "https://www.tiktok.com/@demo/video/123", analysisMode: "full",
     originalPath: "pipeline-test/original.mp4", transcriptOriginal: "The TokScript original speech.",
     transcriptZh: "", attemptCount: 1, status: "queued", title: "test",
   };
@@ -390,7 +392,7 @@ async function pipeline(overrides = {}) {
     resolveMediaPath: path => path,
     validateCompleteVideoForQwen: async () => ({ duration: 8, videoCodec: "h264", audioCodec: "aac" }),
     extractVideoAssets: async () => ({ duration: 8, scenes: [{ shotIndex: 1, startSeconds: 0, endSeconds: 8 }] }),
-    analyzeVideoWithQwen: async () => ({ summary: "视频结论", hook: { description: "展示产品" } }),
+    analyzeVideoWithQwen: async () => ({ summary: "视频结论", hook: { description: "展示产品" }, scores: {}, scenes: [{ shotIndex: 1 }] }),
     translateTranscriptWithQwen: async () => "TokScript 中文翻译",
     syncVideoToProductDocument: async () => deliveries.push({ status: video.status, translation: video.transcriptZh }),
     enqueueVideos: ids => enqueued.push(...ids),
@@ -434,6 +436,7 @@ test("video success does not wait for translation or use a translation invented 
   const p = await pipeline({
     analyzeVideoWithQwen: async () => ({
       summary: "视频结论", hook: { description: "产品演示" }, translationZh: "无口播",
+      scores: {}, scenes: [{ shotIndex: 1 }],
     }),
     translateTranscriptWithQwen: () => {
       translations += 1;
@@ -517,7 +520,7 @@ test("no voiceover does not skip complete-video analysis or trigger another tran
     analyzeVideoWithQwen: async input => {
       videoCalls += 1;
       assert.equal(input.localVideoPath, "pipeline-test/qwen-full-video.mp4");
-      return { summary: "纯画面产品演示", hook: { description: "直接展示使用过程" } };
+      return { summary: "纯画面产品演示", hook: { description: "直接展示使用过程" }, scores: {}, scenes: [{ shotIndex: 1 }] };
     },
     translateTranscriptWithQwen: async () => { translationCalls += 1; return "unexpected"; },
   });
@@ -582,7 +585,7 @@ test("a newly downloaded fallback file reaches Qwen while the TokScript translat
       videoCalls += 1;
       assert.equal(input.localVideoPath, "pipeline-test/qwen-full-video.mp4");
       assert.equal("remoteVideoUrl" in input, false);
-      return { summary: "视频结论", hook: { description: "产品演示" } };
+      return { summary: "视频结论", hook: { description: "产品演示" }, scores: {}, scenes: [{ shotIndex: 1 }] };
     },
   });
   p.video.originalPath = "";
@@ -656,7 +659,8 @@ test("TokScript speech failure still delivers a video and records separate stage
     await p.run();
     assert.equal(p.video.status,"completed"); assert.equal(p.video.originalPath,"pipeline-test/original.mp4");
     assert.equal(p.video.transcriptZh,""); assert.equal(translations,0);
-    assert.equal(analyses,mode === "product_doc" ? 1 : 0);
+    assert.equal(analyses,0, "both handcards and task tables skip video models");
+    assert.ok(stages.some(([, ,stage,state])=>stage === "analysis" && state === "skipped"));
     assert.ok(stages.some(([, ,stage,state])=>stage === "download" && state === "completed"));
     assert.ok(stages.some(([, ,stage,state])=>stage === "transcript" && state === "failed"));
     assert.ok(stages.some(([, ,stage,state])=>stage === "translation" && state === "skipped"));
@@ -671,3 +675,54 @@ test("a translation error is durable and cannot replace the successful video res
   assert.equal(p.video.status,"completed"); assert.equal(p.video.transcriptZh,"");
   assert.doesNotMatch(JSON.stringify(stages),/secret provider body/);
 });
+
+for (const cachedFile of [true, false]) {
+  for (const providerChinese of [true, false]) {
+    test(`handcard skips every video-analysis step and preserves file/translation: cached=${cachedFile}, Chinese=${providerChinese}`, async () => {
+      const stages = [];
+      let fetches = 0, downloads = 0, translations = 0, forbiddenCalls = 0;
+      const forbidden = () => { forbiddenCalls += 1; throw Error("handcards must not enter the analysis pipeline"); };
+      const p = await pipeline({
+        recordVideoStage: (...args) => stages.push(args),
+        fetchTikTok: async (_url, _signal, options) => {
+          fetches += 1;
+          assert.equal(options.includeCover, false);
+          assert.equal(options.timeoutMs, 90_000);
+          return { downloadUrl: "https://cdn.test/video.mp4", transcript: "The TokScript original speech.",
+            transcriptZh: providerChinese ? "TokScript 已返回中文版" : "", segments: [], stats: {}, raw: {} };
+        },
+        downloadTikTokVideoWithFallback: async input => {
+          downloads += 1;
+          assert.equal(input.requireAudio, true, "keep the existing original audio-track protection");
+          return { relativePath: "pipeline-test/original.mp4", source: "TokScript", failures: [] };
+        },
+        translateTranscriptWithQwen: async ({ transcript }) => {
+          translations += 1;
+          assert.equal(transcript, "The TokScript original speech.");
+          return "TokScript 原口播的中文翻译";
+        },
+        extractVideoAssets: forbidden, prepareLocalVideoForQwen: forbidden,
+        validateCompleteVideoForQwen: forbidden, analyzeVideoWithQwen: forbidden,
+        replaceScenes: forbidden, createSceneClip: forbidden, learnFromVideo: forbidden,
+      });
+      p.video.analysisMode = "product_doc";
+      p.video.summary = "已有历史分析";
+      p.video.analysis_json = '{"summary":"已有历史分析"}';
+      p.video.transcriptZh = cachedFile && providerChinese ? "TokScript 已返回中文版" : "";
+      if (!cachedFile) { p.video.originalPath = ""; p.video.transcriptOriginal = ""; }
+      await p.run();
+      await waitFor(() => p.deliveries.some(d => d.status === "completed" && d.translation));
+      assert.equal(forbiddenCalls, 0);
+      assert.equal(fetches, cachedFile ? 0 : 1);
+      assert.equal(downloads, cachedFile ? 0 : 1);
+      assert.equal(translations, providerChinese ? 0 : 1);
+      assert.equal(p.video.originalPath, "pipeline-test/original.mp4");
+      assert.equal(p.video.summary, "已有历史分析", "retirement must not delete saved historical results");
+      assert.equal(p.video.analysis_json, '{"summary":"已有历史分析"}');
+      assert.equal(p.patches.some(patch => "analysis_json" in patch || "summary" in patch || "score_traffic" in patch), false);
+      assert.ok(stages.some(([, ,stage,state]) => stage === "analysis" && state === "skipped"));
+      assert.equal(stages.some(([, ,stage,state]) => stage === "analysis" && state === "running"), false);
+      assert.deepEqual(p.enqueued, []);
+    });
+  }
+}

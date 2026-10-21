@@ -17,12 +17,10 @@ import {
   markProductDocumentVideoRowsInitialized,
   saveProductDocumentVideoRow,
   setCachedDocumentRevision,
-  updateVideo,
 } from "@/lib/database";
 import { listFeishuDocumentBlocks, updateFeishuTextBlock } from "@/lib/feishu/document";
 import { ensureFeishuVideoPreview } from "@/lib/feishu/docx-file";
 import { ensureFeishuConnection, getConnectedFeishuChannel } from "@/lib/feishu/runtime";
-import { conciseProductDocAnalysis } from "@/lib/product-doc-analysis";
 import { enqueueVideos } from "@/lib/queue";
 import { NO_PRODUCT_VOICEOVER_TRANSCRIPT } from "@/lib/transcript-validation";
 import type { Product, VideoRecord } from "@/lib/types";
@@ -318,7 +316,7 @@ async function syncProductDocumentUnlocked(
   let deliveryFailed = false;
 
   // 20秒发现目标（审计12.3节）：常规轮询先花一次便宜的元数据调用确认文档真的改过，没变就直接
-  // 跳过整份文档的表格深读。onlyVideoId 是"视频刚分析完，立刻回填这一行"的即时投递路径，
+  // 跳过整份文档的表格深读。onlyVideoId 是"视频结果就绪，立刻回填这一行"的即时投递路径，
   // 不能被这个缓存挡住，所以永远走真实深读。
   let currentRevisionId: number | null = null;
   if (!options.onlyVideoId) {
@@ -341,19 +339,24 @@ async function syncProductDocumentUnlocked(
   const cells = table.table?.cells || [];
   for (let rowStart = 4; rowStart + 3 < cells.length; rowStart += 4) {
     try {
-      const row = await Promise.all(cells.slice(rowStart, rowStart + 4).map((cellId, index) =>
-        index >= 2 ? resultCellText(cellId, readBlock) : cellText(cellId, readBlock)));
-      const analysisCellId = cells[rowStart + 2];
+      // The retired analysis column is entirely user-owned. Do not inspect its
+      // children, require a text paragraph, write a result/error, or use it as
+      // a retry control. Its contents must not affect file/translation delivery.
+      const [linkCell, videoCell, translationCell] = await Promise.all([
+        cellText(cells[rowStart], readBlock),
+        cellText(cells[rowStart + 1], readBlock),
+        resultCellText(cells[rowStart + 3], readBlock),
+      ]);
       const translationCellId = cells[rowStart + 3];
-      const linkBlockId = row[0].textId;
-      if (linkBlockId && !row[0].text.trim()) {
+      const linkBlockId = linkCell.textId;
+      if (linkBlockId && !linkCell.text.trim()) {
         if (!options.onlyVideoId) await deleteProductDocumentVideoRow(product.documentId, linkBlockId);
         continue;
       }
-      const link = normalizeTikTokUrl(row[0].text);
+      const link = normalizeTikTokUrl(linkCell.text);
       // The second cell is a video-only container and may legitimately have no
-      // text block. The other three columns remain text-backed.
-      if (!link || !linkBlockId || !row[2].textId || !row[3].textId) continue;
+      // text block. Only the link and translation need text-backed cells.
+      if (!link || !linkBlockId || !translationCell.textId) continue;
       const binding = await getProductDocumentVideoRow(product.documentId, linkBlockId);
       let video = binding?.sourceUrl === link ? await getVideo(binding.videoId, false) : null;
       if (binding && !video) {
@@ -379,8 +382,8 @@ async function syncProductDocumentUnlocked(
       }
       // This cell is now reserved for the playable MP4. Remove legacy textual
       // states once, without touching the preview/view children.
-      if (row[1].textId && row[1].text) {
-        await updateIfChanged(client, product.documentId, row[1].textId, row[1].text, "");
+      if (videoCell.textId && videoCell.text) {
+        await updateIfChanged(client, product.documentId, videoCell.textId, videoCell.text, "");
       }
       if (!video) {
         const legacy = migrationMode && !binding ? await getVideoBySourceUrl(link, product.id) : null;
@@ -443,7 +446,7 @@ async function syncProductDocumentUnlocked(
         }
         attachmentErrors.delete(attachmentErrorKey);
       } catch (error) {
-        // Preview delivery is optional and must never block analysis/results.
+        // Preview delivery retries independently and must never block translation.
         deliveryFailed = true;
         if (!attachmentErrors.has(attachmentErrorKey)) {
           const message = error instanceof Error ? error.message : "视频附件上传失败";
@@ -454,30 +457,17 @@ async function syncProductDocumentUnlocked(
       }
 
       // Preview upload can take long enough for a user to edit the row or for
-      // another explicit action to start/finish this video. Never make a retry
-      // decision from the pre-upload task snapshot.
+      // another explicit action to start/finish this video. Read the current
+      // translation/status rather than the pre-upload task snapshot.
       const refreshedVideo = await getVideo(video.id, false);
       if (!refreshedVideo) continue;
       video = refreshedVideo;
 
-      if (video.status === "stopped") {
-        if (!row[2].text.trim()) {
-          await updateBlankResultCell(
-            client,
-            product.documentId,
-            analysisCellId,
-            "已停止，请重新粘贴视频链接",
-            { linkBlockId, sourceUrl: video.sourceUrl || "" },
-          );
-        }
-        result.failed += 1;
-        continue;
-      }
-      // Translation and the original file are deliverable while analysis is
-      // running, after success, or after failure. All text writes still check
+      // Translation and the original file are deliverable during processing,
+      // after success, failure, or stop. All text writes still check
       // the latest row identity/revision and preserve nonempty user content.
       const transcriptZh = String(video.transcriptZh || "").trim();
-      if (!row[3].text.trim() && transcriptZh) {
+      if (!translationCell.text.trim() && transcriptZh) {
         // Shorten only the provider's exact sentinel at display time. Keep
         // stored transcripts, ordinary text and existing user cells unchanged.
         await updateBlankResultCell(
@@ -486,72 +476,9 @@ async function syncProductDocumentUnlocked(
           { linkBlockId, sourceUrl: video.sourceUrl || "" },
         );
       }
-      if (video.status === "failed" && video.analysisMode === "product_doc") {
-        // Qwen's retry budget belongs to this one video task. A terminal task
-        // is requeued only when the user clears the delivered failure cell.
-        if (/^失败：/.test(row[2].text)) {
-          const expectedAttemptNumber = video.attemptCount;
-          const latestFailure = await latestRowText(client, product.documentId, linkBlockId, analysisCellId);
-          const currentBinding = await getProductDocumentVideoRow(product.documentId, linkBlockId);
-          const currentVideo = await getVideo(video.id, false);
-          if (!video.productDocFailureDelivered
-            && rowMatchesSource(latestFailure.linkText, video.sourceUrl)
-            && /^失败：/.test(latestFailure.resultText)
-            && currentBinding?.videoId === video.id
-            && currentBinding.sourceUrl === video.sourceUrl
-            && currentVideo?.status === "failed"
-            && currentVideo.analysisMode === "product_doc"
-            && currentVideo.attemptCount === expectedAttemptNumber) {
-            await updateVideo(video.id, { product_doc_failure_delivered: 1 });
-          }
-        } else if (!row[2].text.trim() && video.productDocFailureDelivered) {
-          // Delivery of a late translation must never restart analysis or
-          // refill a failure cell the user cleared to request a manual retry.
-          if (options.onlyVideoId) continue;
-          const expectedAttemptNumber = video.attemptCount;
-          const latestCell = await latestRowText(client, product.documentId, linkBlockId, analysisCellId);
-          const currentVideo = await getVideo(video.id, false);
-          const currentBinding = await getProductDocumentVideoRow(product.documentId, linkBlockId);
-          if (rowMatchesSource(latestCell.linkText, video.sourceUrl)
-            && !latestCell.resultText.trim()
-            && currentBinding?.videoId === video.id
-            && currentBinding.sourceUrl === video.sourceUrl
-            && currentVideo?.status === "failed"
-            && currentVideo.sourceUrl === video.sourceUrl
-            && currentVideo.analysisMode === "product_doc"
-            && currentVideo.productDocFailureDelivered
-            && currentVideo.attemptCount === expectedAttemptNumber) {
-            await updateVideo(video.id, { product_doc_failure_delivered: 0, error_message: null });
-            await enqueueVideos([video.id], { restart: true });
-            result.queued += 1;
-            continue;
-          }
-        } else if (!row[2].text.trim()) {
-          const reason = String(video.errorMessage || "分析失败").replace(/\s+/g, " ").slice(0, 70);
-          const delivered = await updateBlankResultCell(
-            client,
-            product.documentId,
-            analysisCellId,
-            `失败：${reason}`,
-            { linkBlockId, sourceUrl: video.sourceUrl || "" },
-          );
-          if (delivered) await updateVideo(video.id, { product_doc_failure_delivered: 1 });
-        }
-      }
-
       if (video.status === "completed") {
-        // Analysis and translation cells are user-owned once they contain text.
-        if (!row[2].text.trim()) {
-          await updateBlankResultCell(
-            client,
-            product.documentId,
-            analysisCellId,
-            conciseProductDocAnalysis(video),
-            { linkBlockId, sourceUrl: video.sourceUrl || "" },
-          );
-        }
         result.completed += 1;
-      } else if (video.status === "failed") {
+      } else if (video.status === "failed" || video.status === "stopped") {
         result.failed += 1;
       }
       rowErrors.delete(`${product.documentId}:${rowStart}`);
@@ -582,7 +509,7 @@ export function syncProductDocument(
   return withProductDocumentLock(product.documentId, () => syncProductDocumentUnlocked(client, product, options));
 }
 
-/** Deliver currently available results to this exact row; never retry analysis. */
+/** Deliver currently available file/translation to this exact row; never restart processing. */
 export async function syncVideoToProductDocument(videoId: string) {
   const video = await getVideo(videoId);
   if (!video) return false;

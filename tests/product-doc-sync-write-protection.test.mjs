@@ -67,7 +67,6 @@ async function loadSyncModule() {
     export const updateFeishuTextBlock = (...args) => hooks().updateFeishuTextBlock?.(...args);
     export const ensureFeishuConnection = (...args) => hooks().ensureFeishuConnection?.(...args) || null;
     export const getConnectedFeishuChannel = (...args) => hooks().getConnectedFeishuChannel?.(...args) || null;
-    export const conciseProductDocAnalysis = (...args) => hooks().conciseProductDocAnalysis?.(...args) || "自动视频分析";
     export const enqueueVideos = (...args) => hooks().enqueueVideos?.(...args);
     export const resolveMediaPath = (...args) => hooks().resolveMediaPath?.(...args) || args[0];
     export const ensureFeishuVideoPreview = (...args) => hooks().ensureFeishuVideoPreview?.(...args) || false;
@@ -86,7 +85,6 @@ async function loadSyncModule() {
     .replaceAll('"@/lib/database"', JSON.stringify(stubUrl))
     .replaceAll('"@/lib/feishu/document"', JSON.stringify(stubUrl))
     .replaceAll('"@/lib/feishu/runtime"', JSON.stringify(stubUrl))
-    .replaceAll('"@/lib/product-doc-analysis"', JSON.stringify(stubUrl))
     .replaceAll('"@/lib/transcript-validation"', JSON.stringify(transcriptValidationUrl))
     .replaceAll('"@/lib/queue"', JSON.stringify(stubUrl));
   compiled = compiled.replaceAll('"@/lib/video-processing"', JSON.stringify(stubUrl));
@@ -178,6 +176,26 @@ async function withResultCellFixture(run, overrides = {}) {
 
 const manualParagraph = () => ({ block_type: 2, text: { elements: [{ text_run: { content: "人工第二段" } }] } });
 
+for (const status of ["downloading", "analyzing", "failed", "stopped", "completed"]) {
+  test(`retired analysis column is never read or written and cannot block file/translation: ${status}`, async () => {
+    await withResultCellFixture(async ({ blocks, ids, reads, writes, state, enqueued, sync }) => {
+      const analysisCell = blocks.find(b => b.block_id === "row-1-analysis");
+      // A deleted paragraph / image-only cell used to prevent the whole row
+      // from processing. The retired column must not be inspected at all.
+      analysisCell.children = ["unreadable-analysis-child"];
+      const before = structuredClone(analysisCell);
+      let previews = 0;
+      state.onPreview = () => { previews += 1; };
+      await sync();
+      assert.equal(previews, 1);
+      assert.deepEqual(writes, [{ id: ids.translation, content: "自动中文" }]);
+      assert.equal(reads.some(r => r.id.includes("analysis")), false);
+      assert.deepEqual(analysisCell, before);
+      assert.deepEqual(enqueued, []);
+    }, { status, productDocFailureDelivered: true, analysis: { summary: "旧缓存分析" }, summary: "旧分析结果" });
+  });
+}
+
 for (const status of ["analyzing", "failed", "completed"]) {
   test(`handcard voiceover label: exact TokScript marker becomes no voiceover during ${status}`, async () => {
     await withResultCellFixture(async ({ ids, video, writes, enqueued, updates, sync }) => {
@@ -187,7 +205,7 @@ for (const status of ["analyzing", "failed", "completed"]) {
       assert.equal(video.transcriptZh, storedTranscript, "display formatting must not change stored provider data");
       assert.equal(updates.some(p => "transcript_zh" in p || "transcript_original" in p), false);
       assert.deepEqual(enqueued, [], "formatting must not rerun analysis");
-      if (status === "completed") assert.ok(writes.some(w => w.id === ids.analysis && w.content === "自动视频分析"));
+      assert.equal(writes.some(w => w.id === ids.analysis), false, "analysis is never written, even after success");
     }, { status, transcriptZh: `  ${NO_PRODUCT_VOICEOVER_TRANSCRIPT}\n` });
   });
 }
@@ -200,7 +218,7 @@ for (const timing of ["before scan", "during preview"]) {
       else state.onPreview = fill;
       await sync();
       assert.equal(writes.some(w => w.id === ids.translation), false);
-      assert.ok(writes.some(w => w.id === ids.analysis), "the independent empty analysis still fills");
+      assert.deepEqual(writes, [], "neither a manual translation nor the retired analysis cell may be changed");
     }, { transcriptZh: NO_PRODUCT_VOICEOVER_TRANSCRIPT });
   });
 }
@@ -255,12 +273,13 @@ for (const [kind, content] of [
 
 test("whole-cell guard checks every paragraph at the write revision and still fills truly empty cells", async () => {
   await withResultCellFixture(async ({ append, state, reads, writes, ids, sync }) => {
-    const extra = append("analysis", { text: { elements: [{ text_run: { content: " \n　 " } }] } });
+    const extra = append("translation", { text: { elements: [{ text_run: { content: " \n　 " } }] } });
     state.onPreview = () => { state.revision = 20; };
     await sync();
-    assert.deepEqual(writes, [{ id: ids.translation, content: "自动中文" }, { id: ids.analysis, content: "自动视频分析" }]);
-    assert.ok(reads.some(r => r.id === "row-1-analysis" && r.revision === 21));
-    assert.ok(reads.some(r => r.id === extra.block_id && r.revision === 21));
+    assert.deepEqual(writes, [{ id: ids.translation, content: "自动中文" }]);
+    assert.ok(reads.some(r => r.id === "row-1-translation" && r.revision === 20));
+    assert.ok(reads.some(r => r.id === extra.block_id && r.revision === 20));
+    assert.equal(reads.some(r => r.id.includes("-analysis")), false, "the retired analysis cell is never deep-read");
   });
 });
 
@@ -268,8 +287,8 @@ test("whole-cell guard uses the current empty paragraph rather than a removed sc
   await withResultCellFixture(async ({ blocks, append, state, writes, sync }) => {
     let replacement;
     state.onPreview = () => {
-      replacement = append("analysis", { text: { elements: [] } });
-      blocks.find(b => b.block_id === "row-1-analysis").children = [replacement.block_id];
+      replacement = append("translation", { text: { elements: [] } });
+      blocks.find(b => b.block_id === "row-1-translation").children = [replacement.block_id];
       state.revision += 1;
     };
     await sync();
@@ -432,7 +451,7 @@ test("writes to the same Feishu document are serialized", async () => {
   assert.equal(maxActive, 1);
 });
 
-test("completed document sync fills only independently blank analysis and translation cells", async () => {
+test("completed document sync only fills blank translations and never writes analysis", async () => {
   const rows = [
     { analysis: "人工分析一", translation: "人工翻译一", transcript: "自动翻译一" },
     { analysis: "人工分析二", translation: "", transcript: "自动翻译二" },
@@ -462,7 +481,6 @@ test("completed document sync fills only independently blank analysis and transl
     listFeishuDocumentBlocks: () => blocks,
     getConnectedFeishuChannel: () => ({ rawClient: {} }),
     getVideoBySourceUrl: (url) => videos.get(url),
-    conciseProductDocAnalysis: (video) => `自动分析-${video.id}`,
     ensureFeishuConnection: () => ({ rawClient: {} }),
     updateFeishuTextBlock: async (_client, _documentId, blockId, content) => {
       writes.push({ blockId, content });
@@ -499,7 +517,7 @@ test("completed document sync fills only independently blank analysis and transl
     assert.equal(writes.some((write) => write.blockId === rowTextIds[0].translation), false);
     assert.equal(
       freshReadRequests,
-      17,
+      9,
       "one scan revision plus each writable cell's revision, link, cell and paragraph blocks",
     );
 
@@ -509,17 +527,10 @@ test("completed document sync fills only independently blank analysis and transl
       ["自动翻译二"],
     );
 
-    assert.deepEqual(
-      writes.filter((write) => write.blockId === rowTextIds[2].analysis).map((write) => write.content),
-      ["自动分析-video-3"],
-    );
+    assert.equal(writes.some((write) => write.blockId === rowTextIds[2].analysis), false);
     assert.equal(writes.some((write) => write.blockId === rowTextIds[2].translation), false);
 
-    assert.deepEqual(
-      writes.filter((write) => write.blockId === rowTextIds[3].analysis).map((write) => write.content),
-      ["自动分析-video-4"],
-      "whitespace-only analysis is blank",
-    );
+    assert.equal(writes.some((write) => write.blockId === rowTextIds[3].analysis), false, "even whitespace-only analysis is untouched");
     assert.deepEqual(
       writes.filter((write) => write.blockId === rowTextIds[3].translation).map((write) => write.content),
       ["自动翻译四"],
@@ -661,7 +672,6 @@ test("a newly completed video is delivered to only its bound document row", asyn
       scans.push(documentId);
       return blocks;
     },
-    conciseProductDocAnalysis: () => "直接写入的视频分析",
     updateFeishuTextBlock: async (_client, documentId, blockId, content) => {
       writes.push({ documentId, blockId, content });
     },
@@ -673,7 +683,6 @@ test("a newly completed video is delivered to only its bound document row", asyn
     assert.deepEqual(writes.filter((write) => write.documentId === documentIds[0]), [
       { documentId: documentIds[0], blockId: rowTextIds[0].status, content: "" },
       { documentId: documentIds[0], blockId: rowTextIds[0].translation, content: "直接写入的翻译" },
-      { documentId: documentIds[0], blockId: rowTextIds[0].analysis, content: "直接写入的视频分析" },
     ]);
     assert.deepEqual(writes.filter((write) => write.documentId === documentIds[1]), [], "one task is bound to one document row");
   } finally {
@@ -793,7 +802,6 @@ test("a result cell filled after the table scan is re-read and never overwritten
   globalThis.__productDocSyncWriteProtectionHooks = {
     listFeishuDocumentBlocks: () => blocks,
     getVideoBySourceUrl: () => video,
-    conciseProductDocAnalysis: () => "自动分析",
     updateFeishuTextBlock: async (_client, _documentId, blockId, content) => {
       writes.push({ blockId, content });
     },
@@ -842,7 +850,6 @@ test("automatic result writes carry the freshly read document revision", async (
   globalThis.__productDocSyncWriteProtectionHooks = {
     listFeishuDocumentBlocks: () => blocks,
     getVideoBySourceUrl: () => video,
-    conciseProductDocAnalysis: () => "自动分析",
     updateFeishuTextBlock: async (_client, _documentId, blockId, content, options) => {
       writes.push({ blockId, content, revision: options?.documentRevisionId });
       revision += 1;
@@ -854,7 +861,6 @@ test("automatic result writes carry the freshly read document revision", async (
     assert.deepEqual(writes, [
       { blockId: rowTextIds[0].status, content: "", revision: undefined },
       { blockId: rowTextIds[0].translation, content: "自动翻译", revision: 41 },
-      { blockId: rowTextIds[0].analysis, content: "自动分析", revision: 42 },
     ]);
   } finally {
     delete globalThis.__productDocSyncWriteProtectionHooks;
@@ -966,7 +972,7 @@ test("duplicate document links create independent tasks for each row", async () 
   }
 });
 
-test("failed product-document analysis is reported without automatically requeueing the task", async () => {
+test("failed handcard tasks still deliver translation without writing an analysis error or requeueing", async () => {
   const link = "https://www.tiktok.com/@demo/video/7000000000000000201";
   const { blocks, rowTextIds } = documentBlocks([{ link, status: "旧状态", analysis: "", translation: "" }]);
   const video = {
@@ -1001,21 +1007,20 @@ test("failed product-document analysis is reported without automatically requeue
       await syncModule.syncProductDocument(client, { id: "product-retry", documentId: "document-retry" }),
       { found: 1, queued: 0, completed: 0, failed: 1 },
     );
-    assert.deepEqual(updates, [{ product_doc_failure_delivered: 1 }]);
+    assert.deepEqual(updates, []);
     assert.deepEqual(enqueued, []);
     assert.deepEqual(writes, [
       { blockId: rowTextIds[0].status, content: "" },
       { blockId: rowTextIds[0].translation, content: "这是 TokScript 原口播的中文翻译。" },
-      { blockId: rowTextIds[0].analysis, content: "失败：临时失败" },
     ]);
   } finally {
     delete globalThis.__productDocSyncWriteProtectionHooks;
   }
 });
 
-test("a stopped document task stays stopped and is shown without automatic requeue", async () => {
+test("a stopped document task stays stopped without writing analysis or automatic requeue", async () => {
   const link = "https://www.tiktok.com/@demo/video/7000000000000000250";
-  const { blocks, rowTextIds } = documentBlocks([{ link, status: "", analysis: "", translation: "" }]);
+  const { blocks } = documentBlocks([{ link, status: "", analysis: "", translation: "" }]);
   const video = {
     id: "stopped-video",
     productId: "product-stopped",
@@ -1048,13 +1053,13 @@ test("a stopped document task stays stopped and is shown without automatic reque
       { found: 1, queued: 0, completed: 0, failed: 1 },
     );
     assert.deepEqual(enqueued, []);
-    assert.deepEqual(writes, [{ blockId: rowTextIds[0].analysis, content: "已停止，请重新粘贴视频链接" }]);
+    assert.deepEqual(writes, []);
   } finally {
     delete globalThis.__productDocSyncWriteProtectionHooks;
   }
 });
 
-test("clearing a persistently delivered terminal error requests a fresh analysis after restart", async () => {
+test("clearing a legacy terminal error never requests a fresh analysis after retirement", async () => {
   const link = "https://www.tiktok.com/@demo/video/7000000000000000202";
   const { blocks } = documentBlocks([{ link, status: "", analysis: "", translation: "" }]);
   const video = {
@@ -1086,17 +1091,17 @@ test("clearing a persistently delivered terminal error requests a fresh analysis
   try {
     assert.deepEqual(
       await syncModule.syncProductDocument(client, { id: "product-terminal", documentId: "document-terminal" }),
-      { found: 1, queued: 1, completed: 0, failed: 0 },
+      { found: 1, queued: 0, completed: 0, failed: 1 },
     );
-    assert.deepEqual(updates, [{ product_doc_failure_delivered: 0, error_message: null }]);
-    assert.deepEqual(enqueued, [video.id]);
+    assert.deepEqual(updates, []);
+    assert.deepEqual(enqueued, []);
     assert.deepEqual(writes, []);
   } finally {
     delete globalThis.__productDocSyncWriteProtectionHooks;
   }
 });
 
-test("an observed failure cell restores the durable manual-retry marker", async () => {
+test("a legacy failure in the analysis cell is preserved without restoring the retired retry control", async () => {
   const link = "https://www.tiktok.com/@demo/video/7000000000000000203";
   const { blocks } = documentBlocks([{ link, status: "", analysis: "失败：此前已写入", translation: "" }]);
   const video = {
@@ -1127,7 +1132,7 @@ test("an observed failure cell restores the durable manual-retry marker", async 
       await syncModule.syncProductDocument(client, { id: "product-observed", documentId: "document-observed" }),
       { found: 1, queued: 0, completed: 0, failed: 1 },
     );
-    assert.deepEqual(updates, [{ product_doc_failure_delivered: 1 }]);
+    assert.deepEqual(updates, []);
     assert.deepEqual(enqueued, []);
   } finally {
     delete globalThis.__productDocSyncWriteProtectionHooks;
@@ -1256,7 +1261,6 @@ test("changing link A to B during preview prevents A's preview and completed res
     listFeishuDocumentBlocks: () => blocks,
     getVideoBySourceUrl: () => video,
     getVideo: () => video,
-    conciseProductDocAnalysis: () => "A的自动分析",
     updateFeishuTextBlock: async (_client, _documentId, blockId, content) => writes.push({ blockId, content }),
     ensureFeishuVideoPreview: async (input) => {
       bindingChecks.push(await input.validateBinding());

@@ -11,7 +11,6 @@ export const dynamic = "force-dynamic";
 
 const TEMPLATE_ORDER: Array<{ slug: string; label: string; defaultTemplate: string; source: string }> = [
   { slug: PROMPT_TEMPLATE_SLUGS.full, label: PROMPT_TEMPLATE_LABELS.full, defaultTemplate: DEFAULT_PROMPT_TEMPLATES.full, source: "lib/analysis.ts · analyzeVideo() · full 模式" },
-  { slug: PROMPT_TEMPLATE_SLUGS.product_doc, label: PROMPT_TEMPLATE_LABELS.product_doc, defaultTemplate: DEFAULT_PROMPT_TEMPLATES.product_doc, source: "lib/analysis.ts · analyzeVideo() · product_doc 模式" },
   { slug: TRANSCRIPT_TRANSLATION_PROMPT_SLUG, label: "口播翻译", defaultTemplate: DEFAULT_TRANSCRIPT_TRANSLATION_TEMPLATE, source: "lib/providers/qwen.ts · translateTranscriptWithQwen()" },
   { slug: SEGMENT_TRANSLATION_PROMPT_SLUG, label: "分段口播翻译（字幕用）", defaultTemplate: DEFAULT_SEGMENT_TRANSLATION_TEMPLATE, source: "lib/providers/qwen.ts · translateSegmentsWithQwen()" },
 ];

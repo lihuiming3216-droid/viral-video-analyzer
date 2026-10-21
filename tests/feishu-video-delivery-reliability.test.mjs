@@ -225,7 +225,7 @@ test("a delivery pass scans persisted jobs but skips videos that are not termina
   assert.equal(pending.has("terminal-row"), false);
   assert.equal(pending.has("active-row"), true, "a processing video must remain pending for a later scan");
 });
-test("failed-video delivery redacts credentials before writing to Base", async () => {
+test("failed handcard delivery never writes an analysis error or provider credentials to Base", async () => {
   const pending = new Map([["record-a", delivery("record-a")]]);
   let writtenFields;
   globalThis.__feishuVideoDeliveryTestHooks = {
@@ -245,7 +245,7 @@ test("failed-video delivery redacts credentials before writing to Base", async (
     deleteFeishuAutomationJob: (job) => pending.delete(job.recordId),
   };
   assert.equal(await automation.completeFeishuAutomation("video-1"), true);
-  assert.match(writtenFields.视频分析, /已隐藏/);
+  assert.equal(Object.hasOwn(writtenFields, "视频分析"), false);
   assert.doesNotMatch(JSON.stringify(writtenFields), /sk-secret-value|also-secret|Bearer/i);
   assert.equal(pending.size, 0);
 });

@@ -57,16 +57,18 @@ export async function runPromptTestAction(_prev: PromptTestResult | null, formDa
 
     const capture = await getPromptDebugCapture(captureId);
     if (!capture) return { ok: false, error: "这条历史数据已经找不到了" };
+    if (capture.inputs.mode === "product_doc") {
+      return { ok: false, error: "手卡视频分析已停用，历史输入不再提交分析；中文翻译和视频文件不受影响" };
+    }
     if (!capture.qwenVideoPath) return { ok: false, error: "这条历史数据没有保留本地视频文件，无法重新请求" };
     const renderedPrompt = renderTemplate(template, capture.inputs);
     const localVideoPath = resolveMediaPath(capture.qwenVideoPath);
     let diagnostic: QwenRequestDiagnostic | undefined;
     const startedAt = Date.now();
-    const purpose = capture.inputs.mode === "product_doc" ? "product_doc" : "full";
     const result = await analyzeVideoWithQwen({
       prompt: renderedPrompt,
       localVideoPath,
-      purpose,
+      purpose: "full",
       onDiagnostic: (value) => { diagnostic = value; },
     });
     return {

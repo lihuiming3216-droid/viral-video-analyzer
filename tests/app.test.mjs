@@ -51,13 +51,12 @@ test("new video insert keeps its columns and bound values aligned", async () => 
   assert.equal(placeholders.length, columns.length - 2, "status and stage are SQL literals; every other video column needs a bound value");
 });
 
-test("product documents auto-sync in lightweight mode and keep the manual prop area", async () => {
-  const [instrumentation, sync, analysis, document, formatter, qwen, tokscript, processing] = await Promise.all([
+test("product documents only sync files and translation while full analysis and the manual prop area remain", async () => {
+  const [instrumentation, sync, analysis, document, qwen, tokscript, processing] = await Promise.all([
     readFile(new URL("instrumentation.ts", root), "utf8"),
     readFile(new URL("lib/feishu/product-doc-sync.ts", root), "utf8"),
     readFile(new URL("lib/analysis.ts", root), "utf8"),
     readFile(new URL("lib/feishu/document.ts", root), "utf8"),
-    readFile(new URL("lib/product-doc-analysis.ts", root), "utf8"),
     readFile(new URL("lib/providers/qwen.ts", root), "utf8"),
     readFile(new URL("lib/providers/tokscript.ts", root), "utf8"),
     readFile(new URL("lib/video-processing.ts", root), "utf8"),
@@ -66,13 +65,12 @@ test("product documents auto-sync in lightweight mode and keep the manual prop a
   assert.match(sync, /getVideoBySourceUrl/);
   assert.match(sync, /中文翻译\|原口播文案/);
   assert.match(sync, /setTimeout\(resolve, 380\)/);
-  assert.match(analysis, /qwenMaxTokens = analysisMode === "product_doc"\s*\? 2_000\s*: Math\.min\(16_000, 2_500 \+ assets\.scenes\.length \* 700\)/);
-  assert.match(analysis, /learningContext = analysisMode === "product_doc" \? null/);
+  assert.match(analysis, /qwenMaxTokens = Math\.min\(16_000, 2_500 \+ assets\.scenes\.length \* 700\)/);
+  assert.match(analysis, /if \(analysisMode !== "full"\)/);
+  assert.doesNotMatch(sync, /analysisCellId|conciseProductDocAnalysis|product_doc_failure_delivered/);
   assert.match(analysis, /includeCover: analysisMode !== "product_doc"/);
   assert.match(analysis, /中文翻译由 TokScript 独立链路处理/);
   assert.match(analysis, /禁止生成 translationZh/);
-  assert.match(formatter, /爆点/);
-  assert.doesNotMatch(formatter, /原视频链接|复拍口播稿|分镜脚本/);
   assert.match(qwen, /max_tokens: input\.maxTokens \|\| 4_500/);
   assert.match(qwen, /type: "video_url"/);
   assert.match(qwen, /fps: qwenVideoFps\(\)/);

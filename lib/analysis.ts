@@ -119,25 +119,15 @@ function normalizeAnalysis(
 
 export const PROMPT_TEMPLATE_SLUGS = {
   full: "video_analysis_full",
-  product_doc: "video_analysis_product_doc",
 } as const;
 
-export const PROMPT_TEMPLATE_LABELS: Record<"full" | "product_doc", string> = {
+export const PROMPT_TEMPLATE_LABELS: Record<"full", string> = {
   full: "视频完整分析（full 模式）",
-  product_doc: "视频精简分析（product_doc 模式）",
 };
 
 // {{PRODUCT_JSON}}/{{TIMELINE_JSON}}/{{LEARNING_JSON}} 是真实数据的占位符，运维后台的 Prompt
 // 调试台编辑这份模板时可以改动周围的说明文字，但这三个占位符会在真正请求时被替换成当次的真实输入。
-export const DEFAULT_PROMPT_TEMPLATES: Record<"full" | "product_doc", string> = {
-  product_doc: `你是 TikTok 带货短视频拆解专家。请用中文输出极简的产品样片分析。
-
-只输出：核心判断、开头钩子、分析爆点、内容结构、产品呈现、用户痛点或情绪、转化方式和可借鉴点。中文翻译由 TokScript 独立链路处理，本请求禁止生成 translationZh 或重复翻译口播。不要输出评分、原视频链接、复拍口播稿或分镜脚本。不要臆造页面或视频没有提供的信息。
-所有分析都用短语，不写解释句；只保留“动作+结果”。summary 不超过30个汉字；hook.description、每条 viralPoints、strengths 和 structureFormula 均不超过18个汉字。删除“通过、进行、能够、可以、有效提升、有助于、让用户”等套话。
-严格使用以下 JSON 结构：{"summary":"","language":"","hook":{"timeRange":"","type":"","description":"","whyItWorks":""},"viralPoints":[{"timeRange":"","description":"","reason":""}],"strengths":[""],"structureFormula":""}。
-
-产品：{{PRODUCT_JSON}}
-镜头时间轴：{{TIMELINE_JSON}}`,
+export const DEFAULT_PROMPT_TEMPLATES: Record<"full", string> = {
   full: `你是 TikTok 带货短视频拆解专家。请用中文输出视频分析。中文翻译由 TokScript 独立链路处理，本请求禁止生成 translationZh 或重复翻译口播。
 
 目标：分别判断流量潜力和带货转化，不要因为播放量高就默认转化高。分析每个镜头的画面、声音、清晰度、美感、光线、产品主体是否清晰、节奏、情绪和商业作用。
@@ -198,22 +188,13 @@ export async function renderAnalysisPrompt(input: {
   product: Product;
   scenes: Array<{ shotIndex: number; startSeconds: number; endSeconds: number }>;
   learningContext: unknown;
-  mode: "full" | "product_doc";
+  mode: "full";
 }) {
   const timeline = input.scenes.map((scene) => ({
     shotIndex: scene.shotIndex,
     timeRange: `${formatTime(scene.startSeconds)}–${formatTime(scene.endSeconds)}`,
   }));
-  const productPayload = input.mode === "product_doc"
-    ? {
-      name: input.product.name,
-      pid: input.product.pid,
-      coreFunctions: input.product.coreFunctions.slice(0, 3),
-      usageMethod: input.product.usageMethod,
-      targetAudience: input.product.targetAudience,
-      usageScenes: input.product.usageScenes,
-    }
-    : input.product;
+  const productPayload = input.product;
   const slug = PROMPT_TEMPLATE_SLUGS[input.mode];
   const templateRow = await getPromptTemplate(slug, PROMPT_TEMPLATE_LABELS[input.mode], DEFAULT_PROMPT_TEMPLATES[input.mode]);
   const prompt = templateRow.template
@@ -296,7 +277,6 @@ function userFacingAnalysisError(error: unknown, qwenRequests: number) {
 function isUsableAnalysis(
   value: Record<string, unknown> | undefined,
   sceneCount: number,
-  mode: "full" | "product_doc",
 ) {
   if (!value || typeof value.summary !== "string" || !value.summary.trim()) return false;
   // TokScript owns the transcript translation now. Qwen's video result may
@@ -304,20 +284,6 @@ function isUsableAnalysis(
   // valid video analysis unusable.
   const scores = value.scores;
   const scenes = value.scenes;
-  // The table path deliberately asks for a compact object without scene rows
-  // or scores. Require one compact analysis section so a truncated response
-  // still gets the one allowed retry, but never require translation.
-  if (mode === "product_doc") {
-    const hook = value.hook;
-    return Boolean(
-      (hook && typeof hook === "object" && String((hook as Record<string, unknown>).description || "").trim())
-      || (Array.isArray(value.viralPoints) && value.viralPoints.some((point) =>
-        point && typeof point.description === "string" && point.description.trim()))
-      || (Array.isArray(value.strengths) && value.strengths.some((point) =>
-        typeof point === "string" && point.trim()))
-      || String(value.structureFormula || "").trim()
-    );
-  }
   return Boolean(
     scores && typeof scores === "object"
     && Array.isArray(scenes)
@@ -554,18 +520,17 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
     // Upload the original as soon as it exists, independently of analysis.
     void deliverProductDocument();
 
-    if (!relativeVideoPath) throw new Error("没有可分析的视频文件");
+    if (!relativeVideoPath) throw new Error("没有可用的视频文件");
     if (transcriptZh.trim()) await recordStage("translation", "completed");
     else if (!transcript.trim()) await recordStage("translation", "skipped", "尚无可翻译的有效口播，不将提取失败当作无口播");
 
     let finalTranslation = "";
-    if (analysisMode === "transcript_only") {
+    if (analysisMode !== "full") {
       await recordStage("analysis", "skipped");
-      // 任务安排表只需要 文件/原口播/中文翻译/链接字幕/时间戳原口播/时间戳中文——全部
-      // 来自 TokScript 本身（或下面这一次轻量文本翻译），不依赖场景拆解或 Qwen 完整
-      // 视频分析。那三步（识别镜头/Qwen视频分析/生成报告）只是为 full/product_doc
-      // 两种模式的"视频分析"结果服务，任务安排表这条流程从不读取那份结果，直接跳过
-      // 能省下真金白银的一次多模态调用和好几分钟的等待。
+      // Handcards (product_doc, including already queued legacy tasks) and Base
+      // transcript_only jobs need only the file and TokScript speech/translation.
+      // Do not extract scenes, prepare multimodal input, call video models, or
+      // generate an analysis report. Preserve any historical report in storage.
       await scheduleTranscriptTranslation();
       await assertVideoAttempt(videoId, signal, expectedAttemptNumber);
       finalTranslation = transcriptZh.trim();
@@ -583,9 +548,7 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
     activeStage = "analysis";
     await recordStage("analysis", "running");
     await setStage(videoId, "extracting", "正在识别镜头并提取关键画面", 36);
-    const assets = await extractVideoAssets(videoId, relativeVideoPath, signal, {
-      light: analysisMode === "product_doc",
-    });
+    const assets = await extractVideoAssets(videoId, relativeVideoPath, signal);
     await assertVideoAttempt(videoId, signal, expectedAttemptNumber);
     const currentForCover = await getVideo(videoId, false);
     await updateVideo(videoId, {
@@ -593,7 +556,7 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
       cover_path: currentForCover?.coverPath || assets.scenes[0]?.screenshotPath || null,
     });
 
-    const learningContext = analysisMode === "product_doc" ? null : await getLearningContext(product, videoId);
+    const learningContext = await getLearningContext(product, videoId);
     const learnedExamples = Array.isArray(learningContext?.similarExamples) ? learningContext.similarExamples.length : 0;
     if (learnedExamples) trace.push(`长期学习：参考 ${learnedExamples} 条相似历史经验`);
     const { prompt, slug: promptSlug, inputs: promptInputs } = await renderAnalysisPrompt({
@@ -628,9 +591,7 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
     // with scene count. A truncated response still returns HTTP 200, so this
     // showed up as isUsableAnalysis() rejecting an otherwise-successful call,
     // not as a request error. Scale with scene count instead of a flat cap.
-    const qwenMaxTokens = analysisMode === "product_doc"
-      ? 2_000
-      : Math.min(16_000, 2_500 + assets.scenes.length * 700);
+    const qwenMaxTokens = Math.min(16_000, 2_500 + assets.scenes.length * 700);
     const analysisConfig = await getVideoAnalysisConfig(analysisMode);
     const runQwenRequest = (requestIndex: 1 | 2) => {
       qwenRequests = requestIndex;
@@ -678,7 +639,7 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
       try {
         const candidate = await runQwenRequest(requestIndex);
         await assertVideoAttempt(videoId, signal, expectedAttemptNumber);
-        if (!isUsableAnalysis(candidate, assets.scenes.length, analysisMode)) {
+        if (!isUsableAnalysis(candidate, assets.scenes.length)) {
           throw new QwenRequestError("invalid_response", true, "Qwen 未返回完整的视频分析，请重试该链接");
         }
         rawAnalysis = candidate;
@@ -691,7 +652,7 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
         await assertVideoAttempt(videoId, signal, expectedAttemptNumber);
       }
     }
-    await setStage(videoId, "analyzing", analysisMode === "product_doc" ? "正在生成轻量视频分析" : "正在生成中文深度报告和复拍脚本", 82);
+    await setStage(videoId, "analyzing", "正在生成中文深度报告和复拍脚本", 82);
 
     const analysis = normalizeAnalysis(rawAnalysis, assets.scenes.length, trace, transcriptZh);
     const keyShotIndexes = new Set<number>();
@@ -709,7 +670,7 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
       signal?.throwIfAborted();
       const result = analysis.scenes[base.shotIndex - 1];
       let clipPath: string | null = null;
-      if (analysisMode !== "product_doc" && keyShotIndexes.has(base.shotIndex) && keyShotIndexes.size <= 6) {
+      if (keyShotIndexes.has(base.shotIndex) && keyShotIndexes.size <= 6) {
         clipPath = await createSceneClip(videoId, relativeVideoPath, base.startSeconds, base.endSeconds, `shot-${base.shotIndex}`, signal).catch((error) => {
           if (signal?.aborted) throw error;
           return null;
@@ -776,10 +737,12 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
       .then(({ completeFeishuAutomation }) => completeFeishuAutomation(videoId))
       .catch(() => undefined);
     emitVideoProgress(videoId);
-    try {
-      await learnFromVideo(videoId);
-    } catch {
-      // 学习档案失败不能影响已经完成的视频报告。
+    if (analysisMode === "full") {
+      try {
+        await learnFromVideo(videoId);
+      } catch {
+        // 学习档案失败不能影响已经完成的视频报告。
+      }
     }
   } catch (error) {
     const abortReason = signal?.aborted && signal.reason instanceof Error ? signal.reason : null;
@@ -800,7 +763,7 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
       // still a new execution, and Feishu delivery retries remain independent.
       await updateVideo(videoId, {
         status: signal?.aborted ? "stopped" : "failed",
-        stage: signal?.aborted ? "已停止" : "分析失败",
+        stage: signal?.aborted ? "已停止" : analysisMode === "full" ? "分析失败" : "处理失败",
         error_message: signal?.aborted ? null : userFacingAnalysisError(error, qwenRequests),
         processing_started_at: null,
       });

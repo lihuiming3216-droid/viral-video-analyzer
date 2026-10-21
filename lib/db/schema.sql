@@ -4,42 +4,6 @@
 
 SET NAMES utf8mb4;
 
--- Event-driven quality-video library. Deliberately outside the historical
--- video/inbox queues: only a newly authenticated native trigger starts work.
-CREATE TABLE IF NOT EXISTS feishu_video_library_rows (
-  row_key CHAR(64) PRIMARY KEY,
-  app_token VARCHAR(191) NOT NULL,
-  table_id VARCHAR(191) NOT NULL,
-  record_id VARCHAR(191) NOT NULL,
-  latest_task_id CHAR(64),
-  event_ms BIGINT NOT NULL DEFAULT 0,
-  updated_at VARCHAR(32) NOT NULL
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
-
-CREATE TABLE IF NOT EXISTS feishu_video_library_tasks (
-  id CHAR(64) PRIMARY KEY,
-  row_key CHAR(64) NOT NULL,
-  event_ms BIGINT NOT NULL,
-  source_url VARCHAR(1024) NOT NULL,
-  state VARCHAR(24) NOT NULL DEFAULT 'accepted',
-  reset_outputs TINYINT(1) NOT NULL DEFAULT 1,
-  baseline_json JSON NOT NULL,
-  owned_json JSON NOT NULL,
-  errors_json JSON NOT NULL DEFAULT ('{}'),
-  original_text LONGTEXT NOT NULL,
-  translated_text LONGTEXT NOT NULL,
-  media_path TEXT,
-  file_token VARCHAR(191),
-  provider_job_id VARCHAR(191),
-  created_at VARCHAR(32) NOT NULL,
-  started_at VARCHAR(32),
-  finished_at VARCHAR(32),
-  updated_at VARCHAR(32) NOT NULL,
-  CONSTRAINT fk_video_library_row FOREIGN KEY (row_key) REFERENCES feishu_video_library_rows(row_key),
-  INDEX idx_video_library_state (state, updated_at),
-  INDEX idx_video_library_history (row_key, event_ms)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
-
 -- Invocation receipts are not URL de-duplication. Distinct user operations
 -- remain distinct; uncertain accepted receipts are never silently recycled.
 CREATE TABLE IF NOT EXISTS feishu_request_receipts (

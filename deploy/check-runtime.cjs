@@ -1,4 +1,5 @@
 // Readiness probe: never imports application modules (which initialize schema).
+/* eslint-disable @typescript-eslint/no-require-imports -- Standalone CommonJS container probe. */
 const mysql = require("mysql2/promise");
 const deadline = setTimeout(() => {
   console.error("Application/database readiness check timed out");
@@ -16,7 +17,7 @@ async function main() {
     connectTimeout: 5000,
   });
   try {
-    for (const sql of ["START TRANSACTION READ ONLY", "SELECT 1 FROM products LIMIT 1", "SELECT 1 FROM videos LIMIT 1", "SELECT 1 FROM feishu_automation_delivery_blocks LIMIT 1", "SELECT 1 FROM feishu_request_receipts LIMIT 1", "SELECT 1 FROM feishu_inbox_tasks LIMIT 1", "SELECT 1 FROM video_stage_results LIMIT 1", "SELECT 1 FROM feishu_automation_delivery_retries LIMIT 1", "SELECT 1 FROM feishu_video_library_rows LIMIT 1", "SELECT 1 FROM feishu_video_library_tasks LIMIT 1", "ROLLBACK"]) {
+    for (const sql of ["START TRANSACTION READ ONLY", "SELECT 1 FROM products LIMIT 1", "SELECT 1 FROM videos LIMIT 1", "SELECT 1 FROM feishu_automation_delivery_blocks LIMIT 1", "SELECT 1 FROM feishu_request_receipts LIMIT 1", "SELECT 1 FROM feishu_inbox_tasks LIMIT 1", "SELECT 1 FROM video_stage_results LIMIT 1", "SELECT 1 FROM feishu_automation_delivery_retries LIMIT 1", "ROLLBACK"]) {
       await connection.query({ sql, timeout: 5000 });
     }
   } finally {

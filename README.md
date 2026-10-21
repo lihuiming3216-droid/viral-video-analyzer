@@ -96,17 +96,15 @@ PID 必须是文本型完整数字，不从商品链接的英文名称推断商�
 
 应用部署在服务器；本机关闭不影响云端运行。应用的文档和表格访问权限仍须由飞书管理员配置。
 
-### 优质视频库专用轻量流程
+### 优质视频库复用通用视频处理
 
-`POST /api/feishu/video-library` 是《优质视频库》专用入口，与上述旧任务表流程分开。只允许已确认的 Base `GujZbD0psaRxBrs6WSJc5d6anud` / 表 `tblgmuFeWjhWXfRd`。请求头使用现有 `X-Feishu-Automation-Secret`；表格字段为 `视频链接`（URL）、`原口播`、`中文翻译`、`文件`（附件）、`处理状态`、`失败原因`，不要求 PID，不猜商品资料。
+根据负责人 2026-10-21 的要求，删除专用 `/api/feishu/video-library` 入口、执行器、服务商适配器和配置脚本，不再维护独立五槽任务链。《优质视频库》改用现有 `POST /api/feishu/task-table`，与其他任务表共用接收箱、视频队列、TokScript、翻译和附件回填。手卡完整视频分析不变。
 
-两条原生流程分别使用 `AddRecordTrigger` 和只监视 `视频链接` 的 `SetRecordTrigger`；不排除批量粘贴。请求体发送 `appToken`、`tableId`、`recordId`、`sourceUrl`。`eventTime` 必须引用只读 `事件时间（系统）`（最后更新时间，1002）的 `.timestamp` 子属性；原生内置 `recordModifiedTime` 在 HTTP 表单中实测会格式化到分钟，不能用于快速修改去重。系统字段返回毫秒单位但实测精度可能只到秒，因此同一秒换不同视频继续建立新的行版本（包括 A→B→A），同一秒相同视频视作重复事件。另传原口播、译文和附件 Token 的触发快照 `snapshotTranscript`、`snapshotTranslation`、`snapshotFileTokens`，保护链接修改后、HTTP 到达前的人工编辑。相同事件重发只认领一次；替换链接以当前行保留的链接为准，旧任务不能继续回填。写回前后核对源链接，人工在处理中修改的输出保留；换视频时旧输出先清空，清空前内容保存在任务的 `baseline_json` 中。Feishu 没有条件更新接口，因此 GET/PUT 间不是外部事务；后置核对只清除本任务刚写入且未被人工修改的旧值，不宣称绝对消除所有外部竞态。
+目标 Base 为 `GujZbD0psaRxBrs6WSJc5d6anud`，表为 `tblgmuFeWjhWXfRd`。既有飞书原生流程分别响应新增记录和仅视频链接修改，HTTP 表单发送 `appToken`、`tableId`、`recordId`、`视频链接`，请求头仍用现有 `X-Feishu-Automation-Secret`。不再传递已删除的系统时间或依赖处理状态列；原经典「自动化流程」继续停用，防止重复调用。
 
-原文独立调用 TokScript 单条 `get_tiktok_transcript(format=json)`，不指定翻译语言，完整读取 `transcript` 字符串或 `transcript.segments[].text`；不能使用 `get_stored_video` 的批量条目代替原文（实测新 URL 会返回批量资料包，旧缓存 URL 才可能返回单条原文）。中文取 `submit_transcript_job(target_language=zh-CN)` 完成后的 `export_results` JSON，下载独立调用 `download_video`。原文和下载并行；同一视频原文请求结束（独立 60 秒上限）后再提交中文任务，原文失败仍继续中文，不等待原文飞书写回。原文请求使用去掉查询参数的规范 URL，中文请求给同一视频 URL 加固定 `tokscript_translation=zh-CN`，隔离语言缓存；所有结果仍校验同一视频 ID。长篇非中文导出不能冒充中文成功。只去掉字幕格式，不缩写文本。该入口不调用 Qwen、OpenAI、出海匠、分镜、手卡生成或字幕生成。服务商失败不能写成“无口播”；成功项先独立回填，未完成项在 `失败原因` 中显示。真实 MP4 复用流式下载、媒体检查和飞书分片附件上传，不将下载链接当作附件。
+按现有 `feishu_field_mappings` 保存本表映射：`videoUrl=视频链接`、`videoFile=文件`、`transcript=原口播`、`translation=中文翻译`，其余映射显式设为空字符串。这样不生成字幕、手卡或视频分析，也不向不存在的列写入。`日期`、`产品名称`及已有文字和附件不被覆盖。沿用通用任务表原有的重试、两槽视频并发和后台错误记录；TokScript 没有提供中文时，沿用已配置的 Qwen 文本翻译。启用配置不会提交历史链接；只有新的飞书触发请求进入队列。
 
-轻量任务有独立的五个 MySQL 执行槽，不改变完整视频的两个执行槽；无自建等待队列，超过五个在执行任务时本次明确提示繁忙。仅新原生事件启动任务，不扫整张表、不调用历史接收箱/视频恢复，也不在重启时重新执行本流程已开始的请求。每项处理有六分钟上限；MP4 下载最多两次、单次飞书写入最多两次；不盲目重发结果不明的转写提交。中断后需先核查已有结果，再主动重新粘贴链接，不将旧任务自动唤醒。
-
-部署后在应用容器中运行 `node deploy/configure-video-library.cjs` 做只读检查；`--prepare` 只增加两个必要文字列和一个只读系统时间列并准备两条停用的流程，保留原流程配置快照；`--enable` 才设置 `.data/feishu-video-library.json` 的启用时间并启用流程。原表另有启用中的经典「自动化流程」（`7687285007543045108`），切换前须经负责人确认后停用、保留定义；启用检查会阻止它与新流程同时运行。默认不修改。所有启用时间之前的事件都忽略；代码发布本身不会启用该功能。配置与验收必须保留真实权限、原生触发及五条并发附件回填证据，测试通过不等于飞书端到端已通过。
+其他表可继续使用同一接口并分别保存字段映射，不需要再复制业务程序。飞书应用必须有对应表格的实际读写权限；字段相同不等于自动取得授权。Webhook 不带稳定 `requestId` 时仍沿用旧入口兼容行为，不宣称能够识别所有外部重复投递。
 
 ## 数据位置
 
@@ -116,7 +114,7 @@ PID 必须是文本型完整数字，不从商品链接的英文名称推断商�
 - 已生成的分段字幕翻译缓存及请求预算标记：`.data/subtitle-cache/`
 - 飞书接收：MySQL `feishu_request_receipts` 保存哈希及状态，`feishu_inbox_tasks` 保存加密输入、处理状态及关联视频；解密依赖原 `.data/secret.key`
 - 视频分环节结果：MySQL `video_stage_results`；表格写回暂停与退避分别在 `feishu_automation_delivery_blocks` 和 `feishu_automation_delivery_retries`
-- 优质视频库：MySQL `feishu_video_library_rows` 保存当前行版本，`feishu_video_library_tasks` 保存每次事件、原文/中文、媒体路径、附件和错误；`.data/media/video-library/` 保存原片，`.data/feishu-video-library*.json` 保存启用范围、切换时间和原生流程编号
+- 已退役优质视频库专用链路：既有 `feishu_video_library_rows`、`feishu_video_library_tasks`、`.data/media/video-library/` 和旧配置只保留作历史资料，不删除生产缓存或原片；新安装不再建这两张表，运行和就绪检查也不再依赖它们。本表新任务使用上述通用任务数据位置
 - 本机加密主密钥：`.data/secret.key`
 - 后台登录散列：`.data/admin-auth.json`
 

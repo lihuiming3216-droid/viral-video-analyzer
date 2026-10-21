@@ -36,6 +36,10 @@ async function uploadFile(client: Client, fileBlockId: string, absolutePath: str
   });
 }
 
+export function hasFeishuVideoPreview(parentBlockId: string, blocks: DocxBlock[], fileName: string) {
+  return descendants(parentBlockId, blocks).some(block => block.block_type === 23 && block.file?.name === fileName);
+}
+
 async function deleteChild(client: Client, documentId: string, parentBlockId: string, childBlockId: string) {
   const response = await client.request<{ data?: { items?: DocxBlock[] } }>({
     url: `/open-apis/docx/v1/documents/${encodeURIComponent(documentId)}/blocks/${encodeURIComponent(parentBlockId)}/children`,
@@ -61,11 +65,13 @@ export async function ensureFeishuVideoPreview(input: {
   validateBinding?: () => Promise<{ valid: boolean; documentRevisionId: number }>;
 }) {
   const { client, documentId, parentBlockId, absolutePath, fileName, blocks, validateBinding } = input;
-  const initialValidation = await validateBinding?.();
-  if (initialValidation && !initialValidation.valid) return false;
-  if (descendants(parentBlockId, blocks).some((block) => block.block_type === 23 && block.file?.name === fileName)) {
+  // Nothing will be written for an already embedded file: do not spend extra
+  // revision/link/task reads validating a no-op for every historical row.
+  if (hasFeishuVideoPreview(parentBlockId, blocks, fileName)) {
     return false;
   }
+  const initialValidation = await validateBinding?.();
+  if (initialValidation && !initialValidation.valid) return false;
 
   let viewBlockId = "";
   try {

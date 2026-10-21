@@ -485,7 +485,7 @@ export async function analyzeVideo(videoId: string, signal?: AbortSignal, expect
         relativeVideoPath = downloaded.relativePath;
         trace.push(...downloaded.failures, `视频文件：${downloaded.source}下载`);
         await assertVideoAttempt(videoId, signal, expectedAttemptNumber);
-        const coverPath = tok.coverUrl ? await downloadMedia(videoId, tok.coverUrl, "cover", signal).catch((error) => {
+        const coverPath = analysisMode !== "product_doc" && tok.coverUrl ? await downloadMedia(videoId, tok.coverUrl, "cover", signal).catch((error) => {
           if (signal?.aborted) throw error;
           return null;
         }) : null;

@@ -50,3 +50,20 @@ test("multiple Base rows may share the same PID document; repeated concurrent cl
   assert.equal(index.Column_name, "document_id");
   assert.equal(index.Non_unique, 1);
 });
+
+test("discovery targets include canonical and row-owned cards once, with durable retry revisions", async t => {
+  const { database: db, pool } = await createIsolatedDatabase(t);
+  const product = await db.createProduct({ name: "discovery", pid: "123456", documentId: "canonical", documentUrl: "https://feishu.cn/docx/canonical" });
+  await db.createProduct({ name: "no PID", documentId: "not-eligible" });
+  const system = await db.createProduct({ name: "system", pid: "999999", documentId: "system-doc" });
+  await pool.execute("UPDATE products SET is_system=1 WHERE id=?", [system.id]);
+  for (const [recordId, documentId] of [["one", "canonical"], ["two", "mapped"], ["three", "mapped"]]) {
+    await db.upsertFeishuProductCardMapping({ appToken: "app", tableId: "table", recordId, productId: product.id, documentId });
+  }
+  await db.setCachedDocumentRevision("mapped", -1);
+  const found = await db.listProductDocumentSyncTargets();
+  assert.deepEqual(found.map(d => d.documentId).sort(), ["canonical", "mapped"]);
+  assert.equal(found.find(d => d.documentId === "mapped").cachedRevision, -1);
+  assert.equal(found.find(d => d.documentId === "canonical").cachedRevision, null);
+  assert.ok(found.every(d => d.id === product.id && d.pid === "123456"));
+});

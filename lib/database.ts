@@ -191,6 +191,33 @@ export async function listFeishuProductCardMappingsByProductId(productId: string
   return found.map(productCardMappingFromRow);
 }
 
+export type ProductDocumentSyncTarget = Pick<Product, "id" | "name" | "pid" | "documentId" | "documentUrl"> & {
+  cachedRevision?: number | null;
+};
+
+/** One lightweight query, not the full product archive plus one query per PID. */
+export async function listProductDocumentSyncTargets(): Promise<ProductDocumentSyncTarget[]> {
+  const db = await getDb();
+  const found = await rows(db, `
+    SELECT d.*, s.last_revision_id FROM (
+      SELECT id,name,pid,document_id,document_url FROM products WHERE pid<>'' AND is_system=0
+      UNION ALL
+      SELECT p.id,p.name,p.pid,m.document_id,m.document_url FROM feishu_product_card_mappings m
+        JOIN products p ON p.id=m.product_id WHERE p.pid<>'' AND p.is_system=0
+    ) d LEFT JOIN product_document_video_scan_state s ON s.document_id=d.document_id
+    WHERE d.document_id IS NOT NULL AND TRIM(d.document_id)<>''`);
+  const unique = new Map<string, ProductDocumentSyncTarget>();
+  for (const item of found) {
+    const documentId = String(item.document_id).trim();
+    if (!unique.has(documentId)) unique.set(documentId, {
+      id: String(item.id), name: String(item.name), pid: String(item.pid), documentId,
+      documentUrl: item.document_url ? String(item.document_url) : null,
+      cachedRevision: item.last_revision_id == null ? null : Number(item.last_revision_id),
+    });
+  }
+  return [...unique.values()];
+}
+
 export async function upsertFeishuProductCardMapping(
   input: FeishuProductCardMappingKey & Partial<Pick<
     FeishuProductCardMapping,

@@ -84,6 +84,7 @@ test("creates a cover preview once for a small MP4", async () => {
     );
     input.blocks[0].children.push("view-existing");
     events.length = 0;
+    input.validateBinding = async () => { throw Error("an existing preview must not perform another remote validation"); };
     assert.equal(await preview.ensureFeishuVideoPreview(input), false);
     assert.deepEqual(events, []);
   } finally {

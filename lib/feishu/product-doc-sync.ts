@@ -13,13 +13,15 @@ import {
   getVideoBySourceUrl,
   isProductDocumentVideoRowsInitialized,
   listFeishuProductCardMappingsByProductId,
-  listProducts,
+  listProductDocumentSyncTargets,
   markProductDocumentVideoRowsInitialized,
   saveProductDocumentVideoRow,
   setCachedDocumentRevision,
+  type ProductDocumentSyncTarget,
 } from "@/lib/database";
 import { listFeishuDocumentBlocks, updateFeishuTextBlock } from "@/lib/feishu/document";
-import { ensureFeishuVideoPreview } from "@/lib/feishu/docx-file";
+import { ensureFeishuVideoPreview, hasFeishuVideoPreview } from "@/lib/feishu/docx-file";
+import { ProductDocumentDiscovery } from "@/lib/feishu/product-doc-discovery";
 import { ensureFeishuConnection, getConnectedFeishuChannel } from "@/lib/feishu/runtime";
 import { enqueueVideos } from "@/lib/queue";
 import { NO_PRODUCT_VOICEOVER_TRANSCRIPT } from "@/lib/transcript-validation";
@@ -44,16 +46,19 @@ type SyncResult = {
 type WorkerGlobal = typeof globalThis & {
   __productDocSyncTimer?: NodeJS.Timeout;
   __productDocSyncRunning?: boolean;
-  __productDocSyncCursor?: number;
+  __productDocDiscovery?: ProductDocumentDiscovery;
+  __productDocDeliveries?: Map<string, { promise: Promise<boolean>; dirty: boolean }>;
+  __productDocDeliveryEpochs?: Map<string, number>;
   __productDocSyncLastError?: string;
   __productDocSyncLocks?: Map<string, Promise<unknown>>;
 };
 
 const workerState = globalThis as WorkerGlobal;
 workerState.__productDocSyncRunning ||= false;
-workerState.__productDocSyncCursor ||= 0;
 workerState.__productDocSyncLastError ||= "";
 workerState.__productDocSyncLocks ||= new Map<string, Promise<unknown>>();
+workerState.__productDocDeliveries ||= new Map();
+workerState.__productDocDeliveryEpochs ||= new Map();
 const attachmentErrors = new Set<string>();
 const rowErrors = new Set<string>();
 
@@ -303,11 +308,13 @@ async function withProductDocumentLock<T>(documentId: string, task: () => Promis
 
 async function syncProductDocumentUnlocked(
   client: Client,
-  product: Product,
-  options: { onlyVideoId?: string } = {},
+  product: ProductDocumentSyncTarget,
+  options: { onlyVideoId?: string; discoverOnly?: boolean } = {},
 ): Promise<SyncResult> {
   const result: SyncResult = { found: 0, queued: 0, completed: 0, failed: 0 };
   if (!product.documentId) return result;
+  const deliveryEpoch = workerState.__productDocDeliveryEpochs!.get(product.documentId) || 0;
+  if (options.onlyVideoId) workerState.__productDocDeliveryEpochs!.set(product.documentId, deliveryEpoch + 1);
   // A result event changes backend data, not the Feishu revision. Invalidate
   // before external calls so a failed immediate delivery gets a polling retry.
   if (options.onlyVideoId && await isProductDocumentVideoRowsInitialized(product.documentId)) {
@@ -357,61 +364,88 @@ async function syncProductDocumentUnlocked(
       // The second cell is a video-only container and may legitimately have no
       // text block. Only the link and translation need text-backed cells.
       if (!link || !linkBlockId || !translationCell.textId) continue;
-      const binding = await getProductDocumentVideoRow(product.documentId, linkBlockId);
-      let video = binding?.sourceUrl === link ? await getVideo(binding.videoId, false) : null;
-      if (binding && !video) {
-        const exactLegacy = await getVideoBySourceUrl(link, product.id);
-        if (exactLegacy?.id === binding.videoId) video = exactLegacy;
-      }
-      if (options.onlyVideoId) {
-        if (binding && binding.videoId !== options.onlyVideoId) continue;
+      // Discovery is independent of slow uploads, but claiming a row must still
+      // be serialized with explicit/legacy delivery paths to avoid duplicate jobs.
+      const claimedRow = await withProductDocumentLock(`bind:${product.documentId}:${linkBlockId}`, async () => {
+        const binding = await getProductDocumentVideoRow(product.documentId!, linkBlockId);
+        let video = binding?.sourceUrl === link ? await getVideo(binding.videoId, false) : null;
+        if (binding && !video) {
+          const exactLegacy = await getVideoBySourceUrl(link, product.id);
+          if (exactLegacy?.id === binding.videoId) video = exactLegacy;
+        }
+        if (options.onlyVideoId) {
+          if (binding && binding.videoId !== options.onlyVideoId) return null;
+          if (!video) {
+            const exact = await getVideo(options.onlyVideoId, false);
+            if (!exact || exact.productId !== product.id || exact.sourceUrl !== link) return null;
+            const claimed = await getProductDocumentVideoRowByVideoId(exact.id);
+            if (claimed && (claimed.documentId !== product.documentId || claimed.linkBlockId !== linkBlockId)) return null;
+            video = exact;
+            await saveProductDocumentVideoRow({
+              documentId: product.documentId!,
+              linkBlockId,
+              productId: product.id,
+              sourceUrl: link,
+              videoId: exact.id,
+            });
+          }
+        }
+        let newlyQueued = false;
         if (!video) {
-          const exact = await getVideo(options.onlyVideoId, false);
-          if (!exact || exact.productId !== product.id || exact.sourceUrl !== link) continue;
-          const claimed = await getProductDocumentVideoRowByVideoId(exact.id);
-          if (claimed && (claimed.documentId !== product.documentId || claimed.linkBlockId !== linkBlockId)) continue;
-          video = exact;
+          const legacy = migrationMode && !binding ? await getVideoBySourceUrl(link, product.id) : null;
+          const legacyClaim = legacy ? await getProductDocumentVideoRowByVideoId(legacy.id) : null;
+          video = legacy && !legacyClaim
+            ? legacy
+            : await createVideo({
+              productId: product.id,
+              sourceType: "tiktok",
+              sourceUrl: link,
+              title: `文档样片 ${rowStart / 4}`,
+              analysisMode: "product_doc",
+            });
           await saveProductDocumentVideoRow({
-            documentId: product.documentId,
+            documentId: product.documentId!,
             linkBlockId,
             productId: product.id,
             sourceUrl: link,
-            videoId: exact.id,
+            videoId: video.id,
           });
+          if (video.status === "queued") {
+            await enqueueVideos([video.id]);
+            newlyQueued = true;
+          }
         }
-      }
-      // This cell is now reserved for the playable MP4. Remove legacy textual
-      // states once, without touching the preview/view children.
-      if (videoCell.textId && videoCell.text) {
+        return { video, newlyQueued };
+      });
+      if (!claimedRow) continue;
+      let { video } = claimedRow;
+      result.found += 1;
+
+      if (options.discoverOnly) {
+        // Never let a historical file upload hold up discovery of new rows or
+        // other handcards. Immediate delivery has its own serialized write path.
+        const needsFile = video.originalPath && !hasFeishuVideoPreview(cells[rowStart + 1], blocks, tokScriptVideoFileName(video));
+        const needsTranslation = video.transcriptZh?.trim() && !translationCell.text.trim();
+        if (needsFile || needsTranslation || videoCell.text) {
+          deliveryFailed = true;
+          void syncVideoToProductDocument(video.id).catch(() => undefined);
+        }
+      } else if (videoCell.textId && videoCell.text) {
         await updateIfChanged(client, product.documentId, videoCell.textId, videoCell.text, "");
       }
-      if (!video) {
-        const legacy = migrationMode && !binding ? await getVideoBySourceUrl(link, product.id) : null;
-        const legacyClaim = legacy ? await getProductDocumentVideoRowByVideoId(legacy.id) : null;
-        video = legacy && !legacyClaim
-          ? legacy
-          : await createVideo({
-            productId: product.id,
-            sourceType: "tiktok",
-            sourceUrl: link,
-            title: `文档样片 ${rowStart / 4}`,
-            analysisMode: "product_doc",
-          });
-        await saveProductDocumentVideoRow({
-          documentId: product.documentId,
-          linkBlockId,
-          productId: product.id,
-          sourceUrl: link,
-          videoId: video.id,
-        });
-        if (video.status === "queued") {
-          await enqueueVideos([video.id]);
-          result.found += 1;
-          result.queued += 1;
-          continue;
-        }
+      if (claimedRow.newlyQueued) { result.queued += 1; continue; }
+      // A restart/temporary queue error may happen after the durable row claim
+      // but before enqueue. Recover only queued tasks, never replay failures.
+      if (video.status === "queued") {
+        await enqueueVideos([video.id]);
+        result.queued += 1;
+        continue;
       }
-      result.found += 1;
+      if (options.discoverOnly) {
+        if (video.status === "completed") result.completed += 1;
+        else if (video.status === "failed" || video.status === "stopped") result.failed += 1;
+        continue;
+      }
 
       const attachmentErrorKey = `${product.documentId}:${video.id}`;
       const previewVideoId = video.id;
@@ -432,53 +466,58 @@ async function syncProductDocumentUnlocked(
             && currentVideo.originalPath === previewOriginalPath,
         };
       };
+      const deliverPreview = async () => {
+        try {
+          if (video.sourceType === "tiktok" && video.originalPath) {
+            await ensureFeishuVideoPreview({
+              client,
+              documentId: product.documentId!,
+              parentBlockId: String(cells[rowStart + 1] || ""),
+              absolutePath: resolveMediaPath(video.originalPath),
+              fileName: tokScriptVideoFileName(video),
+              blocks,
+              validateBinding: validatePreviewBinding,
+            });
+          }
+          attachmentErrors.delete(attachmentErrorKey);
+        } catch (error) {
+          // Preview delivery retries independently and must never block translation.
+          deliveryFailed = true;
+          if (!attachmentErrors.has(attachmentErrorKey)) {
+            const message = error instanceof Error ? error.message : "视频附件上传失败";
+            console.warn(`[product-doc-sync] TokScript视频附件 ${video.id}: ${message}`);
+            if (attachmentErrors.size >= 1_000) attachmentErrors.clear();
+            attachmentErrors.add(attachmentErrorKey);
+          }
+        }
+      };
+
+      // Deliver available translation first, then the preview. Network writes
+      // remain serial within the document; a slow upload cannot hold this text
+      // back. A translation failure must still allow the independent preview.
       try {
-        if (video.sourceType === "tiktok" && video.originalPath) {
-          await ensureFeishuVideoPreview({
-            client,
-            documentId: product.documentId,
-            parentBlockId: String(cells[rowStart + 1] || ""),
-            absolutePath: resolveMediaPath(video.originalPath),
-            fileName: tokScriptVideoFileName(video),
-            blocks,
-            validateBinding: validatePreviewBinding,
-          });
-        }
-        attachmentErrors.delete(attachmentErrorKey);
-      } catch (error) {
-        // Preview delivery retries independently and must never block translation.
-        deliveryFailed = true;
-        if (!attachmentErrors.has(attachmentErrorKey)) {
-          const message = error instanceof Error ? error.message : "视频附件上传失败";
-          console.warn(`[product-doc-sync] TokScript视频附件 ${video.id}: ${message}`);
-          if (attachmentErrors.size >= 1_000) attachmentErrors.clear();
-          attachmentErrors.add(attachmentErrorKey);
-        }
-      }
+        const refreshedVideo = await getVideo(video.id, false);
+        if (!refreshedVideo) continue;
+        video = refreshedVideo;
 
-      // Preview upload can take long enough for a user to edit the row or for
-      // another explicit action to start/finish this video. Read the current
-      // translation/status rather than the pre-upload task snapshot.
-      const refreshedVideo = await getVideo(video.id, false);
-      if (!refreshedVideo) continue;
-      video = refreshedVideo;
-
-      // Translation and the original file are deliverable during processing,
-      // after success, failure, or stop. All text writes still check
-      // the latest row identity/revision and preserve nonempty user content.
-      const transcriptZh = String(video.transcriptZh || "").trim();
-      if (!translationCell.text.trim() && transcriptZh) {
-        // Shorten only the provider's exact sentinel at display time. Keep
-        // stored transcripts, ordinary text and existing user cells unchanged.
-        await updateBlankResultCell(
-          client, product.documentId, translationCellId,
-          transcriptZh === NO_PRODUCT_VOICEOVER_TRANSCRIPT ? "无口播" : transcriptZh,
-          { linkBlockId, sourceUrl: video.sourceUrl || "" },
-        );
-      }
-      if (video.status === "completed") {
+        // Translation and the original file are deliverable during processing,
+        // after success, failure, or stop. All text writes still check
+        // the latest row identity/revision and preserve nonempty user content.
+        const transcriptZh = String(video.transcriptZh || "").trim();
+        if (!translationCell.text.trim() && transcriptZh) {
+          // Shorten only the provider's exact sentinel at display time. Keep
+          // stored transcripts, ordinary text and existing user cells unchanged.
+          await updateBlankResultCell(
+            client, product.documentId, translationCellId,
+            transcriptZh === NO_PRODUCT_VOICEOVER_TRANSCRIPT ? "无口播" : transcriptZh,
+            { linkBlockId, sourceUrl: video.sourceUrl || "" },
+          );
+        }
+      } finally { await deliverPreview(); }
+      const latestStatus = (await getVideo(video.id, false))?.status;
+      if (latestStatus === "completed") {
         result.completed += 1;
-      } else if (video.status === "failed" || video.status === "stopped") {
+      } else if (latestStatus === "failed" || latestStatus === "stopped") {
         result.failed += 1;
       }
       rowErrors.delete(`${product.documentId}:${rowStart}`);
@@ -495,27 +534,32 @@ async function syncProductDocumentUnlocked(
   }
   if (!options.onlyVideoId) {
     await markProductDocumentVideoRowsInitialized(product.documentId);
-    if (currentRevisionId !== null && !deliveryFailed) await setCachedDocumentRevision(product.documentId, currentRevisionId);
+    // Keep delivery failures discoverable even when file timestamps stay the
+    // same. This is the existing durable invalidation marker, not a new queue.
+    const deliveryArrivedDuringScan = (workerState.__productDocDeliveryEpochs!.get(product.documentId) || 0) !== deliveryEpoch;
+    await setCachedDocumentRevision(product.documentId, deliveryFailed || deliveryArrivedDuringScan ? -1 : currentRevisionId ?? -1);
   }
   return result;
 }
 
 export function syncProductDocument(
   client: Client,
-  product: Product,
-  options: { onlyVideoId?: string } = {},
+  product: ProductDocumentSyncTarget,
+  options: { onlyVideoId?: string; discoverOnly?: boolean } = {},
 ) {
   if (!product.documentId) return Promise.resolve({ found: 0, queued: 0, completed: 0, failed: 0 });
-  return withProductDocumentLock(product.documentId, () => syncProductDocumentUnlocked(client, product, options));
+  const key = options.discoverOnly ? `discover:${product.documentId}` : product.documentId;
+  return withProductDocumentLock(key, () => syncProductDocumentUnlocked(client, product, options));
 }
 
 /** Deliver currently available file/translation to this exact row; never restart processing. */
-export async function syncVideoToProductDocument(videoId: string) {
+async function deliverVideoToProductDocument(videoId: string) {
   const video = await getVideo(videoId);
   if (!video) return false;
   const product = await getProduct(video.productId);
   if (!product) return false;
-  const documents = await productDocumentTargets(product);
+  const bound = await getProductDocumentVideoRowByVideoId(videoId);
+  const documents = bound ? [{ ...product, documentId: bound.documentId }] : await productDocumentTargets(product);
   if (!documents.length) return false;
   const channel = getConnectedFeishuChannel() || await ensureFeishuConnection();
   if (!channel) return false;
@@ -531,45 +575,31 @@ export async function syncVideoToProductDocument(videoId: string) {
   return true;
 }
 
-export async function syncAllProductDocuments() {
+export function syncVideoToProductDocument(videoId: string): Promise<boolean> {
+  const existing = workerState.__productDocDeliveries!.get(videoId);
+  if (existing) { existing.dirty = true; return existing.promise; }
+  const entry = { promise: Promise.resolve(false), dirty: false };
+  entry.promise = (async () => {
+    let delivered = false;
+    do {
+      entry.dirty = false;
+      delivered = await deliverVideoToProductDocument(videoId);
+    } while (entry.dirty);
+    return delivered;
+  })().finally(() => { workerState.__productDocDeliveries!.delete(videoId); });
+  workerState.__productDocDeliveries!.set(videoId, entry);
+  return entry.promise;
+}
+
+export async function syncAllProductDocuments(options: { background?: boolean } = {}) {
   const channel = getConnectedFeishuChannel() || await ensureFeishuConnection();
   if (!channel) return { documents: 0, found: 0, queued: 0, completed: 0, failed: 0 };
-  const seenDocumentIds = new Set<string>();
-  const allProducts = await listProducts();
-  const eligibleProducts = allProducts.filter((product) => product.pid && !product.isSystem);
-  const targetLists = await Promise.all(eligibleProducts.map(productDocumentTargets));
-  const documents = targetLists.flat().filter((product) => {
-    const documentId = product.documentId!;
-    if (seenDocumentIds.has(documentId)) return false;
-    seenDocumentIds.add(documentId);
-    return true;
-  });
+  const documents = await listProductDocumentSyncTargets();
   if (!documents.length) return { documents: 0, found: 0, queued: 0, completed: 0, failed: 0 };
 
-  const configuredBatch = Number(process.env.PRODUCT_DOC_SYNC_BATCH_SIZE || 12);
-  const batchSize = Number.isFinite(configuredBatch) ? Math.max(1, Math.min(20, Math.floor(configuredBatch))) : 12;
-  const start = workerState.__productDocSyncCursor! % documents.length;
-  const selected = Array.from({ length: Math.min(batchSize, documents.length) }, (_, index) => documents[(start + index) % documents.length]);
-  workerState.__productDocSyncCursor = (start + selected.length) % documents.length;
-  const total = { documents: 0, found: 0, queued: 0, completed: 0, failed: 0 };
-  for (const product of selected) {
-    try {
-      const current = await syncProductDocument(channel.rawClient, product);
-      total.documents += 1;
-      total.found += current.found;
-      total.queued += current.queued;
-      total.completed += current.completed;
-      total.failed += current.failed;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "产品文档同步失败";
-      if (workerState.__productDocSyncLastError !== message) {
-        console.warn(`[product-doc-sync] ${product.name}_${product.pid}: ${message}`);
-        workerState.__productDocSyncLastError = message;
-      }
-    }
-  }
-  if (total.documents) workerState.__productDocSyncLastError = "";
-  return total;
+  workerState.__productDocDiscovery ||= new ProductDocumentDiscovery();
+  return workerState.__productDocDiscovery.poll(channel.rawClient, documents,
+    product => syncProductDocument(channel.rawClient, product, { discoverOnly: true }), options.background);
 }
 
 export function startProductDocumentSyncWorker() {
@@ -580,7 +610,7 @@ export function startProductDocumentSyncWorker() {
     if (workerState.__productDocSyncRunning) return;
     workerState.__productDocSyncRunning = true;
     try {
-      await syncAllProductDocuments();
+      await syncAllProductDocuments({ background: true });
     } catch (error) {
       const message = error instanceof Error ? error.message : "产品文档自动同步失败";
       if (workerState.__productDocSyncLastError !== message) {

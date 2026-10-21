@@ -37,7 +37,6 @@ services:
       NODE_ENV: production
       NEXT_TELEMETRY_DISABLED: "1"
       PRODUCT_DOC_SYNC_INTERVAL_MS: "20000"
-      PRODUCT_DOC_SYNC_BATCH_SIZE: "12"
       MYSQL_HOST: mysql
       MYSQL_PORT: "3306"
       MYSQL_DATABASE: ${MYSQL_DATABASE:-viral_video_analyzer}

@@ -689,7 +689,7 @@ for (const cachedFile of [true, false]) {
           assert.equal(options.includeCover, false);
           assert.equal(options.timeoutMs, 90_000);
           return { downloadUrl: "https://cdn.test/video.mp4", transcript: "The TokScript original speech.",
-            transcriptZh: providerChinese ? "TokScript 已返回中文版" : "", segments: [], stats: {}, raw: {} };
+            transcriptZh: providerChinese ? "TokScript 已返回中文版" : "", coverUrl: "https://cdn.test/unused-cover.jpg", segments: [], stats: {}, raw: {} };
         },
         downloadTikTokVideoWithFallback: async input => {
           downloads += 1;
@@ -704,6 +704,7 @@ for (const cachedFile of [true, false]) {
         extractVideoAssets: forbidden, prepareLocalVideoForQwen: forbidden,
         validateCompleteVideoForQwen: forbidden, analyzeVideoWithQwen: forbidden,
         replaceScenes: forbidden, createSceneClip: forbidden, learnFromVideo: forbidden,
+        downloadMedia: forbidden,
       });
       p.video.analysisMode = "product_doc";
       p.video.summary = "已有历史分析";

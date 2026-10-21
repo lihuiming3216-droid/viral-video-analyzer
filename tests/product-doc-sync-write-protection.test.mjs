@@ -12,6 +12,10 @@ const transcriptValidationUrl = `data:text/javascript;base64,${Buffer.from(ts.tr
   compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
 }).outputText).toString("base64")}`;
 const { NO_PRODUCT_VOICEOVER_TRANSCRIPT } = await import(transcriptValidationUrl);
+const discoverySource = await readFile(new URL("../lib/feishu/product-doc-discovery.ts", import.meta.url), "utf8");
+const discoveryUrl = `data:text/javascript;base64,${Buffer.from(ts.transpileModule(discoverySource, {
+  compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
+}).outputText).toString("base64")}`;
 
 async function loadSyncModule() {
   const stubSource = `
@@ -54,6 +58,12 @@ async function loadSyncModule() {
     export const isProductDocumentVideoRowsInitialized = (documentId) => { const current = resetState(); return current.isProductDocumentVideoRowsInitialized?.(documentId) ?? initializedDocuments.has(documentId); };
     export const listFeishuProductCardMappingsByProductId = (...args) => hooks().listFeishuProductCardMappingsByProductId?.(...args) || [];
     export const listProducts = (...args) => hooks().listProducts?.(...args) || [];
+    export const listProductDocumentSyncTargets = () => {
+      if (hooks().listProductDocumentSyncTargets) return hooks().listProductDocumentSyncTargets();
+      const targets = (hooks().listProducts?.() || []).filter(p => p.pid && !p.isSystem).flatMap(p =>
+        [p, ...(hooks().listFeishuProductCardMappingsByProductId?.(p.id) || []).map(m => ({...p, documentId:m.documentId, documentUrl:m.documentUrl}))]);
+      return [...new Map(targets.filter(p => p.documentId).map(p => [p.documentId,p])).values()];
+    };
     export const markProductDocumentVideoRowsInitialized = (documentId) => { const current = resetState(); return current.markProductDocumentVideoRowsInitialized?.(documentId) ?? initializedDocuments.add(documentId); };
     export const saveProductDocumentVideoRow = (input) => {
       const current = resetState();
@@ -70,6 +80,7 @@ async function loadSyncModule() {
     export const enqueueVideos = (...args) => hooks().enqueueVideos?.(...args);
     export const resolveMediaPath = (...args) => hooks().resolveMediaPath?.(...args) || args[0];
     export const ensureFeishuVideoPreview = (...args) => hooks().ensureFeishuVideoPreview?.(...args) || false;
+    export const hasFeishuVideoPreview = (...args) => hooks().hasFeishuVideoPreview?.(...args) || false;
   `;
   const stubUrl = `data:text/javascript;base64,${Buffer.from(stubSource).toString("base64")}`;
   const testSource = syncSource.replace(
@@ -85,6 +96,7 @@ async function loadSyncModule() {
     .replaceAll('"@/lib/database"', JSON.stringify(stubUrl))
     .replaceAll('"@/lib/feishu/document"', JSON.stringify(stubUrl))
     .replaceAll('"@/lib/feishu/runtime"', JSON.stringify(stubUrl))
+    .replaceAll('"@/lib/feishu/product-doc-discovery"', JSON.stringify(discoveryUrl))
     .replaceAll('"@/lib/transcript-validation"', JSON.stringify(transcriptValidationUrl))
     .replaceAll('"@/lib/queue"', JSON.stringify(stubUrl));
   compiled = compiled.replaceAll('"@/lib/video-processing"', JSON.stringify(stubUrl));
@@ -139,9 +151,12 @@ async function withResultCellFixture(run, overrides = {}) {
     transcriptZh: "自动中文", originalPath: "fixture.mp4", ...overrides,
   };
   const writes = [], enqueued = [], updates = [], cached = [], reads = [];
-  const state = { revision: 10, onPreview: () => {}, onWrite: () => {} };
+  const state = { revision: 10, listed: false, onGuardRead: () => {}, onPreview: () => {}, onWrite: () => {} };
   const client = { request: async ({ url, params }) => {
-    if (!String(url).includes("/blocks/")) return { data: { document: { revision_id: state.revision } } };
+    if (!String(url).includes("/blocks/")) {
+      if (state.listed) { const guard = state.onGuardRead; state.onGuardRead = () => {}; guard(); }
+      return { data: { document: { revision_id: state.revision } } };
+    }
     const id = decodeURIComponent(url.split("/").at(-1));
     reads.push({ id, revision: Number(params.document_revision_id) });
     return { data: { block: blocks.find(b => b.block_id === id) } };
@@ -154,10 +169,10 @@ async function withResultCellFixture(run, overrides = {}) {
     return block;
   };
   globalThis.__productDocSyncWriteProtectionHooks = {
-    listFeishuDocumentBlocks: () => structuredClone(blocks),
+    listFeishuDocumentBlocks: () => { state.listed = true; return structuredClone(blocks); },
     getVideoBySourceUrl: () => video,
     getVideo: () => video,
-    ensureFeishuVideoPreview: async () => state.onPreview(),
+    ensureFeishuVideoPreview: async input => state.onPreview(input),
     updateFeishuTextBlock: async (_c, _d, id, content, options) => {
       state.onWrite();
       assert.equal(options.documentRevisionId, state.revision, "never write at a stale revision");
@@ -170,11 +185,156 @@ async function withResultCellFixture(run, overrides = {}) {
     setCachedDocumentRevision: (...args) => cached.push(args),
   };
   const sync = () => syncModule.syncProductDocument(client, { id: "p", documentId: "whole-cell-doc" });
-  try { await run({ blocks, ids, video, writes, enqueued, updates, cached, reads, state, append, sync }); }
+  try { await run({ client, blocks, ids, video, writes, enqueued, updates, cached, reads, state, append, sync }); }
   finally { delete globalThis.__productDocSyncWriteProtectionHooks; }
 }
 
 const manualParagraph = () => ({ block_type: 2, text: { elements: [{ text_run: { content: "人工第二段" } }] } });
+
+function deferred() { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; }
+
+test("translation is written before a slow preview upload and document writes remain serial", async () => {
+  await withResultCellFixture(async ({ ids, writes, state, sync }) => {
+    const uploading = deferred(), finish = deferred();
+    let inUpload = false;
+    state.onWrite = () => assert.equal(inUpload, false, "no text mutation may overlap a file upload");
+    state.onPreview = async () => {
+      assert.deepEqual(writes, [{ id: ids.translation, content: "自动中文" }]);
+      inUpload = true; uploading.resolve(); await finish.promise; inUpload = false;
+    };
+    const syncing = sync();
+    try { await uploading.promise; assert.equal(writes.length, 1); }
+    finally { finish.resolve(); await syncing; }
+  });
+});
+
+test("a link changed before the fresh translation guard prevents both old text and file binding", async () => {
+  await withResultCellFixture(async ({ blocks, state, writes, sync }) => {
+    state.onGuardRead = () => {
+      blocks.find(b => b.block_id === "row-1-link-text").text.elements[0].text_run.content = "https://www.tiktok.com/@new/video/987654321";
+      state.revision += 1;
+    };
+    state.onPreview = async input => { assert.equal((await input.validateBinding()).valid, false); };
+    await sync();
+    assert.deepEqual(writes, []);
+  });
+});
+
+test("bound immediate deliveries read only their exact document and merge repeated notifications without losing late translation", async () => {
+  await withResultCellFixture(async ({ client, blocks, video, ids, writes }) => {
+    const uploadStarted = deferred(), finish = deferred();
+    const hooks = globalThis.__productDocSyncWriteProtectionHooks;
+    const list = hooks.listFeishuDocumentBlocks;
+    const binding = { documentId: "bound-only", linkBlockId: ids.link, productId: "p", sourceUrl: video.sourceUrl, videoId: video.id };
+    let scans = 0, previews = 0;
+    Object.assign(hooks, {
+      getProduct: () => ({ id: "p", documentId: "unrelated-canonical" }),
+      getProductDocumentVideoRowByVideoId: () => binding,
+      getProductDocumentVideoRow: () => binding,
+      getConnectedFeishuChannel: () => ({ rawClient: client }),
+      listFeishuProductCardMappingsByProductId: () => { throw Error("must not enumerate unrelated cards"); },
+      listFeishuDocumentBlocks: (_client, documentId) => { assert.equal(documentId, "bound-only"); scans++; return list(); },
+      ensureFeishuVideoPreview: async () => { previews++; if (previews === 1) { uploadStarted.resolve(); await finish.promise; } },
+    });
+    video.transcriptZh = "";
+    const first = syncModule.syncVideoToProductDocument(video.id);
+    try {
+      await uploadStarted.promise;
+      video.transcriptZh = "迟到的中文翻译";
+      const notifications = Array.from({ length: 10 }, () => syncModule.syncVideoToProductDocument(video.id));
+      finish.resolve(); await Promise.all([first, ...notifications]);
+      assert.equal(scans, 2, "one in-flight delivery and one fresh pass, not eleven full document reads");
+      assert.deepEqual(writes, [{ id: ids.translation, content: "迟到的中文翻译" }]);
+      assert.ok(blocks.some(b => b.block_id === ids.analysis));
+    } finally { finish.resolve(); await first; }
+  });
+});
+
+test("discovery and an explicit sync claim a new row once under concurrency", async () => {
+  const link = "https://www.tiktok.com/@fixture/video/123456789";
+  const { blocks } = documentBlocks([{ link, status: "", analysis: "", translation: "" }]);
+  const saveStarted = deferred(), saveFinished = deferred();
+  const rows = new Map(), videos = new Map(), enqueued = [];
+  let creates = 0;
+  globalThis.__productDocSyncWriteProtectionHooks = {
+    isProductDocumentVideoRowsInitialized: () => true,
+    listFeishuDocumentBlocks: () => blocks,
+    getProductDocumentVideoRow: (doc, id) => rows.get(`${doc}:${id}`),
+    getVideo: id => videos.get(id),
+    createVideo: input => { creates++; const video = { ...input, id: "only-video", status: "queued", transcriptZh: "" }; videos.set(video.id, video); return video; },
+    saveProductDocumentVideoRow: async input => { saveStarted.resolve(); await saveFinished.promise; rows.set(`${input.documentId}:${input.linkBlockId}`, input); return input; },
+    enqueueVideos: ids => { for (const id of ids) if (!enqueued.includes(id)) enqueued.push(id); },
+  };
+  const product = { id: "p", documentId: "concurrent-claim" };
+  const first = syncModule.syncProductDocument({}, product, { discoverOnly: true });
+  let second;
+  try {
+    await saveStarted.promise;
+    second = syncModule.syncProductDocument({}, product);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(creates, 1);
+    saveFinished.resolve(); await Promise.all([first, second]);
+    assert.equal(creates, 1); assert.deepEqual(enqueued, ["only-video"]);
+  } finally { saveFinished.resolve(); await Promise.all([first, second]); delete globalThis.__productDocSyncWriteProtectionHooks; }
+});
+
+test("a slow existing upload never blocks discovery of the next pasted link", async () => {
+  const oldLink = "https://www.tiktok.com/@fixture/video/111111111";
+  const newLink = "https://www.tiktok.com/@fixture/video/222222222";
+  const { blocks } = documentBlocks([
+    { link: oldLink, status: "", analysis: "", translation: "" },
+    { link: newLink, status: "", analysis: "", translation: "" },
+  ]);
+  const started = deferred(), finish = deferred(), enqueued = [];
+  const old = { id: "slow-old", productId: "p", sourceType: "tiktok", sourceUrl: oldLink, status: "completed", attemptCount: 1, originalPath: "old.mp4", transcriptZh: "" };
+  const client = { request: async ({ url }) => String(url).includes("/blocks/")
+    ? { data: { block: blocks.find(b => b.block_id === decodeURIComponent(url.split("/").at(-1))) } }
+    : { data: { document: { revision_id: 10 } } } };
+  globalThis.__productDocSyncWriteProtectionHooks = {
+    listFeishuDocumentBlocks: () => blocks,
+    getVideoBySourceUrl: url => url === oldLink ? old : null,
+    getProduct: () => ({ id: "p", documentId: "no-upload-block" }),
+    getConnectedFeishuChannel: () => ({ rawClient: client }),
+    createVideo: input => ({ ...input, id: "new-without-wait", status: "queued" }),
+    enqueueVideos: ids => enqueued.push(...ids),
+    ensureFeishuVideoPreview: async () => { started.resolve(); await finish.promise; },
+  };
+  try {
+    const found = await syncModule.syncProductDocument(client, { id: "p", documentId: "no-upload-block" }, { discoverOnly: true });
+    await started.promise;
+    assert.equal(found.queued, 1);
+    assert.deepEqual(enqueued, ["new-without-wait"]);
+  } finally {
+    finish.resolve(); await syncModule.syncVideoToProductDocument(old.id);
+    delete globalThis.__productDocSyncWriteProtectionHooks;
+  }
+});
+
+test("a result arriving during discovery cannot have its delivery-retry marker overwritten by a clean scan", async () => {
+  await withResultCellFixture(async ({ client, video, cached }) => {
+    let direct;
+    globalThis.__productDocSyncWriteProtectionHooks.markProductDocumentVideoRowsInitialized = () => {
+      direct = syncModule.syncProductDocument(client, { id: "p", documentId: "whole-cell-doc" }, { onlyVideoId: video.id });
+    };
+    await syncModule.syncProductDocument(client, { id: "p", documentId: "whole-cell-doc" }, { discoverOnly: true });
+    await direct;
+    assert.equal(cached.at(-1)[1], -1, "a polling acknowledgement must not erase an in-flight result event");
+  }, { status: "downloading", originalPath: null, transcriptZh: "" });
+});
+
+test("discovery safely re-admits a bound queued task without recreating or restarting failed work", async () => {
+  await withResultCellFixture(async ({ client, video, ids, enqueued }) => {
+    globalThis.__productDocSyncWriteProtectionHooks.getProductDocumentVideoRow = () => ({
+      documentId: "whole-cell-doc", linkBlockId: ids.link, sourceUrl: video.sourceUrl, videoId: video.id,
+    });
+    const result = await syncModule.syncProductDocument(client, { id: "p", documentId: "whole-cell-doc" }, { discoverOnly: true });
+    assert.equal(result.queued, 1);
+    assert.deepEqual(enqueued, [video.id]);
+    video.status = "failed";
+    await syncModule.syncProductDocument(client, { id: "p", documentId: "whole-cell-doc" }, { discoverOnly: true });
+    assert.deepEqual(enqueued, [video.id], "failed tasks must not acquire a new paid execution automatically");
+  }, { status: "queued", originalPath: null, transcriptZh: "" });
+});
 
 for (const status of ["downloading", "analyzing", "failed", "stopped", "completed"]) {
   test(`retired analysis column is never read or written and cannot block file/translation: ${status}`, async () => {
@@ -210,12 +370,12 @@ for (const status of ["analyzing", "failed", "completed"]) {
   });
 }
 
-for (const timing of ["before scan", "during preview"]) {
+for (const timing of ["before scan", "before result recheck"]) {
   test(`handcard voiceover label: preserves existing text ${timing}`, async () => {
     await withResultCellFixture(async ({ ids, append, state, writes, sync }) => {
       const fill = () => { append("translation", manualParagraph()); state.revision += 1; };
       if (timing === "before scan") fill();
-      else state.onPreview = fill;
+      else state.onGuardRead = fill;
       await sync();
       assert.equal(writes.some(w => w.id === ids.translation), false);
       assert.deepEqual(writes, [], "neither a manual translation nor the retired analysis cell may be changed");
@@ -233,7 +393,7 @@ for (const transcriptZh of ["无口播", `这是口播中的原句：${NO_PRODUC
 }
 
 for (const status of ["completed", "analyzing", "failed", "stopped"]) {
-  for (const timing of ["before scan", "during preview"]) {
+  for (const timing of ["before scan", "before result recheck"]) {
     test(`whole-cell guard preserves later manual paragraphs: ${status}, ${timing}`, async () => {
       await withResultCellFixture(async ({ append, state, writes, enqueued, updates, sync }) => {
         const fill = () => {
@@ -242,7 +402,7 @@ for (const status of ["completed", "analyzing", "failed", "stopped"]) {
           state.revision += 1;
         };
         if (timing === "before scan") fill();
-        else state.onPreview = fill;
+        else state.onGuardRead = fill;
         await sync();
         assert.deepEqual(writes, [], "any manual paragraph owns the entire result cell");
         assert.deepEqual(enqueued, [], "an empty first paragraph is not a cleared failure cell");
@@ -274,7 +434,7 @@ for (const [kind, content] of [
 test("whole-cell guard checks every paragraph at the write revision and still fills truly empty cells", async () => {
   await withResultCellFixture(async ({ append, state, reads, writes, ids, sync }) => {
     const extra = append("translation", { text: { elements: [{ text_run: { content: " \n　 " } }] } });
-    state.onPreview = () => { state.revision = 20; };
+    state.onGuardRead = () => { state.revision = 20; };
     await sync();
     assert.deepEqual(writes, [{ id: ids.translation, content: "自动中文" }]);
     assert.ok(reads.some(r => r.id === "row-1-translation" && r.revision === 20));
@@ -286,7 +446,7 @@ test("whole-cell guard checks every paragraph at the write revision and still fi
 test("whole-cell guard uses the current empty paragraph rather than a removed scan-time target", async () => {
   await withResultCellFixture(async ({ blocks, append, state, writes, sync }) => {
     let replacement;
-    state.onPreview = () => {
+    state.onGuardRead = () => {
       replacement = append("translation", { text: { elements: [] } });
       blocks.find(b => b.block_id === "row-1-translation").children = [replacement.block_id];
       state.revision += 1;
@@ -302,7 +462,7 @@ for (const failure of ["missing paragraph", "cycle", "revision conflict"]) {
   const label = failure === "revision conflict" ? "simulated API revision rejection" : failure;
   test(`whole-cell guard fails closed on ${label}`, async () => {
     await withResultCellFixture(async ({ blocks, state, writes, cached, sync }) => {
-      state.onPreview = () => {
+      state.onGuardRead = () => {
         blocks.find(b => b.block_id === "row-1-translation").children.push(
           failure === "cycle" ? "row-1-translation" : failure === "missing paragraph" ? "missing-child" : "row-1-translation-text",
         );
@@ -313,7 +473,7 @@ for (const failure of ["missing paragraph", "cycle", "revision conflict"]) {
       };
       await sync();
       assert.deepEqual(writes, []);
-      assert.deepEqual(cached, [], "an incomplete read or rejected write must remain retryable");
+      assert.deepEqual(cached, [["whole-cell-doc", -1]], "an incomplete read or rejected write must remain retryable");
     });
   });
 }
@@ -419,7 +579,7 @@ test("a failed row write is not marked as a successfully processed document revi
   };
   try {
     await syncModule.syncProductDocument(client, { id: "p", documentId: "doc-write-error" });
-    assert.deepEqual(cached, []);
+    assert.deepEqual(cached, [["doc-write-error", -1]]);
   } finally { delete globalThis.__productDocSyncWriteProtectionHooks; }
 });
 
@@ -758,11 +918,7 @@ test("periodic sync discovers a new link in the second row-mapped document witho
       analysisMode: "product_doc",
     }]);
     assert.deepEqual(enqueued, ["video-from-second-document"]);
-    assert.deepEqual(writes, [{
-      documentId: "document-row-b",
-      blockId: second.rowTextIds[0].status,
-      content: "",
-    }], "legacy state text is cleared; no new queue state is displayed");
+    assert.deepEqual(writes, [], "discovery must not wait for external writes; the independent delivery clears legacy state");
   } finally {
     delete globalThis.__productDocSyncWriteProtectionHooks;
   }
@@ -1230,7 +1386,7 @@ test("a task completed during preview upload cannot be requeued from a stale fai
   }
 });
 
-test("changing link A to B during preview prevents A's preview and completed result from binding", async () => {
+test("changing link during upload prevents A's file binding; text delivered before that edit is preserved", async () => {
   const linkA = "https://www.tiktok.com/@demo/video/7000000000000000206";
   const linkB = "https://www.tiktok.com/@demo/video/7000000000000000207";
   const { blocks, rowTextIds } = documentBlocks([{ link: linkA, status: "", analysis: "", translation: "" }]);
@@ -1275,7 +1431,7 @@ test("changing link A to B during preview prevents A's preview and completed res
       { found: 1, queued: 0, completed: 1, failed: 0 },
     );
     assert.deepEqual(bindingChecks.map((item) => item.valid), [true, false]);
-    assert.deepEqual(writes, []);
+    assert.deepEqual(writes, [{ blockId: rowTextIds[0].translation, content: "A的翻译" }], "translation was delivered before the link edit; never erase an already filled cell");
   } finally {
     delete globalThis.__productDocSyncWriteProtectionHooks;
   }

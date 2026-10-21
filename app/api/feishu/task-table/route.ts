@@ -22,13 +22,21 @@ export async function POST(request: NextRequest) {
     const tableId = String(body.tableId || body.table_id || "").trim();
     const recordId = String(body.recordId || body.record_id || "").trim();
     if (!appToken || !tableId || !recordId) return NextResponse.json({ error: "缺少 appToken、tableId 或 recordId" }, { status: 400 });
+    if (body.credentialSource !== undefined && !["primary", "chatgpt"].includes(String(body.credentialSource))) {
+      return NextResponse.json({ error: "飞书应用配置无效" }, { status: 400 });
+    }
+    const selectedCredentialSource = body.credentialSource === "chatgpt" ? "chatgpt" : "primary";
     const fields = payloadFields(body);
     const stored = await getFeishuFieldMapping(`${appToken}:${tableId}`);
+    if (selectedCredentialSource === "chatgpt" && !stored) {
+      return NextResponse.json({ error: "请先为这张表保存字段配置，并授权 chatgpt 应用访问" }, { status: 403 });
+    }
     const requested = payloadFieldMap(body.fieldMap || body.field_map);
     const resolved = resolveAutomationFields(fields, { ...stored?.fieldMap, ...requested }, stored?.aliases);
     if (!resolved.videoUrl || !isTikTokUrl(resolved.videoUrl)) return NextResponse.json({ error: "这一行没有有效的 TikTok 视频链接" }, { status: 400 });
-    const receipt = await claimFeishuRequest(request.headers, body, ["video-webhook", appToken, tableId, recordId], { fields, fieldMap: requested },
-      { kind: "video", credentialSource: "primary", appToken, tableId, recordId, fields, fieldMap: resolved.map });
+    const receipt = await claimFeishuRequest(request.headers, body, ["video-webhook", appToken, tableId, recordId],
+      { fields, fieldMap: requested, ...(selectedCredentialSource === "chatgpt" ? { credentialSource: "chatgpt" } : {}) },
+      { kind: "video", credentialSource: selectedCredentialSource, appToken, tableId, recordId, fields, fieldMap: resolved.map });
     if (receipt?.duplicate) return NextResponse.json(feishuRequestReplay(receipt));
     after(() => runFeishuInboxPass());
     return NextResponse.json({ code: 0, msg: "success", data: { accepted: true, jobId: receipt?.id,

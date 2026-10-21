@@ -47,7 +47,7 @@ export function payloadFields(body: Record<string, unknown>) {
       if (fields && typeof fields === "object" && !Array.isArray(fields)) return fields as Record<string, unknown>;
     }
   }
-  const controlKeys = new Set(["appToken", "app_token", "tableId", "table_id", "recordId", "record_id", "secret", "fieldMap", "field_map", "requestId", "request_id"]);
+  const controlKeys = new Set(["appToken", "app_token", "tableId", "table_id", "recordId", "record_id", "secret", "fieldMap", "field_map", "requestId", "request_id", "credentialSource"]);
   const directFields = Object.fromEntries(Object.entries(body).filter(([key]) => !controlKeys.has(key)));
   return directFields;
 }

@@ -100,7 +100,7 @@ PID 必须是文本型完整数字，不从商品链接的英文名称推断商�
 
 根据负责人 2026-10-21 的要求，删除专用 `/api/feishu/video-library` 入口、执行器、服务商适配器和配置脚本，不再维护独立五槽任务链。《优质视频库》改用现有 `POST /api/feishu/task-table`，与其他任务表共用接收箱、视频队列、TokScript、翻译和附件回填。手卡完整视频分析不变。
 
-目标 Base 为 `GujZbD0psaRxBrs6WSJc5d6anud`，表为 `tblgmuFeWjhWXfRd`。既有飞书原生流程分别响应新增记录和仅视频链接修改，HTTP 表单发送 `appToken`、`tableId`、`recordId`、`视频链接`，请求头仍用现有 `X-Feishu-Automation-Secret`。不再传递已删除的系统时间或依赖处理状态列；原经典「自动化流程」继续停用，防止重复调用。
+目标 Base 为 `GujZbD0psaRxBrs6WSJc5d6anud`，表为 `tblgmuFeWjhWXfRd`。既有飞书原生流程分别响应新增记录和仅视频链接修改，HTTP 表单发送 `appToken`、`tableId`、`recordId`、`视频链接`、`credentialSource=chatgpt`，请求头仍用现有 `X-Feishu-Automation-Secret`。本表原应用有读取但无写入权限，因此选择已经获本表授权的 chatgpt 应用；默认不传该参数的其他表仍用原应用。chatgpt 选择要求表格已有保存的字段配置，且实际读写仍由飞书权限决定。不再传递已删除的系统时间或依赖处理状态列；原经典「自动化流程」继续停用，防止重复调用。
 
 按现有 `feishu_field_mappings` 保存本表映射：`videoUrl=视频链接`、`videoFile=文件`、`transcript=原口播`、`translation=中文翻译`，其余映射显式设为空字符串。这样不生成字幕、手卡或视频分析，也不向不存在的列写入。`日期`、`产品名称`及已有文字和附件不被覆盖。沿用通用任务表原有的重试、两槽视频并发和后台错误记录；TokScript 没有提供中文时，沿用已配置的 Qwen 文本翻译。启用配置不会提交历史链接；只有新的飞书触发请求进入队列。
 

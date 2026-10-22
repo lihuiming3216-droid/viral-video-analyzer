@@ -22,6 +22,7 @@ import {
 import { listFeishuDocumentBlocks, updateFeishuTextBlock } from "@/lib/feishu/document";
 import { ensureFeishuVideoPreview, hasFeishuVideoPreview } from "@/lib/feishu/docx-file";
 import { ProductDocumentDiscovery } from "@/lib/feishu/product-doc-discovery";
+import { isFeishuRateLimit } from "@/lib/feishu/read-control";
 import { ensureFeishuConnection, getConnectedFeishuChannel } from "@/lib/feishu/runtime";
 import { enqueueVideos } from "@/lib/queue";
 import { NO_PRODUCT_VOICEOVER_TRANSCRIPT } from "@/lib/transcript-validation";
@@ -289,6 +290,7 @@ async function getDocumentRevisionId(client: Client, documentId: string) {
     method: "GET",
   });
   const revisionId = response.data?.document?.revision_id;
+  if (isFeishuRateLimit(response)) throw Object.assign(new Error("飞书读取被限流"), { feishuCode: 99991400 });
   if (typeof revisionId !== "number" || !Number.isInteger(revisionId)) throw new Error("飞书没有返回文档版本号");
   return revisionId;
 }
@@ -331,7 +333,9 @@ async function syncProductDocumentUnlocked(
       currentRevisionId = await getDocumentRevisionId(client, product.documentId);
       const cachedRevisionId = await getCachedDocumentRevision(product.documentId);
       if (cachedRevisionId !== null && cachedRevisionId === currentRevisionId) return result;
-    } catch {
+    } catch (error) {
+      // A rejected cheap read must not fan out into an expensive full read.
+      if (isFeishuRateLimit(error)) throw error;
       // 版本号读取失败就退回原来的行为：照常做一次完整深读，不能因为这个优化误跳过真实变更。
       currentRevisionId = null;
     }
@@ -595,8 +599,6 @@ export async function syncAllProductDocuments(options: { background?: boolean } 
   const channel = getConnectedFeishuChannel() || await ensureFeishuConnection();
   if (!channel) return { documents: 0, found: 0, queued: 0, completed: 0, failed: 0 };
   const documents = await listProductDocumentSyncTargets();
-  if (!documents.length) return { documents: 0, found: 0, queued: 0, completed: 0, failed: 0 };
-
   workerState.__productDocDiscovery ||= new ProductDocumentDiscovery();
   return workerState.__productDocDiscovery.poll(channel.rawClient, documents,
     product => syncProductDocument(channel.rawClient, product, { discoverOnly: true }), options.background);

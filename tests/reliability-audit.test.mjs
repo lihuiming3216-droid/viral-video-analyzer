@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import ts from "typescript";
+import { readControlUrl } from "./helpers/feishu-read-control.mjs";
 
 const url = code => `data:text/javascript;base64,${Buffer.from(code).toString("base64")}`;
 const compile = source => ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } }).outputText.replace('import "server-only";', "");
@@ -73,7 +74,9 @@ test("all Feishu HTTP methods have bounded deadlines and preserve upload allowan
   globalThis[key] = options => { calls.push(options); return Promise.resolve({ ok: true }); };
   t.after(() => { delete globalThis[key]; });
   const stub = url(`export const defaultHttpInstance = { request: options => globalThis[${JSON.stringify(key)}](options) };`);
-  const code = compile(await read("lib/feishu/http.ts")).replaceAll('"@larksuiteoapi/node-sdk"', JSON.stringify(stub));
+  const code = compile(await read("lib/feishu/http.ts"))
+    .replaceAll('"@larksuiteoapi/node-sdk"', JSON.stringify(stub))
+    .replaceAll('"@/lib/feishu/read-control"', JSON.stringify(readControlUrl));
   const { feishuHttp } = await import(url(code));
   await feishuHttp.get("https://open.feishu.cn/open-apis/bitable/v1/apps/base/tables/table/records");
   await feishuHttp.post("https://open.feishu.cn/open-apis/drive/v1/medias/upload_all", "stream");
@@ -94,6 +97,11 @@ test("all Feishu HTTP methods have bounded deadlines and preserve upload allowan
   await new Promise(resolve => setTimeout(resolve, 15));
   assert.equal(calls.at(-1).signal.aborted, true);
   assert.equal(calls.length, 6, "the transport must not retry uncertain writes");
+  const documentUrl = "https://open.feishu.cn/open-apis/docx/v1/documents/deadline-fixture";
+  await feishuHttp.get(documentUrl);
+  await assert.rejects(feishuHttp.get(documentUrl, { timeout: 10 }), /timeout/i,
+    "time spent waiting for a read slot must count toward the HTTP deadline");
+  assert.equal(calls.length, 7, "an expired queued read must never reach the SDK transport");
 });
 
 test("subtitle upload retries reuse persisted translations, independent tasks do not, and concurrent deliveries share one request", async t => {

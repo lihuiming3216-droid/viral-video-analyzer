@@ -2,9 +2,11 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import ts from "typescript";
+import { readControlUrl } from "./helpers/feishu-read-control.mjs";
 
 const source = await readFile(new URL("../lib/feishu/product-doc-discovery.ts", import.meta.url), "utf8");
-const code = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } }).outputText;
+const code = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } }).outputText
+  .replaceAll('"@/lib/feishu/read-control"', JSON.stringify(readControlUrl));
 const { ProductDocumentDiscovery } = await import(`data:text/javascript;base64,${Buffer.from(code).toString("base64")}`);
 const result = () => ({ found: 1, queued: 0, completed: 1, failed: 0 });
 const targets = n => Array.from({ length: n }, (_, i) => ({ id: `p-${i}`, pid: `pid-${i}`, name: "fixture", documentId: `doc-${i}`, documentUrl: "", cachedRevision: 7 }));
@@ -92,14 +94,80 @@ test("same-second edits are revision-audited during the settling window", async 
   assert.equal(scans, 2);
 });
 
-test("a failed scan is not acknowledged and a change of product ownership invalidates the watermark", async () => {
+test("a failed scan backs off without acknowledgement; edits and ownership changes bypass the cooldown", async t => {
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
   const docs = targets(1), h = metadataHarness(docs), worker = new ProductDocumentDiscovery();
   let scans = 0;
   const scan = async () => { scans++; if (scans === 1) throw Error("fixture failure"); return result(); };
   assert.equal((await worker.poll(h.client, docs, scan)).failed, 1);
   await worker.poll(h.client, docs, scan);
+  assert.equal(scans, 1, "a failed read must not hammer the API on an immediate repeat");
+  now += 20_000;
+  await worker.poll(h.client, docs, scan);
   assert.equal(scans, 2);
   docs[0].id = "replacement-product";
   await worker.poll(h.client, docs, scan);
   assert.equal(scans, 3);
+});
+
+test("a throttled metadata batch never fans out into hundreds of document reads", async () => {
+  const docs = targets(455), h = metadataHarness(docs), worker = new ProductDocumentDiscovery();
+  const original = h.client.request; let limited = true, scans = 0;
+  h.client.request = async options => {
+    if (limited) return { code: 99991400 };
+    return original(options);
+  };
+  await worker.poll(h.client, docs, async () => { scans++; return result(); });
+  assert.equal(scans, 0);
+  h.client.request = async () => { throw { code: "ERR_BAD_REQUEST", response: { data: { code: 99991400 } } }; };
+  await worker.poll(h.client, docs, async () => { scans++; return result(); });
+  assert.equal(scans, 0);
+  limited = false; h.client.request = original;
+  await worker.poll(h.client, docs, async () => { scans++; return result(); });
+  assert.equal(scans, 455, "no deferred card may be acknowledged as already checked");
+});
+
+test("repeated inaccessible cards back off to five minutes, while a changed watermark retries immediately", async t => {
+  let now = Date.now(); t.mock.method(Date, "now", () => now);
+  const docs = targets(1), h = metadataHarness(docs), worker = new ProductDocumentDiscovery();
+  h.versions.delete("doc-0"); let scans = 0;
+  const scan = async () => { scans++; throw Error("permission denied"); };
+  await worker.poll(h.client, docs, scan);
+  now += 59_999; await worker.poll(h.client, docs, scan); assert.equal(scans, 1);
+  now++; await worker.poll(h.client, docs, scan); assert.equal(scans, 2);
+  now += 119_999; await worker.poll(h.client, docs, scan); assert.equal(scans, 2);
+  now++; await worker.poll(h.client, docs, scan); assert.equal(scans, 3);
+  now += 240_000; await worker.poll(h.client, docs, scan); assert.equal(scans, 4);
+  now += 299_999; await worker.poll(h.client, docs, scan); assert.equal(scans, 4);
+  now++; await worker.poll(h.client, docs, scan); assert.equal(scans, 5);
+  h.versions.set("doc-0", "104"); await worker.poll(h.client, docs, scan); assert.equal(scans, 6);
+});
+
+test("a failure of an old in-flight snapshot cannot delay the already-observed new edit", async () => {
+  const docs = targets(1), h = metadataHarness(docs), worker = new ProductDocumentDiscovery(), first = gate();
+  let calls = 0;
+  const scan = async () => { calls++; if (calls === 1) { await first.promise; throw Error("old snapshot"); } return result(); };
+  await worker.poll(h.client, docs, scan, true);
+  h.versions.set("doc-0", "102"); const next = worker.poll(h.client, docs, scan);
+  await tick(); first.release(); await next;
+  assert.equal(calls, 2);
+  await worker.poll(h.client, docs, scan); assert.equal(calls, 2);
+});
+
+test("removing all targets drops old queued work instead of processing unbound cards later", async () => {
+  const docs = targets(8), h = metadataHarness(docs), worker = new ProductDocumentDiscovery(), hold = gate(), calls = [];
+  await worker.poll(h.client, docs, async d => { calls.push(d.documentId); await hold.promise; return result(); }, true);
+  assert.equal(calls.length, 4);
+  await worker.poll(h.client, [], async () => result(), true);
+  hold.release(); await tick();
+  assert.equal(calls.length, 4, "only already-in-flight reads may finish");
+});
+
+test("a future timestamp cannot force repeated full revision audits on unchanged cards", async () => {
+  const docs = targets(1), h = metadataHarness(docs), worker = new ProductDocumentDiscovery();
+  h.versions.set("doc-0", String(Math.floor(Date.now() / 1000) + 86_400)); let calls = 0;
+  const scan = async () => { calls++; return result(); };
+  await worker.poll(h.client, docs, scan); await worker.poll(h.client, docs, scan);
+  assert.equal(calls, 1);
 });

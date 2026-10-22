@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import ts from "typescript";
+import { readControlUrl } from "./helpers/feishu-read-control.mjs";
 
 const syncSource = await readFile(
   new URL("../lib/feishu/product-doc-sync.ts", import.meta.url),
@@ -15,7 +16,7 @@ const { NO_PRODUCT_VOICEOVER_TRANSCRIPT } = await import(transcriptValidationUrl
 const discoverySource = await readFile(new URL("../lib/feishu/product-doc-discovery.ts", import.meta.url), "utf8");
 const discoveryUrl = `data:text/javascript;base64,${Buffer.from(ts.transpileModule(discoverySource, {
   compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
-}).outputText).toString("base64")}`;
+}).outputText.replaceAll('"@/lib/feishu/read-control"', JSON.stringify(readControlUrl))).toString("base64")}`;
 
 async function loadSyncModule() {
   const stubSource = `
@@ -97,6 +98,7 @@ async function loadSyncModule() {
     .replaceAll('"@/lib/feishu/document"', JSON.stringify(stubUrl))
     .replaceAll('"@/lib/feishu/runtime"', JSON.stringify(stubUrl))
     .replaceAll('"@/lib/feishu/product-doc-discovery"', JSON.stringify(discoveryUrl))
+    .replaceAll('"@/lib/feishu/read-control"', JSON.stringify(readControlUrl))
     .replaceAll('"@/lib/transcript-validation"', JSON.stringify(transcriptValidationUrl))
     .replaceAll('"@/lib/queue"', JSON.stringify(stubUrl));
   compiled = compiled.replaceAll('"@/lib/video-processing"', JSON.stringify(stubUrl));
@@ -140,6 +142,25 @@ function documentBlocks(rows) {
 }
 
 const syncModule = await loadSyncModule();
+
+test("a throttled revision read never falls through to a full document read or queues a video", async () => {
+  let reads = 0, queues = 0, caches = 0;
+  globalThis.__productDocSyncWriteProtectionHooks = {
+    listFeishuDocumentBlocks: () => { reads++; return []; },
+    enqueueVideos: () => { queues++; },
+    setCachedDocumentRevision: () => { caches++; },
+  };
+  try {
+    for (const value of [{ code: 99991400 }, { code: "ERR_BAD_REQUEST", response: { data: { code: 99991400 } } }]) {
+      const client = { request: async () => {
+        if (value.response) throw value;
+        return value;
+      } };
+      await assert.rejects(syncModule.syncProductDocument(client, { id: "rate-limited", documentId: "rate-limited-doc" }));
+    }
+    assert.equal(reads, 0); assert.equal(queues, 0); assert.equal(caches, 0);
+  } finally { delete globalThis.__productDocSyncWriteProtectionHooks; }
+});
 
 async function withResultCellFixture(run, overrides = {}) {
   const link = "https://www.tiktok.com/@demo/video/123456789";

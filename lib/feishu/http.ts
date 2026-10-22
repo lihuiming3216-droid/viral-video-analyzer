@@ -1,7 +1,11 @@
 import "server-only";
 import { defaultHttpInstance, type HttpInstance, type HttpRequestOptions } from "@larksuiteoapi/node-sdk";
+import { FeishuReadControl } from "@/lib/feishu/read-control";
 
-/** Bound the SDK's otherwise unlimited HTTP calls without adding retries. */
+const state = globalThis as typeof globalThis & { __feishuReadControl?: FeishuReadControl };
+const reads = state.__feishuReadControl ||= new FeishuReadControl();
+
+/** Bound all calls; only explicitly safe document reads have one rate-limit retry. */
 function request<T, R = T, D = unknown>(options: HttpRequestOptions<D>): Promise<R> {
   const upload = /\/open-apis\/(?:drive\/v1\/(?:medias|files)\/upload|im\/v1\/(?:files|images))(?:[\/_?]|$)/.test(options.url || "");
   const limit = upload ? 120_000 : 30_000;
@@ -9,11 +13,12 @@ function request<T, R = T, D = unknown>(options: HttpRequestOptions<D>): Promise
     ? Math.min(options.timeout!, limit) : limit;
   const deadline = AbortSignal.timeout(timeout);
   const callerSignal = (options as HttpRequestOptions<D> & { signal?: AbortSignal }).signal;
+  const signal = callerSignal ? AbortSignal.any([callerSignal, deadline]) : deadline;
   // The SDK's response interceptor returns the body (R), not AxiosResponse.
-  return defaultHttpInstance.request<T, R, D>({
+  return reads.run({ ...options, signal }, () => defaultHttpInstance.request<T, R, D>({
     ...options, timeout,
-    signal: callerSignal ? AbortSignal.any([callerSignal, deadline]) : deadline,
-  }) as Promise<R>;
+    signal,
+  }) as Promise<R>);
 }
 
 export const feishuHttp: HttpInstance = {

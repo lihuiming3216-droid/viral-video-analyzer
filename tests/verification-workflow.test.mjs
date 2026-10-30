@@ -72,7 +72,7 @@ test("both release paths require the download-fallback regression tests", () => 
 
 test("both release paths include the reliability audit and provider transcript regressions", () => {
   for (const text of [workflow, read(".github/workflows/deploy.yml")]) {
-    for (const file of ["reliability-audit", "tokscript-transcript-source", "feishu-docx-video-preview", "feishu-request-dedup", "feishu-inbox", "video-execution", "product-link-retirement"]) {
+    for (const file of ["reliability-audit", "tokscript-transcript-source", "feishu-docx-video-preview", "feishu-request-dedup", "feishu-inbox", "video-execution", "analysis-pipeline"]) {
       assert.ok(text.includes(`tests/${file}.test.mjs`));
     }
   }

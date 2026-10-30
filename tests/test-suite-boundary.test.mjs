@@ -7,23 +7,13 @@ const read = file => readFile(new URL(file, root), "utf8");
 const testFiles = async directory => (await readdir(new URL(directory, root)))
   .filter(name => name.endsWith(".test.mjs")).sort();
 
-test("default tests cover active files and explicit commands retain legacy and combined suites", async () => {
+test("the default command runs every test file and no archived suites remain", async () => {
   const { scripts } = JSON.parse(await read("package.json"));
   const command = "node --test --test-concurrency=2 --test-reporter=./tests/compact-reporter.mjs";
   assert.equal(scripts.test, `${command} tests/*.test.mjs`);
-  assert.equal(scripts["test:legacy"], `${command} tests/legacy/*.test.mjs`);
-  assert.equal(scripts["test:all"], `${command} tests/*.test.mjs tests/legacy/*.test.mjs`);
-});
-
-test("only retired product-link suites are archived and their assertions remain enabled", async () => {
-  const expected = ["openai-product-analyzer.test.mjs", "product-parser-contract.test.mjs", "product-parser-evidence.test.mjs"];
-  assert.deepEqual(await testFiles("tests/legacy/"), expected);
-  const active = await testFiles("tests/");
-  assert.ok(expected.every(file => !active.includes(file)));
-  assert.ok(active.includes("product-link-retirement.test.mjs"), "the closed-entry-point guard must stay active");
-  for (const file of expected) {
-    assert.doesNotMatch(await read(`tests/legacy/${file}`), /\btest\.(?:skip|todo|only)\s*\(/);
-  }
+  assert.equal(scripts["test:legacy"], undefined);
+  assert.equal(scripts["test:all"], undefined);
+  await assert.rejects(readdir(new URL("tests/legacy/", root)), { code: "ENOENT" });
 });
 
 test("verification and deployment both run every active test file", async () => {

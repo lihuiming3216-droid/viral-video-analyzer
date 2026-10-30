@@ -1,34 +1,15 @@
 import assert from "node:assert/strict";
-import { readFile, stat } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
-import { createIsolatedDatabase, moduleUrl, loadTestModule } from "./helpers/isolated-mysql.mjs";
-import { NextRequest } from "next/server.js";
 
 const root = new URL("../", import.meta.url);
 
-test("ships the finished product shell and branded preview", async () => {
-  const [page, layout, app, image] = await Promise.all([
-    readFile(new URL("app/page.tsx", root), "utf8"),
-    readFile(new URL("app/layout.tsx", root), "utf8"),
-    readFile(new URL("app/ViralAnalyzerApp.tsx", root), "utf8"),
-    stat(new URL("public/og.png", root)),
-  ]);
-  assert.match(page, /ViralAnalyzerApp/);
-  assert.match(layout, /爆片分析/);
-  assert.match(layout, /og\.png/);
-  assert.match(app, /产品爆片档案库/);
-  assert.match(app, /两条视频对比/);
-  assert.match(app, /逐镜头时间轴/);
-  assert.ok(image.size > 100_000);
-  assert.doesNotMatch(`${page}\n${layout}\n${app}`, /codex-preview|SkeletonPreview|Your site is taking shape/);
-});
-
-test("database schema covers archive, scenes, providers, learning, Feishu and search indexes", async () => {
+test("database schema covers products, videos, providers, Feishu and search indexes", async () => {
   const database = await readFile(new URL("lib/db/schema.sql", root), "utf8");
-  for (const table of ["products", "videos", "scenes", "provider_settings", "learning_memories", "learning_profiles", "feishu_settings", "feishu_targets", "feishu_batches", "feishu_deliveries", "feishu_documents", "feishu_events"]) {
+  for (const table of ["products", "videos", "provider_settings", "feishu_settings", "feishu_documents"]) {
     assert.match(database, new RegExp(`CREATE TABLE IF NOT EXISTS ${table}`));
   }
-  for (const index of ["idx_videos_product_created", "idx_videos_account_created", "idx_videos_status", "uq_scenes_video_shot", "idx_learning_memories_product"]) {
+  for (const index of ["idx_videos_product_created", "idx_videos_account_created", "idx_videos_status"]) {
     assert.match(database, new RegExp(index));
   }
 });
@@ -51,7 +32,7 @@ test("new video insert keeps its columns and bound values aligned", async () => 
   assert.equal(placeholders.length, columns.length - 2, "status and stage are SQL literals; every other video column needs a bound value");
 });
 
-test("product documents only sync files and translation while full analysis and the manual prop area remain", async () => {
+test("product documents only sync files and translation and the manual prop area remains", async () => {
   const [instrumentation, sync, analysis, document, qwen, tokscript, processing] = await Promise.all([
     readFile(new URL("instrumentation.ts", root), "utf8"),
     readFile(new URL("lib/feishu/product-doc-sync.ts", root), "utf8"),
@@ -65,26 +46,13 @@ test("product documents only sync files and translation while full analysis and 
   assert.match(sync, /getVideoBySourceUrl/);
   assert.match(sync, /中文翻译\|原口播文案/);
   assert.match(sync, /setTimeout\(resolve, 380\)/);
-  assert.match(analysis, /qwenMaxTokens = Math\.min\(16_000, 2_500 \+ assets\.scenes\.length \* 700\)/);
-  assert.match(analysis, /if \(analysisMode !== "full"\)/);
   assert.doesNotMatch(sync, /analysisCellId|conciseProductDocAnalysis|product_doc_failure_delivered/);
-  assert.match(analysis, /includeCover: analysisMode !== "product_doc"/);
-  assert.match(analysis, /中文翻译由 TokScript 独立链路处理/);
-  assert.match(analysis, /禁止生成 translationZh/);
-  assert.match(qwen, /max_tokens: input\.maxTokens \|\| 4_500/);
-  assert.match(qwen, /type: "video_url"/);
-  assert.match(qwen, /fps: qwenVideoFps\(\)/);
+  assert.match(analysis, /includeCover: false/);
+  assert.match(analysis, /recordStage\("analysis", "skipped"\)/);
+  assert.doesNotMatch(analysis, /analyzeVideoWithQwen|extractVideoAssets|learnFromVideo/);
   assert.match(qwen, /qwen3\.5-omni-plus/);
-  assert.match(qwen, /modalities: \["text"\]/);
-  assert.match(qwen, /stream: true/);
-  assert.doesNotMatch(qwen, /MAX_ANALYSIS_FRAMES/);
-  assert.match(analysis, /：完整 MP4 画面与原始音轨分析/);
+  assert.doesNotMatch(qwen, /MAX_ANALYSIS_FRAMES|analyzeVideoWithQwen/);
   assert.doesNotMatch(analysis, /完整原文：\$\{input\.transcript\}/);
-  assert.match(processing, /prepareLocalVideoForQwen/);
-  assert.match(processing, /"-c:a", "aac"/);
-  const fullVideoAnalyzer = qwen.slice(qwen.indexOf("export async function analyzeVideoWithQwen"), qwen.indexOf("// DashScope's Qwen-Omni"));
-  assert.ok(fullVideoAnalyzer.length > 100);
-  assert.doesNotMatch(fullVideoAnalyzer, /input_audio/);
   assert.doesNotMatch(analysis, /transcribeAudioWithQwen|splitAudioForQwenAsr/);
   assert.doesNotMatch(processing, /segment_time", "270/);
   assert.match(tokscript, /options\.includeCover !== false/);
@@ -111,31 +79,9 @@ test("product documents only sync files and translation while full analysis and 
   assert.match(document, /B3GNdl05HoEdjnx8WPrcwC5Hnlg/);
 });
 
-test("Feishu bot receives links, returns scored reports, and excludes remake copy from documents", async () => {
-  const [runtime, handler, cards, document, app, packageJson] = await Promise.all([
-    readFile(new URL("lib/feishu/runtime.ts", root), "utf8"),
-    readFile(new URL("lib/feishu/handler.ts", root), "utf8"),
-    readFile(new URL("lib/feishu/cards.ts", root), "utf8"),
-    readFile(new URL("lib/feishu/document.ts", root), "utf8"),
-    readFile(new URL("app/ViralAnalyzerApp.tsx", root), "utf8"),
-    readFile(new URL("package.json", root), "utf8"),
-  ]);
-  assert.match(runtime, /createLarkChannel/);
-  assert.match(runtime, /requireMention: true/);
-  assert.match(handler, /parseFeishuSubmission/);
-  assert.match(handler, /createFeishuBatch/);
-  for (const score of ["流量潜力", "带货转化", "画面质量", "产品展示", "声音情绪", "节奏完播"]) {
-    assert.match(cards, new RegExp(score));
-    assert.match(document, new RegExp(score));
-  }
-  assert.doesNotMatch(document, /rewriteScript|可直接照着拍的新中文脚本/);
-  assert.match(app, /发送到飞书/);
-  assert.match(packageJson, /@larksuiteoapi\/node-sdk/);
-});
-
 test("source tree contains no pasted API keys", async () => {
   const files = [
-    "app/ViralAnalyzerApp.tsx", "lib/provider-config.ts",
+    "lib/provider-config.ts",
     "lib/providers/qwen.ts", "lib/providers/tokscript.ts", "README.md",
   ];
   const text = (await Promise.all(files.map((file) => readFile(new URL(file, root), "utf8")))).join("\n");
@@ -164,39 +110,11 @@ test("admin login retains independent Feishu callback authentication", async () 
 });
 
 test("TikTok inputs require HTTPS TikTok hosts and PID links do not invent a product slug", async () => {
-  const [links, importRoute, parseRoute] = await Promise.all([
-    readFile(new URL("lib/tiktok-product.ts", root), "utf8"),
-    readFile(new URL("app/api/videos/import/route.ts", root), "utf8"),
-    readFile(new URL("app/api/products/parse-public/route.ts", root), "utf8"),
-  ]);
+  const links = await readFile(new URL("lib/tiktok-product.ts", root), "utf8");
   assert.match(links, /url\.protocol === "https:"/);
   assert.match(links, /hostname\.endsWith\("\.tiktok\.com"\)/);
   assert.match(links, /www\.tiktok\.com\/view\/product/);
   assert.doesNotMatch(links, /zhenmi-cordless-blender/);
-  assert.match(importRoute, /isTikTokUrl/);
-  assert.match(parseRoute, /PRODUCT_LINK_ANALYSIS_RETIRED/);
-  assert.match(parseRoute, /status: 410/);
-  assert.doesNotMatch(parseRoute, /@\/lib\/product-parser|request\.json|canonicalTikTokProductUrl/);
-});
-
-test("dashboard handler returns real MySQL business data without exposing provider secrets", async t => {
-  const f = await createIsolatedDatabase(t);
-  const product = await f.database.createProduct({ name: "dashboard fixture", pid: "1731000000000000001" });
-  await f.database.saveProviderSetting({ provider: "qwen", encryptedApiKey: "fixture-secret-never-return", baseUrl: "https://provider.invalid", enabled: true });
-  const noBackground = moduleUrl("export const ensureFeishuConnection=async()=>null; export const resumePendingVideos=async()=>{};");
-  const { exports: route } = await f.load("app/api/dashboard/route.ts", {
-    "next/server": import.meta.resolve("next/server.js"), "@/lib/feishu/runtime": noBackground, "@/lib/queue": noBackground,
-  });
-  const response = await route.GET(new NextRequest("http://localhost/api/dashboard"));
-  assert.equal(response.status, 200);
-  const payload = await response.json();
-  assert.ok(Array.isArray(payload.products));
-  assert.ok(Array.isArray(payload.videos));
-  assert.ok(Array.isArray(payload.providers));
-  assert.ok(payload.products.every((product) => typeof product.pid === "string"));
-  assert.ok(payload.providers.every((provider) => !("encryptedApiKey" in provider) && !("apiKey" in provider)));
-  assert.ok(payload.products.some(item => item.id === product.id));
-  assert.doesNotMatch(JSON.stringify(payload), /fixture-secret-never-return/);
 });
 
 test("Qwen uses bounded requests and outbound dependencies can use the macOS proxy", async () => {
@@ -219,38 +137,6 @@ test("queue runs two videos concurrently without enqueueing an active id twice",
   assert.match(queue, /VIDEO_TASK_TIMEOUT_MS = 30 \* 60 \* 1_000/);
   assert.match(queue, /AbortController/);
   assert.match(queue, /controller\.abort/);
-});
-
-test("finished videos can be deleted with their archived media", async () => {
-  const [route, processing, app, types] = await Promise.all([
-    readFile(new URL("app/api/videos/[id]/route.ts", root), "utf8"),
-    readFile(new URL("lib/video-processing.ts", root), "utf8"),
-    readFile(new URL("app/ViralAnalyzerApp.tsx", root), "utf8"),
-    readFile(new URL("lib/types.ts", root), "utf8"),
-  ]);
-  assert.match(route, /export async function DELETE/);
-  assert.match(route, /"waiting", "completed", "failed", "stopped"/);
-  assert.match(route, /deleteVideoMedia/);
-  assert.match(processing, /rmSync\(target, \{ recursive: true, force: true \}\)/);
-  assert.match(app, /永久删除这条视频/);
-  assert.match(app, /className="queue-delete"/);
-  assert.match(app, /const queue = data\.videos/);
-  assert.match(app, /停止/);
-  assert.match(types, /"stopped"/);
-});
-
-test("analysis page can quickly create a product with an optional PID", async () => {
-  const [app, database, types] = await Promise.all([
-    readFile(new URL("app/ViralAnalyzerApp.tsx", root), "utf8"),
-    readFile(new URL("lib/db/schema.sql", root), "utf8"),
-    readFile(new URL("lib/types.ts", root), "utf8"),
-  ]);
-  assert.match(app, /新增产品档案/);
-  assert.match(app, /PID（选填）/);
-  assert.match(app, /创建并选中/);
-  assert.match(database, /pid VARCHAR\(191\) NOT NULL DEFAULT ''/);
-  assert.match(database, /idx_products_pid/);
-  assert.match(types, /pid: string/);
 });
 
 test("Feishu automation supports direct Base write-back", async () => {
@@ -305,11 +191,10 @@ test("generated Feishu documents grant company editors collaborator management",
 });
 
 test("product cards are created only by the Feishu button and identified by exact PID titles", async () => {
-  const [automation, document, database, ensureDocument, tiktokProduct] = await Promise.all([
+  const [automation, document, database, tiktokProduct] = await Promise.all([
     readFile(new URL("lib/feishu/automation.ts", root), "utf8"),
     readFile(new URL("lib/feishu/document.ts", root), "utf8"),
     readFile(new URL("lib/database.ts", root), "utf8"),
-    readFile(new URL("app/api/products/ensure-document/route.ts", root), "utf8"),
     readFile(new URL("lib/tiktok-product.ts", root), "utf8"),
   ]);
   assert.match(tiktokProduct, /https:\/\/www\.tiktok\.com\/view\/product\/\$\{normalized\}/);
@@ -329,8 +214,6 @@ test("product cards are created only by the Feishu button and identified by exac
   assert.doesNotMatch(automation, /patch\[resolved\.map\.productUrl\]/);
   assert.doesNotMatch(automation, /hyperlinkFieldValue/);
   assert.doesNotMatch(automation, /mergeVerifiedProductFacts/);
-  assert.match(ensureDocument, /产品手卡只能通过飞书表格按钮生成或关联/);
-  assert.match(ensureDocument, /status: 410/);
   assert.match(database, /source_image_urls_json/);
   assert.match(database, /visual_analysis_status/);
   assert.match(database, /visual_analyzed_at/);
@@ -360,37 +243,3 @@ test("product cards are created only by the Feishu button and identified by exac
   assert.match(document, /withProductDocumentLock/);
 });
 
-test("long-term learning is visible and used by future analysis", async () => {
-  const [learning, analysis, app, feedbackRoute] = await Promise.all([
-    readFile(new URL("lib/learning.ts", root), "utf8"),
-    readFile(new URL("lib/analysis.ts", root), "utf8"),
-    readFile(new URL("app/ViralAnalyzerApp.tsx", root), "utf8"),
-    readFile(new URL("app/api/videos/[id]/route.ts", root), "utf8"),
-  ]);
-  assert.match(learning, /getLearningContext/);
-  assert.match(learning, /人工标签和备注是最高优先级证据/);
-  assert.match(analysis, /长期学习系统提供的产品\/品类\/团队历史经验/);
-  assert.match(analysis, /learnFromVideo/);
-  assert.match(feedbackRoute, /learnFromVideo/);
-  assert.match(app, /长期学习中心/);
-  assert.match(app, /学习中心/);
-});
-
-test("learning handler backfills completed reports in an isolated real MySQL", async t => {
-  const f = await createIsolatedDatabase(t);
-  const product = await f.database.createProduct({ name: "learning fixture" });
-  const video = await f.database.createVideo({ productId: product.id, sourceType: "tiktok", sourceUrl: "https://example.test/video" });
-  await f.database.updateVideo(video.id, { status: "completed", analysis_json: { title: "fixture",
-    hook: { type: "question", description: "problem", whyItWorks: "clear" }, structureFormula: "problem-solution",
-    strengths: ["clear"], weaknesses: [], scenes: [], summary: "fixture", scores: {traffic:80,conversion:70,visual:70,product:80,audio:60,rhythm:70} } });
-  const query = await loadTestModule("lib/db/query.ts");
-  const learning = await f.load("lib/learning.ts", { "@/lib/db/query": query.url });
-  const { exports: route } = await f.load("app/api/learning/route.ts", { "next/server": import.meta.resolve("next/server.js"), "@/lib/learning": learning.url });
-  const response = await route.GET();
-  assert.equal(response.status, 200);
-  const payload = await response.json();
-  assert.equal(payload.learnedVideos, 1);
-  assert.ok(Array.isArray(payload.profiles));
-  assert.ok(Array.isArray(payload.recentMemories));
-  assert.equal(payload.recentMemories[0].videoId, video.id);
-});

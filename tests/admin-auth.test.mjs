@@ -21,7 +21,7 @@ test("Feishu machine routes keep their existing authentication; admin and server
     assert.equal(auth.publicMachineRoute(route, "GET"), false);
     assert.equal(auth.publicMachineRoute(route, "POST"), false);
   }
-  assert.equal(auth.publicMachineRoute("/api/media/video/original.mp4", "GET"), true);
+  assert.equal(auth.publicMachineRoute("/api/media/video/original.mp4", "GET"), false);
   assert.equal(auth.publicMachineRoute("/api/media/video/original.mp4", "POST"), false);
   assert.equal(auth.publicMachineRoute("/_next/static/chunk.js", "POST", true), false);
 });

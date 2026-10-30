@@ -72,27 +72,6 @@ const NAV_ITEMS = [
       </svg>
     ),
   },
-  {
-    href: "/admin/learning",
-    label: "学习中心",
-    icon: (
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
-        <path d="M12 3l1.7 4.8L18.5 9l-4.8 1.7L12 15.5l-1.7-4.8L5.5 9l4.8-1.7L12 3z" />
-        <path d="M19 14.5l.7 2 2 .7-2 .7-.7 2-.7-2-2-.7 2-.7.7-2z" />
-      </svg>
-    ),
-  },
-  {
-    href: "/admin/prompts",
-    label: "Prompt 调试",
-    icon: (
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
-        <rect x="3" y="4" width="18" height="16" rx="2" />
-        <path d="M7.5 9.5l3 2.5-3 2.5" />
-        <path d="M13 14.5h4" />
-      </svg>
-    ),
-  },
 ];
 
 export function AdminSidebar({ mysqlLabel }: { mysqlLabel: string }) {

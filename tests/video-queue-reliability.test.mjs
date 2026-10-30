@@ -7,16 +7,8 @@ import ts from "typescript";
 const queueSource = await readFile(new URL("../lib/queue.ts", import.meta.url), "utf8");
 
 test("explicit submissions always create a fresh task for a repeated link", async () => {
-  const [route, handler, automation] = await Promise.all([
-    readFile(new URL("../app/api/videos/import/route.ts", import.meta.url), "utf8"),
-    readFile(new URL("../lib/feishu/handler.ts", import.meta.url), "utf8"),
-    readFile(new URL("../lib/feishu/automation.ts", import.meta.url), "utf8"),
-  ]);
-  assert.doesNotMatch(route, /getVideoBySourceUrl/);
-  assert.doesNotMatch(handler, /sourceUrl === url/);
+  const automation = await readFile(new URL("../lib/feishu/automation.ts", import.meta.url), "utf8");
   assert.doesNotMatch(automation, /getVideoBySourceUrl/);
-  assert.match(route, /createVideo/);
-  assert.match(handler, /createVideo/);
   assert.match(automation, /createVideo/);
 });
 

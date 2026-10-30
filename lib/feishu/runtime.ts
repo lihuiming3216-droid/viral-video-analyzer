@@ -7,7 +7,6 @@ import { decryptSecret } from "@/lib/crypto";
 import { safeFeishuLogger } from "@/lib/feishu/safe-logger";
 import { feishuHttp } from "@/lib/feishu/http";
 import { getMediaRoot } from "@/lib/video-processing";
-import { registerFeishuHandlers } from "@/lib/feishu/handler";
 import { getFeishuSettings, getRawFeishuSettings, setFeishuConnectionStatus } from "@/lib/feishu/store";
 
 type RuntimeGlobal = typeof globalThis & {
@@ -86,7 +85,6 @@ export async function ensureFeishuConnection(force = false): Promise<LarkChannel
         retry: { maxAttempts: 3, baseDelayMs: 500 },
       },
     });
-    registerFeishuHandlers(channel);
     channel.on("reconnecting", () => void setFeishuConnectionStatus("reconnecting", "连接中断，正在自动恢复").catch(() => undefined));
     channel.on("reconnected", () => void setFeishuConnectionStatus("connected", "").catch(() => undefined));
     channel.on("error", (error) => void setFeishuConnectionStatus("failed", error.message).catch(() => undefined));

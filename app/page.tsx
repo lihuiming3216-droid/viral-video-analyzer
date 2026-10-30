@@ -1,11 +1,6 @@
-import type { Metadata } from "next";
-import ViralAnalyzerApp from "./ViralAnalyzerApp";
+import { redirect } from "next/navigation";
 
-export const metadata: Metadata = {
-  title: "爆片分析",
-  description: "TikTok 带货视频多模态拆解与产品爆片档案库",
-};
-
+/** The web analysis workspace was retired on 2026-10-31; work happens in Feishu and the admin console. */
 export default function Home() {
-  return <ViralAnalyzerApp />;
+  redirect("/admin");
 }

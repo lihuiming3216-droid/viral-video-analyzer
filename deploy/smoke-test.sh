@@ -39,7 +39,7 @@ docker run --rm --network "$network" --entrypoint node \
     tests/feishu-product-card-mapping.test.mjs tests/feishu-video-delivery-reliability.test.mjs \
     tests/video-queue-reliability.test.mjs tests/app.test.mjs \
     tests/feishu-automation-cache.test.mjs tests/feishu-document-ownership.test.mjs \
-    tests/feishu-product-folder-settings.test.mjs
+    tests/feishu-product-folder-settings.test.mjs tests/media-retention.test.mjs
 docker run -d --name "$app_container" --network "$network" \
   --tmpfs /app/.data:rw -e MYSQL_HOST=mysql -e MYSQL_USER=root \
   -e MYSQL_PASSWORD=isolated-ci-only -e MYSQL_DATABASE=viral_video_analyzer "$image" >/dev/null

@@ -301,59 +301,6 @@ export interface ProviderSetting {
   updatedAt: string;
 }
 
-export type LearningScopeType = "global" | "category" | "product";
-
-export interface LearningPattern {
-  name: string;
-  count: number;
-  score: number;
-}
-
-export interface LearningProfile {
-  scopeType: LearningScopeType;
-  scopeKey: string;
-  scopeName: string;
-  sampleCount: number;
-  labeledCount: number;
-  positiveCount: number;
-  neutralCount: number;
-  negativeCount: number;
-  averageTraffic: number;
-  averageConversion: number;
-  confidence: number;
-  insights: {
-    topHooks: LearningPattern[];
-    topTags: LearningPattern[];
-    winningStructures: LearningPattern[];
-    provenStrengths: LearningPattern[];
-    riskPatterns: LearningPattern[];
-  };
-  updatedAt: string;
-}
-
-export interface LearningOverview {
-  learnedVideos: number;
-  labeledVideos: number;
-  positiveVideos: number;
-  categories: number;
-  products: number;
-  overallConfidence: number;
-  profiles: LearningProfile[];
-  recentMemories: Array<{
-    videoId: string;
-    title: string;
-    productName: string;
-    category: string;
-    outcome: "positive" | "neutral" | "negative" | "unverified";
-    manualLabel: ManualLabel;
-    hookType: string;
-    structureFormula: string;
-    traffic: number;
-    conversion: number;
-    updatedAt: string;
-  }>;
-}
-
 export interface DashboardPayload {
   products: Product[];
   videos: VideoRecord[];
@@ -382,34 +329,6 @@ export interface FeishuSettings {
   connectionStatus: FeishuConnectionState;
   lastError: string;
   connectedAt: string | null;
-  updatedAt: string;
-}
-
-export interface FeishuTarget {
-  targetId: string;
-  targetType: "p2p" | "group";
-  name: string;
-  senderOpenId: string;
-  lastUsedAt: string;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface FeishuDelivery {
-  id: string;
-  videoId: string;
-  batchId: string | null;
-  chatId: string;
-  chatType: "p2p" | "group";
-  senderOpenId: string;
-  replyToMessageId: string | null;
-  cardMessageId: string | null;
-  documentId: string | null;
-  documentUrl: string | null;
-  source: "inbound" | "web";
-  status: string;
-  errorMessage: string;
-  createdAt: string;
   updatedAt: string;
 }
 

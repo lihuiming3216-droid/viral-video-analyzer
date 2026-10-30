@@ -2,7 +2,7 @@ import "server-only";
 
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statfsSync, statSync, writeFileSync } from "node:fs";
+import { createWriteStream, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statfsSync, statSync } from "node:fs";
 import path from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -15,22 +15,6 @@ const runFile = promisify(execFile);
 const mediaRoot = path.join(process.cwd(), ".data", "media");
 const ffmpegPath = ffmpegInstaller.path;
 const ffprobePath = ffprobeStatic.path;
-
-export interface ExtractedScene {
-  shotIndex: number;
-  startSeconds: number;
-  endSeconds: number;
-  screenshotPath: string;
-  clipPath: string | null;
-}
-
-export interface CompleteVideoMetadata {
-  duration: number;
-  width: number;
-  height: number;
-  videoCodec: string;
-  audioCodec: string;
-}
 
 function safeExtension(fileName: string, fallback = ".mp4") {
   const extension = path.extname(fileName).toLowerCase();
@@ -61,31 +45,6 @@ export function resolveMediaPath(relativePath: string) {
 export function getMediaRoot() {
   mkdirSync(mediaRoot, { recursive: true });
   return mediaRoot;
-}
-
-export async function saveUploadedVideo(videoId: string, file: File) {
-  if (file.size > 500 * 1024 * 1024) throw new Error("视频不能超过 500MB");
-  const relative = path.join(videoId, `original${safeExtension(file.name)}`);
-  const target = resolveMediaPath(relative);
-  mkdirSync(path.dirname(target), { recursive: true });
-  const temporary = `${target}.${randomUUID()}.part`;
-  try {
-    await pipeline(Readable.fromWeb(file.stream() as never), createWriteStream(temporary));
-    renameSync(temporary, target);
-  } finally {
-    rmSync(temporary, { force: true });
-  }
-  return relative;
-}
-
-export async function saveProductImage(productId: string, file: File) {
-  if (file.size > 12 * 1024 * 1024) throw new Error("产品图片不能超过 12MB");
-  const extension = file.type.includes("png") ? ".png" : file.type.includes("webp") ? ".webp" : ".jpg";
-  const relative = path.join("products", `${productId}${extension}`);
-  const target = resolveMediaPath(relative);
-  mkdirSync(path.dirname(target), { recursive: true });
-  writeFileSync(target, Buffer.from(await file.arrayBuffer()));
-  return relative;
 }
 
 export async function downloadMedia(
@@ -196,31 +155,16 @@ async function probeVideo(absolutePath: string, signal?: AbortSignal) {
   };
 }
 
-/**
- * Qwen Omni can only inspect an MP4's original sound when the container really
- * includes both media tracks. Validate that contract before claiming that a
- * request contains a complete video with its original audio.
- */
-export async function validateCompleteVideoForQwen(
-  absolutePath: string,
-  signal?: AbortSignal,
-): Promise<CompleteVideoMetadata> {
-  const metadata = await probeVideo(absolutePath, signal);
-  if (!metadata.videoCodec) throw new Error("完整视频缺少视频轨，无法进行 Qwen 全模态分析");
-  if (!metadata.audioCodec) throw new Error("完整视频缺少音频轨，无法进行 Qwen 全模态分析");
-  return metadata;
-}
-
 /** Check a newly acquired fallback file without changing or transcribing it. */
 export async function validateDownloadedVideoFile(
   absolutePath: string,
   signal?: AbortSignal,
   options: { requireAudio?: boolean; decode?: boolean } = {},
 ) {
-  const metadata = options.requireAudio === false
-    ? await probeVideo(absolutePath, signal)
-    : await validateCompleteVideoForQwen(absolutePath, signal);
+  const metadata = await probeVideo(absolutePath, signal);
   if (!metadata.videoCodec) throw new Error("完整视频缺少视频轨");
+  // Keep the original sound: a file without its audio track is not delivered.
+  if (options.requireAudio !== false && !metadata.audioCodec) throw new Error("完整视频缺少音频轨");
   if (!Number.isFinite(metadata.duration) || metadata.duration <= 0.1 || metadata.duration > 600.5) {
     throw new Error("下载视频时长无效或超过 10 分钟");
   }
@@ -231,214 +175,10 @@ export async function validateDownloadedVideoFile(
   return metadata;
 }
 
-async function detectCuts(absolutePath: string, signal?: AbortSignal) {
-  let stderr = "";
-  try {
-    const result = await runFile(
-      ffmpegPath,
-      ["-hide_banner", "-i", absolutePath, "-filter:v", "select='gt(scene,0.30)',showinfo", "-f", "null", "-"],
-      { maxBuffer: 32 * 1024 * 1024, signal },
-    );
-    stderr = result.stderr;
-  } catch (error) {
-    if (signal?.aborted) throw error;
-    stderr = String((error as { stderr?: string }).stderr || "");
-  }
-  const times = [...stderr.matchAll(/pts_time:([0-9.]+)/g)].map((match) => Number(match[1]));
-  return times.filter((time) => Number.isFinite(time));
-}
-
-function buildBoundaries(duration: number, detected: number[]) {
-  let points = [0, ...detected.filter((time) => time > 0.6 && time < duration - 0.35), duration]
-    .sort((a, b) => a - b)
-    .filter((value, index, array) => index === 0 || value - array[index - 1] > 0.65);
-  if (duration > 3 && !points.some((time) => time >= 2.6 && time <= 3.4)) points.push(3);
-  points = points.sort((a, b) => a - b);
-  const expanded: number[] = [points[0]];
-  for (let index = 1; index < points.length; index += 1) {
-    const previous = expanded.at(-1)!;
-    const current = points[index];
-    const gap = current - previous;
-    if (gap > 6) {
-      const pieces = Math.ceil(gap / 5);
-      for (let piece = 1; piece < pieces; piece += 1) expanded.push(previous + (gap * piece) / pieces);
-    }
-    expanded.push(current);
-  }
-  if (expanded.length > 37) {
-    const sampled = [0];
-    const step = duration / 30;
-    for (let time = step; time < duration; time += step) sampled.push(time);
-    sampled.push(duration);
-    return sampled;
-  }
-  return expanded;
-}
-
-async function extractScreenshot(videoPath: string, seconds: number, outputPath: string, signal?: AbortSignal) {
-  await runFile(
-    ffmpegPath,
-    ["-y", "-ss", seconds.toFixed(3), "-i", videoPath, "-frames:v", "1", "-vf", "scale='min(960,iw)':-2", "-q:v", "2", outputPath],
-    { maxBuffer: 8 * 1024 * 1024, signal },
-  );
-}
-
-export async function extractVideoAssets(
-  videoId: string,
-  relativeVideoPath: string,
-  signal?: AbortSignal,
-  options: { light?: boolean } = {},
-) {
-  const absoluteVideoPath = resolveMediaPath(relativeVideoPath);
-  signal?.throwIfAborted();
-  const metadata = await probeVideo(absoluteVideoPath, signal);
-  if (metadata.duration > 600.5) throw new Error("视频超过 10 分钟，请上传更短版本");
-  // Table automation only needs a few visual checkpoints. Avoid the expensive
-  // scene-cut pass and dozens of screenshots in the lightweight path.
-  const boundaries = options.light
-    ? [0, metadata.duration / 3, (metadata.duration * 2) / 3, metadata.duration]
-    : buildBoundaries(metadata.duration, await detectCuts(absoluteVideoPath, signal));
-  const shotsDir = resolveMediaPath(path.join(videoId, "shots"));
-  mkdirSync(shotsDir, { recursive: true });
-  const scenes: ExtractedScene[] = [];
-  for (let index = 0; index < boundaries.length - 1; index += 1) {
-    signal?.throwIfAborted();
-    const start = boundaries[index];
-    const end = boundaries[index + 1];
-    const timestamp = Math.min(end - 0.05, start + Math.min(1.2, Math.max(0.15, (end - start) / 2)));
-    const relativeScreenshot = path.join(videoId, "shots", `${String(index + 1).padStart(2, "0")}.jpg`);
-    await extractScreenshot(absoluteVideoPath, timestamp, resolveMediaPath(relativeScreenshot), signal);
-    scenes.push({
-      shotIndex: index + 1,
-      startSeconds: Number(start.toFixed(2)),
-      endSeconds: Number(end.toFixed(2)),
-      screenshotPath: relativeScreenshot,
-      clipPath: null,
-    });
-  }
-  return { ...metadata, scenes };
-}
-
-const QWEN_INLINE_VIDEO_LIMIT = 6 * 1024 * 1024;
-
-/**
- * Validate a local source and, when necessary, create a bounded full-duration
- * H.264/AAC proxy. Absolute paths keep the media operation independently
- * testable while prepareLocalVideoForQwen retains the application path guard.
- */
-export async function prepareCompleteVideoFileForQwen(
-  source: string,
-  target: string,
-  durationSeconds: number,
-  signal?: AbortSignal,
-) {
-  const sourceMetadata = await validateCompleteVideoForQwen(source, signal);
-  if (statSync(source).size <= QWEN_INLINE_VIDEO_LIMIT) return source;
-
-  mkdirSync(path.dirname(target), { recursive: true });
-  const targetBytes = 5 * 1024 * 1024;
-  const audioKbps = 32;
-  const completeDuration = Math.max(0.1, sourceMetadata.duration || durationSeconds);
-  const totalKbps = Math.floor((targetBytes * 8) / completeDuration / 1_000);
-  const bitrateKbps = Math.max(24, Math.min(1_200, totalKbps - audioKbps));
-  try {
-    await runFile(
-      ffmpegPath,
-      [
-        "-y", "-i", source,
-        "-map", "0:v:0",
-        "-map", "0:a:0",
-        "-vf", "scale='min(640,iw)':-2",
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-b:v", `${bitrateKbps}k`,
-        "-maxrate", `${bitrateKbps}k`,
-        "-bufsize", `${bitrateKbps * 2}k`,
-        "-c:a", "aac",
-        "-b:a", `${audioKbps}k`,
-        "-ac", "1",
-        "-ar", "16000",
-        "-sn", "-dn",
-        "-movflags", "+faststart",
-        target,
-      ],
-      { maxBuffer: 16 * 1024 * 1024, signal },
-    );
-    if (statSync(target).size > QWEN_INLINE_VIDEO_LIMIT) {
-      throw new Error("本地视频压缩后仍超过 Qwen 完整视频直传限制");
-    }
-    const proxyMetadata = await validateCompleteVideoForQwen(target, signal);
-    if (proxyMetadata.videoCodec !== "h264" || proxyMetadata.audioCodec !== "aac") {
-      throw new Error("Qwen 视频代理未生成 H.264/AAC 完整媒体");
-    }
-    const durationTolerance = Math.max(0.5, Math.min(1.5, completeDuration * 0.01));
-    if (Math.abs(proxyMetadata.duration - completeDuration) > durationTolerance) {
-      throw new Error("Qwen 视频代理未保留完整视频时长");
-    }
-    return target;
-  } catch (error) {
-    rmSync(target, { force: true });
-    throw error;
-  }
-}
-
-/**
- * OpenAI-compatible Qwen requests can only inline a small Base64 video. Check
- * every local source for picture and sound, then preserve its full timeline in
- * a bounded analysis proxy when the original is too large.
- */
-export async function prepareLocalVideoForQwen(
-  videoId: string,
-  relativeVideoPath: string,
-  durationSeconds: number,
-  signal?: AbortSignal,
-) {
-  const source = resolveMediaPath(relativeVideoPath);
-  const relative = path.join(videoId, "qwen-full-video.mp4");
-  const target = resolveMediaPath(relative);
-  const prepared = await prepareCompleteVideoFileForQwen(source, target, durationSeconds, signal);
-  return prepared === source ? relativeVideoPath : relative;
-}
-
-export async function createSceneClip(videoId: string, relativeVideoPath: string, start: number, end: number, label: string, signal?: AbortSignal) {
-  const duration = Math.max(0.5, Math.min(10, end - start));
-  const safeLabel = label.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 24) || "highlight";
-  const relative = path.join(videoId, "clips", `${safeLabel}-${Math.round(start * 10)}.mp4`);
-  const absolute = resolveMediaPath(relative);
-  mkdirSync(path.dirname(absolute), { recursive: true });
-  try {
-    await runFile(
-      ffmpegPath,
-      ["-y", "-ss", start.toFixed(3), "-i", resolveMediaPath(relativeVideoPath), "-t", duration.toFixed(3), "-c", "copy", "-movflags", "+faststart", absolute],
-      { maxBuffer: 8 * 1024 * 1024, signal },
-    );
-  } catch (error) {
-    if (signal?.aborted) throw error;
-    await runFile(
-      ffmpegPath,
-      ["-y", "-ss", start.toFixed(3), "-i", resolveMediaPath(relativeVideoPath), "-t", duration.toFixed(3), "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", "-movflags", "+faststart", absolute],
-      { maxBuffer: 16 * 1024 * 1024, signal },
-    );
-  }
-  return relative;
-}
-
-export function readMedia(relativePath: string) {
-  const absolute = resolveMediaPath(relativePath);
-  if (!existsSync(absolute)) return null;
-  return readFileSync(absolute);
-}
-
-export function deleteVideoMedia(videoId: string) {
-  const target = resolveMediaPath(videoId);
-  if (existsSync(target)) rmSync(target, { recursive: true, force: true });
-}
-
 /**
  * Remove files produced by an unsuccessful attempt. TikTok originals are
- * downloaded cache and are removed with the task directory. A user upload is
- * owned by the user, so its exact original file is retained while screenshots,
- * covers, clips and the Qwen proxy are deleted.
+ * downloaded cache and are removed with the task directory; an explicitly
+ * preserved original file is kept.
  */
 export function deleteVideoAttemptCache(videoId: string, preservedOriginalPath?: string | null) {
   const target = resolveMediaPath(videoId);
@@ -482,11 +222,3 @@ export function getDiskUsage() {
   }
 }
 
-export function contentTypeForMedia(filePath: string) {
-  const extension = path.extname(filePath).toLowerCase();
-  return ({
-    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp",
-    ".mp4": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm", ".mkv": "video/x-matroska",
-    ".mp3": "audio/mpeg", ".m4a": "audio/mp4",
-  } as Record<string, string>)[extension] || "application/octet-stream";
-}

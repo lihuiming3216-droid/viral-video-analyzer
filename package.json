@@ -10,8 +10,6 @@
     "build": "next build",
     "start": "next start",
     "test": "node --test --test-concurrency=2 --test-reporter=./tests/compact-reporter.mjs tests/*.test.mjs",
-    "test:legacy": "node --test --test-concurrency=2 --test-reporter=./tests/compact-reporter.mjs tests/legacy/*.test.mjs",
-    "test:all": "node --test --test-concurrency=2 --test-reporter=./tests/compact-reporter.mjs tests/*.test.mjs tests/legacy/*.test.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "check": "tsc --noEmit",
     "migrate:sqlite": "node --env-file=.env.local scripts/migrate-sqlite-to-mysql.mjs"

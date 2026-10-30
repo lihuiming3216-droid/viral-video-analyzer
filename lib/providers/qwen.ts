@@ -7,9 +7,7 @@ import { getPromptTemplate, getQwenPurposeModel, type QwenPurpose } from "@/lib/
 import { parseJsonLoose } from "@/lib/json-utils";
 import { requireProvider } from "@/lib/provider-config";
 import { requireAiRuntime } from "@/lib/ai/settings";
-import type { AiRuntime } from "@/lib/ai/types";
 import { fetchQwen } from "@/lib/providers/qwen-transport";
-import { QWEN_TRANSPORT_ERROR_CODES, type QwenTransportErrorCode } from "@/lib/types";
 
 export const TRANSCRIPT_TRANSLATION_PROMPT_SLUG = "transcript_translation";
 export const DEFAULT_TRANSCRIPT_TRANSLATION_TEMPLATE = '把下面 TokScript 提供的完整口播原文翻译成自然、准确、完整的简体中文。只返回 JSON，不要解释：{"translationZh":""}。不要删减、总结、补写。原文：{{TRANSCRIPT_JSON}}';
@@ -92,24 +90,6 @@ export class QwenRequestError extends Error {
   }
 }
 
-function transportErrorCode(error: unknown): QwenTransportErrorCode | undefined {
-  // fetch wraps socket/parser errors in TypeError.cause. Inspect a bounded
-  // chain, copying only allowlisted codes, never messages, URLs or credentials.
-  let current = error;
-  for (let depth = 0; depth < 8 && current && typeof current === "object"; depth += 1) {
-    const candidate = current as { code?: unknown; cause?: unknown };
-    const code = QWEN_TRANSPORT_ERROR_CODES.find((allowed) => allowed === candidate.code);
-    if (code) return code;
-    current = candidate.cause;
-  }
-  return undefined;
-}
-
-function qwenVideoFps() {
-  const configured = Number(process.env.QWEN_VIDEO_FPS || 2);
-  return Number.isFinite(configured) ? Math.max(0.1, Math.min(10, configured)) : 2;
-}
-
 export type QwenModelSource = "env" | "override" | "default" | "hardcoded";
 
 /** Legacy full-report/dubbing callers remain intact; never skip a configured name. */
@@ -133,13 +113,6 @@ async function qwenVideoModel(purpose: "full" | "product_doc", configuredModel =
   return (await resolveQwenModel(purpose, configuredModel)).value;
 }
 
-export async function getVideoAnalysisConfig(purpose: "full" | "product_doc"): Promise<AiRuntime> {
-  if (purpose === "product_doc") return requireAiRuntime("video");
-  const shared = await requireProvider("qwen");
-  return { purpose: "video", provider: "qwen", credentialSource: "shared", apiKey: shared.apiKey,
-    baseUrl: shared.baseUrl, model: await qwenVideoModel("full", shared.model), retries: 1, videoAudioConfirmed: true };
-}
-
 function videoMimeType(videoPath: string) {
   switch (path.extname(videoPath).toLowerCase()) {
     case ".avi": return "video/x-msvideo";
@@ -153,24 +126,6 @@ function videoMimeType(videoPath: string) {
     case ".ogg": return "audio/ogg";
     default: return "video/mp4";
   }
-}
-
-function completeVideoInput(input: { localVideoPath: string }) {
-  const size = statSync(input.localVideoPath).size;
-  if (size > MAX_INLINE_VIDEO_BYTES) {
-    throw new Error("完整视频超过 Qwen Base64 直传限制，请先压缩视频后重试");
-  }
-  const bytes = readFileSync(input.localVideoPath);
-  return {
-    item: {
-      type: "video_url",
-      video_url: { url: `data:${videoMimeType(input.localVideoPath)};base64,${bytes.toString("base64")}` },
-      fps: qwenVideoFps(),
-      max_pixels: 655_360,
-    },
-    inputBytes: bytes.length,
-    inputSha256: createHash("sha256").update(bytes).digest("hex"),
-  };
 }
 
 function streamedText(payload: Record<string, unknown>) {
@@ -253,20 +208,6 @@ async function parseOmniStream(response: Response, onFirstToken: (requestId: str
   };
 }
 
-export interface QwenRequestDiagnostic {
-  model: string;
-  inputBytes: number;
-  inputSha256: string;
-  requestId: string;
-  httpStatus: number | null;
-  headersMs: number | null;
-  firstTokenMs: number | null;
-  totalMs: number;
-  outcome: "success" | "timeout" | "aborted" | "http_error" | "invalid_response" | "network_error";
-  responseSha256: string;
-  errorCode?: QwenTransportErrorCode;
-}
-
 export async function testQwenConnection() {
   const config = await requireProvider("qwen");
   const response = await fetch(`${config.baseUrl}/models`, {
@@ -286,121 +227,6 @@ export async function testQwenConnection() {
     ok: true,
     message: `连接成功，视频模型 ${fullModel}${sharedEndpoint ? "；建议改用与当前 Key 同地域的 Workspace 专属地址" : ""}`,
   };
-}
-
-export async function analyzeVideoWithQwen(input: {
-  prompt: string;
-  localVideoPath: string;
-  /** 完整分析和产品手卡精简分析可以在运维后台分别配置模型；默认 full。 */
-  purpose?: "full" | "product_doc";
-  maxTokens?: number;
-  signal?: AbortSignal;
-  onDiagnostic?: (diagnostic: QwenRequestDiagnostic) => void | Promise<void>;
-  /** One in-memory configuration snapshot for all requests within a task. Never persisted. */
-  config?: AiRuntime;
-}) {
-  const config = input.config || await getVideoAnalysisConfig(input.purpose || "full");
-  const model = config.model;
-  const video = completeVideoInput(input);
-  const content: Array<Record<string, unknown>> = [
-    video.item,
-    {
-      type: "text",
-      text: `${input.prompt}\n你已收到一个包含原始画面和原始音轨的完整 MP4。必须按时间顺序观看并听完整段视频，直接识别口播、音乐、音效、情绪与画面，不得假设另有外部转写。只返回合法 JSON，不要使用 Markdown 代码块。`,
-    },
-  ];
-  const startedAt = performance.now();
-  let response: Response | null = null;
-  let requestId = "";
-  let headersMs: number | null = null;
-  let firstTokenMs: number | null = null;
-  let responseSha256 = "";
-  let outcome: QwenRequestDiagnostic["outcome"] = "network_error";
-  let errorCode: QwenTransportErrorCode | undefined;
-  let deadline: AbortSignal | undefined;
-  let releaseSlot: (() => void) | undefined;
-  try {
-    releaseSlot = await acquireQwenRequestSlot("video", input.signal);
-    deadline = AbortSignal.timeout(QWEN_REQUEST_TIMEOUT_MS);
-    response = await fetchQwen(`${config.baseUrl}/chat/completions`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${config.apiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model,
-        messages: [{ role: "user", content }],
-        modalities: ["text"],
-        ...(config.provider === "qwen" ? { enable_thinking: false } : {}),
-        stream: true,
-        stream_options: { include_usage: true },
-        max_tokens: input.maxTokens || 4_500,
-      }),
-      signal: input.signal
-        ? AbortSignal.any([input.signal, deadline])
-        : deadline,
-    });
-    headersMs = Math.round(performance.now() - startedAt);
-    requestId = safeResponseRequestId(response);
-    const parsed = await parseOmniStream(response, (streamRequestId) => {
-      if (streamRequestId) requestId = streamRequestId;
-      firstTokenMs ??= Math.round(performance.now() - startedAt);
-    });
-    requestId ||= parsed.requestId;
-    responseSha256 = parsed.responseSha256;
-    outcome = "success";
-    return parsed.result;
-  } catch (error) {
-    errorCode = transportErrorCode(error);
-    if (input.signal?.aborted) {
-      outcome = "aborted";
-      throw error;
-    }
-    const message = error instanceof Error ? error.message : String(error || "");
-    if (deadline?.aborted || errorCode?.includes("TIMEOUT") || errorCode === "ETIMEDOUT"
-      || ((!response || response.ok) && /(?:timeout|timed out|aborted due to timeout|etimedout)/i.test(message))) {
-      if (deadline?.aborted) errorCode = "REQUEST_TIMEOUT";
-      outcome = "timeout";
-      throw new QwenRequestError("timeout", true, "Qwen 完整视频分析超时");
-    }
-    if (response && !response.ok) {
-      outcome = "http_error";
-      const retryable = response.status === 408 || response.status === 429 || response.status >= 500;
-      throw new QwenRequestError(
-        "http_error",
-        retryable,
-        `Qwen 完整视频请求失败（HTTP ${response.status}）`,
-        response.status,
-      );
-    }
-    if (error instanceof SyntaxError || /(?:JSON|没有返回|流式响应)/i.test(message)) {
-      outcome = "invalid_response";
-      // Unlike a deterministic parsing bug, the same multimodal input can get a
-      // differently-shaped (and valid) response from the model on a second try
-      // — this must count toward the "每任务最多请求 2 次" budget like every
-      // other failure mode, not skip straight to a permanent task failure.
-      throw new QwenRequestError("invalid_response", true, "Qwen 没有返回可用的视频分析结构");
-    }
-    outcome = "network_error";
-    throw new QwenRequestError("network_error", true, "Qwen 完整视频网络连接失败");
-  } finally {
-    releaseSlot?.();
-    try {
-      await input.onDiagnostic?.({
-        model,
-        inputBytes: video.inputBytes,
-        inputSha256: video.inputSha256,
-        requestId,
-        httpStatus: response?.status ?? null,
-        headersMs,
-        firstTokenMs,
-        totalMs: Math.round(performance.now() - startedAt),
-        outcome,
-        responseSha256,
-        ...(errorCode ? { errorCode } : {}),
-      });
-    } catch {
-      // Diagnostics must never alter the analysis result.
-    }
-  }
 }
 
 export interface QwenTranscribedSegment {
@@ -423,7 +249,7 @@ const AUDIO_FORMAT_BY_EXTENSION: Record<string, string> = {
  * listening to it — for media that never goes through TokScript (e.g. an
  * employee-recorded dub track uploaded straight into a Base attachment
  * field, which has no TikTok URL for TokScript to fetch). Reuses the same
- * base64-inline multimodal channel as analyzeVideoWithQwen() for video
+ * base64-inline multimodal channel for video
  * files. A pure audio file needs the "input_audio" content type, confirmed
  * against Alibaba Cloud's own Qwen-Omni docs after two real DashScope 400s
  * on the same test .mp3 ruled out guessing: {data: <raw base64>, format}

@@ -35,7 +35,7 @@ docker run --rm --network "$network" --entrypoint node \
   "$image" --test --test-concurrency=2 \
     tests/feishu-delivery-mysql.test.mjs tests/product-catalog-mysql.test.mjs \
     tests/product-verified-facts.test.mjs tests/video-attempt-integrity.test.mjs \
-    tests/video-attempt-diagnostics.test.mjs tests/product-doc-failure-delivery-state.test.mjs \
+    tests/video-attempt-history.test.mjs tests/product-doc-failure-delivery-state.test.mjs \
     tests/feishu-product-card-mapping.test.mjs tests/feishu-video-delivery-reliability.test.mjs \
     tests/video-queue-reliability.test.mjs tests/app.test.mjs \
     tests/feishu-automation-cache.test.mjs tests/feishu-document-ownership.test.mjs \

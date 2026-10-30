@@ -3,10 +3,8 @@ import "server-only";
 import { randomUUID } from "node:crypto";
 import type { PoolConnection, ResultSetHeader } from "mysql2/promise";
 import { getPool } from "@/lib/db/pool";
-import { QWEN_TRANSPORT_ERROR_CODES } from "@/lib/types";
 import type {
   AnalysisResult,
-  DashboardPayload,
   FeishuProductCardMapping,
   FeishuProductCardMappingKey,
   ManualLabel,
@@ -18,8 +16,6 @@ import type {
   ProviderSetting,
   SceneRecord,
   VerifiedProductFactsMergeInput,
-  VideoAttemptCallDiagnostic,
-  VideoAttemptDiagnostics,
   VideoRecord,
   VideoStatus,
 } from "@/lib/types";
@@ -381,10 +377,6 @@ export async function saveFeishuAutomationJob(input: {
   };
   if (connection) await write(connection);
   else await withTransaction(write);
-}
-
-export async function getFeishuAutomationJob(videoId: string) {
-  return (await getFeishuAutomationJobs(videoId))[0] || null;
 }
 
 export async function getFeishuAutomationJobs(videoId: string) {
@@ -923,37 +915,6 @@ export async function clearProductDocumentLink(id: string) {
   return getProduct(id);
 }
 
-export async function listVideos(filters: { search?: string; productId?: string; account?: string; date?: string } = {}) {
-  const clauses = ["1=1"];
-  const params: string[] = [];
-  if (filters.productId) {
-    clauses.push("v.product_id = ?");
-    params.push(filters.productId);
-  }
-  if (filters.account) {
-    clauses.push("v.account_name = ?");
-    params.push(filters.account);
-  }
-  if (filters.date) {
-    clauses.push("SUBSTR(COALESCE(v.published_at, v.created_at), 1, 10) = ?");
-    params.push(filters.date);
-  }
-  if (filters.search) {
-    clauses.push("(v.title LIKE ? OR v.account_name LIKE ? OR p.name LIKE ? OR p.pid LIKE ? OR v.transcript_original LIKE ? OR v.transcript_zh LIKE ?)");
-    const term = `%${filters.search}%`;
-    params.push(term, term, term, term, term, term);
-  }
-  const db = await getDb();
-  const found = await rows(
-    db,
-    `SELECT v.*, p.name AS product_name FROM videos v
-     JOIN products p ON p.id = v.product_id
-     WHERE ${clauses.join(" AND ")} ORDER BY v.created_at DESC`,
-    params,
-  );
-  return found.map(videoFromRow);
-}
-
 export interface ProductDocumentVideoRow {
   documentId: string;
   linkBlockId: string;
@@ -1178,12 +1139,6 @@ export async function listVideoStages(videoId: string, attemptNumber: number) {
   return found.map(item => ({ stage: String(item.stage), state: String(item.state), error: String(item.error_message || ""), updatedAt: String(item.updated_at) }));
 }
 
-export async function deleteVideoRecord(id: string) {
-  const db = await getDb();
-  const result = await run(db, "DELETE FROM videos WHERE id=?", [id]);
-  return result.affectedRows > 0;
-}
-
 export async function replaceScenes(videoId: string, scenes: Array<Omit<SceneRecord, "id" | "videoId">>) {
   await withTransaction(async db => {
     await run(db, "DELETE FROM scenes WHERE video_id=?", [videoId]);
@@ -1247,31 +1202,6 @@ export async function saveProviderSetting(input: {
   return (await listProviderSettings()).find((item) => item.provider === input.provider)!;
 }
 
-export async function getDashboard(filters: Parameters<typeof listVideos>[0] = {}): Promise<DashboardPayload> {
-  const [products, videos, providers] = await Promise.all([
-    listProducts(),
-    listVideos(filters),
-    listProviderSettings(),
-  ]);
-  const completed = videos.filter((video) => video.status === "completed");
-  const processing = videos.filter((video) => !["completed", "failed", "waiting"].includes(video.status));
-  const average = (key: "traffic" | "conversion") =>
-    completed.length ? Math.round(completed.reduce((sum, video) => sum + video.scores[key], 0) / completed.length) : 0;
-  return {
-    products,
-    videos,
-    providers,
-    totals: {
-      products: products.filter((product) => !product.isSystem).length,
-      videos: videos.length,
-      completed: completed.length,
-      processing: processing.length,
-      averageTraffic: average("traffic"),
-      averageConversion: average("conversion"),
-    },
-  };
-}
-
 export async function getPendingVideoIds(inboxOnly = false) {
   const db = await getDb();
   const found = await rows(
@@ -1301,146 +1231,6 @@ export async function prepareVideoForQueue(videoId: string, restart = false) {
     }
     return result.affectedRows > 0;
   });
-}
-
-export const VIDEO_ATTEMPT_DIAGNOSTICS_MAX_BYTES = 16 * 1024;
-
-const videoAttemptDiagnosticKeys = new Set([
-  "schemaVersion", "provider", "model", "inputMode", "fileBytes", "inputSha256", "encodedBytes", "durationMs",
-  "hasAudio", "videoCodec", "audioCodec", "calls",
-]);
-const videoAttemptCallDiagnosticKeys = new Set([
-  "requestIndex", "clientRequestId", "providerRequestId", "phase", "outcome", "startedAt",
-  "headersMs", "firstTokenMs", "totalMs", "httpStatus", "responseSha256", "errorCode",
-]);
-const videoAttemptCallPhases = new Set([
-  "awaiting_headers", "awaiting_first_token", "streaming", "parsing", "completed",
-]);
-const videoAttemptCallOutcomes = new Set([
-  "success", "timeout", "aborted", "http_error", "network_error", "invalid_response",
-]);
-
-function plainDiagnosticObject(value: unknown): value is Record<string, unknown> {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
-}
-
-function assertDiagnosticKeys(value: Record<string, unknown>, allowed: Set<string>, label: string) {
-  for (const key of Object.keys(value)) {
-    if (!allowed.has(key)) throw new Error(`${label}包含不允许的字段 ${key}`);
-  }
-}
-
-function diagnosticNumber(value: unknown, label: string, options: { integer?: boolean; positive?: boolean } = {}) {
-  if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > Number.MAX_SAFE_INTEGER) {
-    throw new Error(`${label}必须是安全的非负数`);
-  }
-  if (options.integer && !Number.isInteger(value)) throw new Error(`${label}必须是整数`);
-  if (options.positive && value === 0) throw new Error(`${label}必须大于0`);
-  return value;
-}
-
-function diagnosticIdentifier(value: unknown, label: string, maxLength = 160) {
-  if (typeof value !== "string"
-    || !value
-    || value.length > maxLength
-    || /(?:https?|ftp):\/\/|^data:|bearer\s|sk-[A-Za-z0-9_-]{8,}/i.test(value)
-    || !/^[A-Za-z0-9][A-Za-z0-9._:+/-]*$/.test(value)) {
-    throw new Error(`${label}必须是安全标识符`);
-  }
-  return value;
-}
-
-function optionalDiagnosticNumber(value: Record<string, unknown>, key: string, options: { integer?: boolean } = {}) {
-  if (key in value) diagnosticNumber(value[key], `诊断字段 ${key}`, options);
-}
-
-function validateVideoAttemptCallDiagnostic(value: unknown): asserts value is VideoAttemptCallDiagnostic {
-  if (!plainDiagnosticObject(value)) throw new Error("Qwen请求诊断必须是普通对象");
-  assertDiagnosticKeys(value, videoAttemptCallDiagnosticKeys, "Qwen请求诊断");
-  const requestIndex = diagnosticNumber(value.requestIndex, "requestIndex", { integer: true, positive: true });
-  if (requestIndex !== 1 && requestIndex !== 2) throw new Error("requestIndex只能是1或2");
-  diagnosticIdentifier(value.clientRequestId, "clientRequestId");
-  if ("providerRequestId" in value) diagnosticIdentifier(value.providerRequestId, "providerRequestId");
-  if ("errorCode" in value && !QWEN_TRANSPORT_ERROR_CODES.some((code) => code === value.errorCode)) {
-    throw new Error("Qwen网络错误码无效");
-  }
-  if ("responseSha256" in value
-    && (typeof value.responseSha256 !== "string" || !/^[a-f0-9]{64}$/.test(value.responseSha256))) {
-    throw new Error("responseSha256必须是64位小写十六进制");
-  }
-  if (typeof value.phase !== "string" || !videoAttemptCallPhases.has(value.phase)) throw new Error("Qwen请求诊断阶段无效");
-  if (typeof value.outcome !== "string" || !videoAttemptCallOutcomes.has(value.outcome)) throw new Error("Qwen请求诊断结果无效");
-  if (typeof value.startedAt !== "string"
-    || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(value.startedAt)
-    || !Number.isFinite(Date.parse(value.startedAt))) {
-    throw new Error("startedAt必须是UTC ISO时间");
-  }
-  for (const key of ["headersMs", "firstTokenMs"]) {
-    optionalDiagnosticNumber(value, key);
-  }
-  diagnosticNumber(value.totalMs, "totalMs");
-  optionalDiagnosticNumber(value, "httpStatus", { integer: true });
-  if ("httpStatus" in value && (Number(value.httpStatus) < 100 || Number(value.httpStatus) > 599)) {
-    throw new Error("httpStatus超出有效范围");
-  }
-}
-
-function serializeVideoAttemptDiagnostics(value: VideoAttemptDiagnostics) {
-  if (!plainDiagnosticObject(value)) throw new Error("执行诊断必须是普通对象");
-  let serialized = "";
-  try {
-    serialized = JSON.stringify(value);
-  } catch {
-    throw new Error("执行诊断必须是可序列化JSON");
-  }
-  if (Buffer.byteLength(serialized, "utf8") > VIDEO_ATTEMPT_DIAGNOSTICS_MAX_BYTES) {
-    throw new Error(`执行诊断不能超过${VIDEO_ATTEMPT_DIAGNOSTICS_MAX_BYTES}字节`);
-  }
-  assertDiagnosticKeys(value, videoAttemptDiagnosticKeys, "执行诊断");
-  if (value.schemaVersion !== 1) throw new Error("执行诊断版本无效");
-  if (value.provider !== "qwen" && value.provider !== "compatible") throw new Error("执行诊断provider无效");
-  diagnosticIdentifier(value.model, "model", 100);
-  if (value.inputMode !== "local_base64") throw new Error("inputMode无效");
-  diagnosticNumber(value.fileBytes, "fileBytes", { integer: true, positive: true });
-  if (typeof value.inputSha256 !== "string" || !/^[a-f0-9]{64}$/.test(value.inputSha256)) {
-    throw new Error("inputSha256必须是64位小写十六进制");
-  }
-  diagnosticNumber(value.encodedBytes, "encodedBytes", { integer: true, positive: true });
-  diagnosticNumber(value.durationMs, "durationMs", { positive: true });
-  if (value.hasAudio !== true) throw new Error("hasAudio必须为true");
-  diagnosticIdentifier(value.videoCodec, "videoCodec", 80);
-  diagnosticIdentifier(value.audioCodec, "audioCodec", 80);
-  if (!Array.isArray(value.calls) || value.calls.length > 2) throw new Error("每次执行最多记录2个Qwen请求");
-  const requestIndexes = new Set<number>();
-  for (const call of value.calls) {
-    validateVideoAttemptCallDiagnostic(call);
-    if (requestIndexes.has(call.requestIndex)) throw new Error("Qwen请求序号不能重复");
-    requestIndexes.add(call.requestIndex);
-  }
-  return serialized;
-}
-
-/** Replace the sanitized diagnostic snapshot for the exact active attempt.
- * A stale or already-finished attempt can never mutate durable history. */
-export async function updateVideoAttemptDiagnostics(
-  videoId: string,
-  attemptNumber: number,
-  diagnostics: VideoAttemptDiagnostics,
-) {
-  const normalizedVideoId = videoId.trim();
-  if (!normalizedVideoId) throw new Error("videoId不能为空");
-  if (!Number.isInteger(attemptNumber) || attemptNumber <= 0) throw new Error("attemptNumber必须是正整数");
-  const serialized = serializeVideoAttemptDiagnostics(diagnostics);
-  const db = await getDb();
-  const result = await run(
-    db,
-    `UPDATE video_attempts SET diagnostics_json=?
-     WHERE video_id=? AND attempt_number=? AND status='running' AND finished_at IS NULL`,
-    [serialized, normalizedVideoId, attemptNumber],
-  );
-  return result.affectedRows > 0;
 }
 
 export async function startVideoAttempt(videoId: string) {
@@ -1742,46 +1532,10 @@ export async function getPromptTemplate(slug: string, label: string, defaultTemp
   return promptTemplateFromRow(found);
 }
 
-export async function listPromptTemplates() {
-  const db = await getDb();
-  const found = await rows(db, "SELECT * FROM prompt_templates ORDER BY slug");
-  return found.map(promptTemplateFromRow);
-}
-
-/** Save an edited template as a new version; the full history stays in prompt_template_versions. */
-export async function savePromptTemplate(slug: string, template: string) {
-  return withTransaction(async (db) => {
-    const current = await row(db, "SELECT current_version FROM prompt_templates WHERE slug=? FOR UPDATE", [slug]);
-    const nextVersion = Number(current?.current_version ?? 0) + 1;
-    const timestamp = now();
-    await run(
-      db,
-      `INSERT INTO prompt_template_versions (id, slug, version, template, created_at) VALUES (?, ?, ?, ?, ?)`,
-      [randomUUID(), slug, nextVersion, template, timestamp],
-    );
-    await run(
-      db,
-      `UPDATE prompt_templates SET template=?, current_version=?, updated_at=? WHERE slug=?`,
-      [template, nextVersion, timestamp, slug],
-    );
-    return (await row(db, "SELECT * FROM prompt_templates WHERE slug=?", [slug]))!;
-  }).then(promptTemplateFromRow);
-}
-
 export interface PromptTemplateVersion {
   version: number;
   template: string;
   createdAt: string;
-}
-
-export async function listPromptTemplateVersions(slug: string) {
-  const db = await getDb();
-  const found = await rows(
-    db,
-    "SELECT version, template, created_at FROM prompt_template_versions WHERE slug=? ORDER BY version DESC",
-    [slug],
-  );
-  return found.map((item) => ({ version: Number(item.version), template: String(item.template), createdAt: String(item.created_at) }) satisfies PromptTemplateVersion);
 }
 
 export interface PromptDebugCapture {
@@ -1795,58 +1549,3 @@ export interface PromptDebugCapture {
   productName?: string;
 }
 
-function promptDebugCaptureFromRow(source: Row): PromptDebugCapture {
-  return {
-    id: String(source.id),
-    videoId: String(source.video_id),
-    attemptNumber: Number(source.attempt_number),
-    templateSlug: String(source.template_slug),
-    inputs: json<Record<string, unknown>>(source.inputs_json, {}),
-    qwenVideoPath: source.qwen_video_path ? String(source.qwen_video_path) : null,
-    createdAt: String(source.created_at),
-    productName: source.product_name ? String(source.product_name) : undefined,
-  };
-}
-
-/** Best-effort capture of the exact structured inputs behind one real Qwen prompt — never blocks analysis. */
-export async function savePromptDebugCapture(input: {
-  videoId: string;
-  attemptNumber: number;
-  templateSlug: string;
-  inputs: Record<string, unknown>;
-  qwenVideoPath: string | null;
-}) {
-  const db = await getDb();
-  await run(
-    db,
-    `INSERT INTO prompt_debug_captures (id, video_id, attempt_number, template_slug, inputs_json, qwen_video_path, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    [randomUUID(), input.videoId, input.attemptNumber, input.templateSlug, JSON.stringify(input.inputs), input.qwenVideoPath, now()],
-  );
-}
-
-export async function listPromptDebugCaptures(templateSlug: string, limit = 30) {
-  const db = await getDb();
-  const found = await rows(
-    db,
-    `SELECT c.*, p.name AS product_name FROM prompt_debug_captures c
-     JOIN videos v ON v.id = c.video_id
-     JOIN products p ON p.id = v.product_id
-     WHERE c.template_slug=? ORDER BY c.created_at DESC LIMIT ?`,
-    [templateSlug, limit],
-  );
-  return found.map(promptDebugCaptureFromRow);
-}
-
-export async function getPromptDebugCapture(id: string) {
-  const db = await getDb();
-  const found = await row(
-    db,
-    `SELECT c.*, p.name AS product_name FROM prompt_debug_captures c
-     JOIN videos v ON v.id = c.video_id
-     JOIN products p ON p.id = v.product_id
-     WHERE c.id=?`,
-    [id],
-  );
-  return found ? promptDebugCaptureFromRow(found) : null;
-}

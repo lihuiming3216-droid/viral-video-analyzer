@@ -9,7 +9,6 @@ import { readControlUrl } from "./helpers/feishu-read-control.mjs";
 const url = code => `data:text/javascript;base64,${Buffer.from(code).toString("base64")}`;
 const compile = source => ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } }).outputText.replace('import "server-only";', "");
 const read = file => readFile(new URL(`../${file}`, import.meta.url), "utf8");
-const { parseMediaRange } = await import(url(compile(await read("lib/media-range.ts"))));
 
 test("asynchronous notification failures cannot escape into the video worker", async () => {
   const events = await import(url(compile(await read("lib/video-events.ts"))));
@@ -19,53 +18,6 @@ test("asynchronous notification failures cannot escape into the video worker", a
   events.setVideoProgressHandler(() => { throw Error("synchronous notification unavailable"); });
   assert.doesNotThrow(() => events.emitVideoProgress("video"));
   events.setVideoProgressHandler(() => {});
-});
-
-test("a failed bot progress card does not strand already-created video tasks", async t => {
-  const key = `auditHandler${Math.random()}`;
-  const queued = [];
-  let nextId = 0;
-  globalThis[key] = {
-    recordFeishuEvent: async () => true,
-    parseFeishuSubmission: () => ({ productName: "Fixture", pid: "123456", urls: ["url-1", "url-2"] }),
-    findOrCreateProduct: async () => ({ id: "product", name: "Fixture", pid: "123456" }),
-    createFeishuBatch: async () => ({ id: "batch" }),
-    createVideo: async () => ({ id: `video-${++nextId}` }),
-    createFeishuDelivery: async () => ({ id: `delivery-${nextId}` }),
-    enqueueVideos: async ids => { queued.push(...ids); },
-    safeSdkLogValues: () => [],
-  };
-  const warnings = [];
-  const previous = console.warn;
-  console.warn = (...args) => { warnings.push(args); };
-  t.after(() => { delete globalThis[key]; console.warn = previous; });
-  let code = compile(await read("lib/feishu/handler.ts"));
-  for (const [, names, module] of [...code.matchAll(/import\s*\{([^}]+)\}\s*from\s*"(@\/lib\/[^\"]+)"/g)]) {
-    const stub = names.split(",").map(name => name.trim()).filter(Boolean).map(name => `export const ${name} = (...a) => globalThis[${JSON.stringify(key)}][${JSON.stringify(name)}]?.(...a);`).join("\n");
-    code = code.replaceAll(JSON.stringify(module), JSON.stringify(url(stub)));
-  }
-  const callbacks = {};
-  const channel = {
-    on: (name, callback) => { callbacks[name] = callback; },
-    send: async () => { throw Error("Authorization: Bearer PRIVATE_TOKEN"); },
-  };
-  (await import(url(code))).registerFeishuHandlers(channel);
-  await callbacks.message({ messageId: "message", chatId: "chat", chatType: "p2p", senderId: "sender", content: "fixture" });
-  assert.deepEqual(queued, ["video-1", "video-2"]);
-  assert.equal(warnings.length, 1);
-  assert.doesNotMatch(JSON.stringify(warnings), /PRIVATE_TOKEN|Bearer/);
-});
-
-test("media range supports suffix/open-ended bounds and rejects invalid/overflow/multi-range requests", () => {
-  assert.deepEqual(parseMediaRange("bytes=2-8", 10), { start: 2, end: 8 });
-  assert.deepEqual(parseMediaRange("bytes=2-", 10), { start: 2, end: 9 });
-  assert.deepEqual(parseMediaRange("bytes=-3", 10), { start: 7, end: 9 });
-  assert.deepEqual(parseMediaRange("bytes=-30", 10), { start: 0, end: 9 });
-  assert.deepEqual(parseMediaRange("bytes=0-999", 10), { start: 0, end: 9 });
-  for (const value of ["bytes=8-2", "bytes=10-", "bytes=-0", "bytes=-", "bytes=0-1,3-4", "garbage bytes=0-2", "bytes=9007199254740992-"]) {
-    assert.equal(parseMediaRange(value, 10), null, value);
-  }
-  assert.equal(parseMediaRange("bytes=0-", 0), null);
 });
 
 test("all Feishu HTTP methods have bounded deadlines and preserve upload allowance and caller cancellation", async t => {

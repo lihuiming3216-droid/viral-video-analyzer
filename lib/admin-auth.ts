@@ -13,8 +13,7 @@ let activeChecks = 0;
 export function publicMachineRoute(pathname: string, method: string, serverAction = false) {
   if (serverAction) return false;
   if ((method === "GET" || method === "HEAD") && (pathname.startsWith("/_next/static/") || pathname === "/_next/image" || pathname === "/favicon.ico")) return true;
-  if ((method === "GET" || method === "HEAD") && (pathname === "/api/health" || pathname.startsWith("/api/media/")
-    || /^\/api\/products\/[^/]+\/image$/.test(pathname))) return true;
+  if ((method === "GET" || method === "HEAD") && pathname === "/api/health") return true;
   return method === "POST" && [
     "/api/feishu/automation", "/api/feishu/product-doc-sync", "/api/feishu/task-table",
     "/api/feishu/app-actions/handcard", "/api/feishu/app-actions/video",

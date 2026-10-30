@@ -1,60 +1,23 @@
 import assert from "node:assert/strict";
 import { readFile, stat } from "node:fs/promises";
 import test from "node:test";
-import ts from "typescript";
 import { loadAutomationFixture } from "./helpers/automation-fixture.mjs";
 
 const read = path => readFile(new URL(`../${path}`, import.meta.url), "utf8");
 
 test("retired handcard analysis has no formatter, write path, or active prompt template", async () => {
   await assert.rejects(stat(new URL("../lib/product-doc-analysis.ts", import.meta.url)), { code: "ENOENT" });
-  const [sync, automation, analysis, prompts, providers] = await Promise.all([
+  const [sync, automation, analysis, providers] = await Promise.all([
     read("lib/feishu/product-doc-sync.ts"), read("lib/feishu/automation.ts"),
-    read("lib/analysis.ts"), read("app/admin/prompts/page.tsx"),
-    read("app/admin/providers/page.tsx"),
+    read("lib/analysis.ts"), read("app/admin/providers/page.tsx"),
   ]);
   assert.doesNotMatch(sync, /analysisCellId|conciseProductDocAnalysis|product_doc_failure_delivered/);
   assert.doesNotMatch(automation, /setMappedField\(fields, map\.analysis|\[map\.analysis\]/);
   assert.doesNotMatch(analysis, /video_analysis_product_doc|极简的产品样片分析/);
-  assert.doesNotMatch(prompts, /PROMPT_TEMPLATE_\w+\.product_doc/);
   assert.match(providers, /purposes\.filter\(setting => setting\.config\.purpose !== "video"\)/);
   assert.match(providers, /不再调用视频分析模型/);
   assert.match(sync, /analysisMode: "product_doc"/, "retain the durable handcard row identity");
-  assert.match(analysis, /if \(analysisMode !== "full"\)/);
-});
-
-test("historical handcard prompt replays return before loading media or requesting a video model", async () => {
-  let capturedReads = 0, modelCalls = 0, mediaReads = 0;
-  const key = "__handcardPromptRetirementHooks";
-  globalThis[key] = {
-    getPromptDebugCapture: async () => { capturedReads += 1; return { inputs: { mode: "product_doc" }, qwenVideoPath: "legacy.mp4" }; },
-    analyzeVideoWithQwen: () => { modelCalls += 1; throw Error("retired handcard analysis must not be requested"); },
-    resolveMediaPath: () => { mediaReads += 1; throw Error("retired handcard media must not be read"); },
-  };
-  const stub = `const hooks = () => globalThis.${key};
-    export const revalidatePath = () => {};
-    export const savePromptTemplate = () => {};
-    export const getPromptDebugCapture = (...args) => hooks().getPromptDebugCapture(...args);
-    export const analyzeVideoWithQwen = (...args) => hooks().analyzeVideoWithQwen(...args);
-    export const resolveMediaPath = (...args) => hooks().resolveMediaPath(...args);
-    export const TRANSCRIPT_TRANSLATION_PROMPT_SLUG = "transcript_translation";
-    export const translateTranscriptWithQwen = () => { throw Error("unexpected translation"); };`;
-  const stubUrl = `data:text/javascript;base64,${Buffer.from(stub).toString("base64")}`;
-  const compiled = ts.transpileModule(await read("app/admin/prompts/actions.ts"), {
-    compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
-  }).outputText.replaceAll(/"(?:@\/lib\/[^\"]+|next\/cache)"/g, JSON.stringify(stubUrl));
-  try {
-    const actions = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString("base64")}`);
-    const form = new FormData();
-    form.set("slug", "video_analysis_product_doc");
-    form.set("captureId", "historical-handcard-input");
-    const result = await actions.runPromptTestAction(null, form);
-    assert.equal(result.ok, false);
-    assert.match(result.error, /手卡视频分析已停用/);
-    assert.equal(capturedReads, 1);
-    assert.equal(modelCalls, 0);
-    assert.equal(mediaReads, 0);
-  } finally { delete globalThis[key]; }
+  assert.match(analysis, /recordStage\("analysis", "skipped"\)/);
 });
 
 for (const status of ["completed", "failed", "stopped"]) {
